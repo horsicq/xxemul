@@ -50,6 +50,8 @@ struct xxemul {
     void *output_context;
     xxemul_x86_state x86;
     double x87_stack[8];
+    uint64_t x87_int_val[8];
+    uint8_t x87_is_int[8];
     uint8_t x87_depth;
     uint8_t x87_top;
     uint16_t x87_control;

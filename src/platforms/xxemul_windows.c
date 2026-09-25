@@ -26,6 +26,9 @@
 #define WIN_MAX_ALLOCATIONS 4096u
 #define WIN_MAX_VECTORED_HANDLERS 64u
 #define WIN_VECTORED_HANDLE_OFFSET UINT64_C(0x8200)
+#define WIN_SHELL_MALLOC_OFFSET UINT64_C(0x8500)
+#define WIN_TLS_ARRAY_OFFSET UINT64_C(0x8600)
+#define WIN_TLS_DEFAULT_DATA_OFFSET UINT64_C(0x8680)
 #define WIN_MAX_CRITICAL_SECTIONS 128u
 #define WIN_MAX_TLS_SLOTS 128u
 #define WIN_MAX_ONEXIT 256u
@@ -193,6 +196,8 @@ struct xxemul_windows {
     size_t initterm_depth;
     win_qsort_frame qsort_frames[WIN_MAX_QSORT_DEPTH];
     size_t qsort_depth;
+    uint32_t resource_rva;
+    uint32_t resource_size;
 };
 
 static uint16_t win_le16(const uint8_t *data)
@@ -256,6 +261,17 @@ static int win_suffix(const char *text, const char *suffix)
 {
     size_t a = strlen(text), b = strlen(suffix);
     return a >= b && win_equal(text + a - b, suffix);
+}
+
+static int win_prefix(const char *text, const char *prefix)
+{
+    while (*prefix != '\0') {
+        if (*text == '\0' || tolower((unsigned char)*text) != tolower((unsigned char)*prefix))
+            return 0;
+        ++text;
+        ++prefix;
+    }
+    return 1;
 }
 
 static int win_write(xxemul_windows *process, uint64_t address,
@@ -496,7 +512,8 @@ static int win_known_api(const char *name)
         "FreeEnvironmentStringsW", "GetTickCount", "GetCurrentProcessId",
         "GetCurrentThreadId", "GetVersion", "GetACP", "GetOEMCP",
         "GetConsoleOutputCP", "SetConsoleMode", "GetConsoleMode",
-        "GetStartupInfoA", "GetSystemInfo", "QueryPerformanceCounter",
+        "GetStartupInfoA", "GetSystemInfo", "GetActiveProcessorGroupCount",
+        "GetActiveProcessorCount", "QueryPerformanceCounter",
         "QueryPerformanceFrequency", "AddVectoredExceptionHandler",
         "RemoveVectoredExceptionHandler", "CreateEventA", "SetEvent",
         "ResetEvent", "WaitForSingleObject", "WaitForMultipleObjects",
@@ -513,7 +530,9 @@ static int win_known_api(const char *name)
         "GetFileTime", "SetFileTime", "GetThreadPriority",
         "SetThreadPriority",
         "SetUnhandledExceptionFilter", "GetThreadContext",
-        "IsDBCSLeadByteEx", "MultiByteToWideChar",
+        "IsDBCSLeadByte", "IsDBCSLeadByteEx", "MultiByteToWideChar",
+        "SetDllDirectoryW", "SetDllDirectoryA",
+        "AreFileApisANSI", "GetCPInfo",
         "WideCharToMultiByte", "OpenProcess", "RaiseException",
         "VirtualQuery", "ResumeThread", "SuspendThread",
         "SetThreadContext", "Sleep",
@@ -521,7 +540,36 @@ static int win_known_api(const char *name)
         "RtlUnwindEx", "RtlVirtualUnwind", "__C_specific_handler",
         "InitializeCriticalSection", "DeleteCriticalSection",
         "EnterCriticalSection", "LeaveCriticalSection",
-        "TryEnterCriticalSection", "atoi", "_iob"
+        "TryEnterCriticalSection", "atoi", "_iob",
+        "LoadLibraryExW", "GetModuleHandleExW", "GetModuleHandleExA",
+        "GetStartupInfoW", "GetVersionExW",
+        "InitializeCriticalSectionAndSpinCount", "InitializeCriticalSectionEx",
+        "FlsAlloc", "FlsFree", "FlsGetValue", "FlsGetValue2", "FlsSetValue",
+        "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive",
+        "AcquireSRWLockShared", "ReleaseSRWLockShared",
+        "SleepConditionVariableSRW", "WakeAllConditionVariable", "WakeConditionVariable",
+        "InitializeSListHead", "EncodePointer", "DecodePointer",
+        "SetErrorMode", "SetPriorityClass", "SetThreadExecutionState",
+        "GetDiskFreeSpaceExW", "GetDriveTypeW", "GetVolumeInformationW",
+        "LCMapStringW", "GetStringTypeW", "IsValidCodePage",
+        "CompareStringW", "FoldStringW", "FormatMessageW",
+        "ExpandEnvironmentStringsW", "WriteConsoleW", "ReadConsoleW",
+        "RtlPcToFileHeader", "FindFirstFileExW", "CreateHardLinkW",
+        "BackupRead", "BackupSeek", "DeviceIoControl",
+        "OpenProcessToken", "GetTokenInformation", "LookupPrivilegeValueW",
+        "AdjustTokenPrivileges", "CheckTokenMembership",
+        "AllocateAndInitializeSid", "FreeSid", "RegOpenKeyExW",
+        "RegQueryValueExW", "RegCloseKey", "ConvertStringSidToSidW",
+        "ConvertSidToStringSidW", "LsaOpenPolicy", "LsaClose",
+        "LsaAddAccountRights", "CharLowerW", "ExitWindowsEx",
+        "LoadStringW", "OemToCharBuffW", "CharToOemBuffW",
+        "CharToOemBuffA", "CharToOemA", "OemToCharA",
+        "SetSuspendState", "SHGetPathFromIDListW", "SHGetMalloc",
+        "ShellExecuteExW", "SHFileOperationW", "SHGetSpecialFolderLocation",
+        "CreateThread", "CreateSemaphoreW", "CreateEventW",
+        "FileTimeToSystemTime", "SystemTimeToFileTime",
+        "SystemTimeToTzSpecificLocalTime", "TzSpecificLocalTimeToSystemTime",
+        "GetSystemTime", "GetLongPathNameW", "GetShortPathNameW"
     };
     size_t i;
     for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
@@ -567,140 +615,187 @@ static int win_crt_api(const char *name)
 
 static uint8_t win_argument_count(const char *name)
 {
-    if (win_equal(name, "GetProcAddress")
-        || win_equal(name, "AddVectoredExceptionHandler")
-        || win_equal(name, "WaitForSingleObject")
-        || win_equal(name, "GetCurrentDirectoryA")
-        || win_equal(name, "GetCurrentDirectoryW")
-        || win_equal(name, "GetFileSize")
-        || win_equal(name, "GetFileSizeEx")
-        || win_equal(name, "GetConsoleMode")
-        || win_equal(name, "SetConsoleMode")
-        || win_equal(name, "GetConsoleCursorInfo")
-        || win_equal(name, "GetConsoleScreenBufferInfo")
-        || win_equal(name, "SetConsoleCursorInfo")
-        || win_equal(name, "SetConsoleCursorPosition")
-        || win_equal(name, "SetConsoleTextAttribute")
-        || win_equal(name, "GetHandleInformation")
-        || win_equal(name, "SetProcessAffinityMask")
-        || win_equal(name, "SetThreadPriority")
-        || win_equal(name, "GetThreadContext")
-        || win_equal(name, "SetThreadContext")
-        || win_equal(name, "IsDBCSLeadByteEx")
-        || win_equal(name, "_initterm")
-        || win_equal(name, "setlocale")
-        || win_equal(name, "calloc")
-        || win_equal(name, "realloc")
-        || win_equal(name, "strchr")
-        || win_equal(name, "strrchr")
-        || win_equal(name, "strstr")
-        || win_equal(name, "strcspn")
-        || win_equal(name, "strcmp")
-        || win_equal(name, "_stricmp")
-        || win_equal(name, "strcpy")
-        || win_equal(name, "_stati64")
-        || win_equal(name, "_stat64")
-        || win_equal(name, "_fstati64")
-        || win_equal(name, "_fstat64")
-        || win_equal(name, "_chmod")
-        || win_equal(name, "TlsSetValue")) return 2u;
-    if (win_equal(name, "GetModuleFileNameA")
-        || win_equal(name, "GetModuleFileNameW")
-        || win_equal(name, "VirtualFree")
-        || win_equal(name, "HeapAlloc")
-        || win_equal(name, "HeapFree")
-        || win_equal(name, "HeapSize")
-        || win_equal(name, "LoadLibraryExA")
-        || win_equal(name, "GetProcessAffinityMask")
-        || win_equal(name, "VirtualQuery")
-        || win_equal(name, "OpenProcess")) return 3u;
-    if (win_equal(name, "_open") || win_equal(name, "_read")
-        || win_equal(name, "_write")) return 3u;
-    if (win_equal(name, "memchr") || win_equal(name, "memcmp")
-        || win_equal(name, "memcpy") || win_equal(name, "memmove")
-        || win_equal(name, "memset")
-        || win_equal(name, "strtol") || win_equal(name, "strtoul")
-        || win_equal(name, "strncmp")
-        || win_equal(name, "strncpy")) return 3u;
-    if (win_equal(name, "VirtualProtect")
-        || win_equal(name, "VirtualAlloc")
-        || win_equal(name, "qsort")
-        || win_equal(name, "CreateEventA")
-        || win_equal(name, "CreateSemaphoreA")
-        || win_equal(name, "RaiseException")
-        || win_equal(name, "WaitForMultipleObjects")
-        || win_equal(name, "GetFileTime")
-        || win_equal(name, "SetFileTime")
-        || win_equal(name, "HeapReAlloc")
-        || win_equal(name, "SetFilePointer")
-        || win_equal(name, "SetFilePointerEx")) return 4u;
-    if (win_equal(name, "_sopen")
-        || win_equal(name, "_lseeki64")) return 4u;
+    if (win_equal(name, "AllocateAndInitializeSid")) return 11u;
+    if (win_equal(name, "CreateProcessA") || win_equal(name, "CreateProcessW")) return 10u;
+    if (win_equal(name, "DeviceIoControl") || win_equal(name, "WideCharToMultiByte")
+        || win_equal(name, "GetVolumeInformationW") || win_equal(name, "RtlVirtualUnwind")) return 8u;
+    if (win_equal(name, "CreateFileA") || win_equal(name, "CreateFileW")
+        || win_equal(name, "DuplicateHandle") || win_equal(name, "BackupRead")
+        || win_equal(name, "FormatMessageW")) return 7u;
+    if (win_equal(name, "MultiByteToWideChar")
+        || win_equal(name, "CompareStringA") || win_equal(name, "CompareStringW")
+        || win_equal(name, "CreateThread") || win_equal(name, "FindFirstFileExW")
+        || win_equal(name, "GetDateFormatA") || win_equal(name, "GetDateFormatW")
+        || win_equal(name, "PeekNamedPipe") || win_equal(name, "RegQueryValueExA")
+        || win_equal(name, "RegQueryValueExW") || win_equal(name, "LCMapStringW")
+        || win_equal(name, "BackupSeek") || win_equal(name, "AdjustTokenPrivileges")) return 6u;
     if (win_equal(name, "ReadFile") || win_equal(name, "WriteFile")
-        || win_equal(name, "WriteConsoleOutputA")
-        || win_equal(name, "ReadConsoleOutputA")
-        || win_equal(name, "ScrollConsoleScreenBufferA")
-        || win_equal(name, "__getmainargs")) return 5u;
-    if (win_equal(name, "MultiByteToWideChar")) return 6u;
-    if (win_equal(name, "CreateFileA")
-        || win_equal(name, "CreateFileW")
-        || win_equal(name, "DuplicateHandle")) return 7u;
-    if (win_equal(name, "WideCharToMultiByte")) return 8u;
-    if (win_equal(name, "QueryPerformanceCounter")
-        || win_equal(name, "QueryPerformanceFrequency")
+        || win_equal(name, "WriteConsoleOutputA") || win_equal(name, "ReadConsoleOutputA")
+        || win_equal(name, "ScrollConsoleScreenBufferA") || win_equal(name, "__getmainargs")
+        || win_equal(name, "CreateConsoleScreenBuffer") || win_equal(name, "EnumResourceLanguagesA")
+        || win_equal(name, "ReadProcessMemory") || win_equal(name, "WriteConsoleOutputW")
+        || win_equal(name, "VariantChangeTypeEx") || win_equal(name, "RegOpenKeyExA")
+        || win_equal(name, "RegOpenKeyExW") || win_equal(name, "WriteConsoleW")
+        || win_equal(name, "ReadConsoleW") || win_equal(name, "FoldStringW")
+        || win_equal(name, "GetTokenInformation")) return 5u;
+    if (win_equal(name, "VirtualProtect") || win_equal(name, "VirtualAlloc")
+        || win_equal(name, "qsort") || win_equal(name, "CreateEventA")
+        || win_equal(name, "CreateSemaphoreA") || win_equal(name, "RaiseException")
+        || win_equal(name, "WaitForMultipleObjects") || win_equal(name, "GetFileTime")
+        || win_equal(name, "SetFileTime") || win_equal(name, "HeapReAlloc")
+        || win_equal(name, "SetFilePointer") || win_equal(name, "SetFilePointerEx")
+        || win_equal(name, "_sopen") || win_equal(name, "_lseeki64")
+        || win_equal(name, "CreatePipe") || win_equal(name, "EnumCalendarInfoA")
+        || win_equal(name, "EnumResourceNamesA") || win_equal(name, "FindResourceExA")
+        || win_equal(name, "GetFullPathNameW") || win_equal(name, "GetLocaleInfoA")
+        || win_equal(name, "GetLocaleInfoW") || win_equal(name, "ReadConsoleInputA")
+        || win_equal(name, "WriteConsoleInputA") || win_equal(name, "RtlUnwind")
+        || win_equal(name, "MessageBoxA") || win_equal(name, "GetFileVersionInfoA")
+        || win_equal(name, "SleepConditionVariableSRW") || win_equal(name, "GetDiskFreeSpaceExW")
+        || win_equal(name, "GetStringTypeW") || win_equal(name, "LoadStringW")
+        || win_equal(name, "LsaOpenPolicy") || win_equal(name, "CreateSemaphoreW")
+        || win_equal(name, "CreateEventW") || win_equal(name, "RtlUnwindEx")
+        || win_equal(name, "VerQueryValueA")) return 4u;
+    if (win_equal(name, "GetModuleFileNameA") || win_equal(name, "GetModuleFileNameW")
+        || win_equal(name, "VirtualFree") || win_equal(name, "HeapAlloc")
+        || win_equal(name, "HeapFree") || win_equal(name, "HeapSize")
+        || win_equal(name, "LoadLibraryExA") || win_equal(name, "LoadLibraryExW")
+        || win_equal(name, "GetProcessAffinityMask")
+        || win_equal(name, "GetModuleHandleExW") || win_equal(name, "GetModuleHandleExA")
+        || win_equal(name, "InitializeCriticalSectionEx") || win_equal(name, "ExpandEnvironmentStringsW")
+        || win_equal(name, "OpenProcessToken") || win_equal(name, "LookupPrivilegeValueW")
+        || win_equal(name, "LookupPrivilegeValueA") || win_equal(name, "CheckTokenMembership")
+        || win_equal(name, "OemToCharBuffW") || win_equal(name, "CharToOemBuffW")
+        || win_equal(name, "CharToOemBuffA") || win_equal(name, "SetSuspendState")
+        || win_equal(name, "SHGetSpecialFolderLocation") || win_equal(name, "LsaAddAccountRights")
+        || win_equal(name, "CreateHardLinkW") || win_equal(name, "SystemTimeToTzSpecificLocalTime")
+        || win_equal(name, "TzSpecificLocalTimeToSystemTime") || win_equal(name, "GetLongPathNameW")
+        || win_equal(name, "VirtualQuery") || win_equal(name, "OpenProcess")
+        || win_equal(name, "_open") || win_equal(name, "_read") || win_equal(name, "_write")
+        || win_equal(name, "memchr") || win_equal(name, "memcmp")
+        || win_equal(name, "memcpy") || win_equal(name, "memmove") || win_equal(name, "memset")
+        || win_equal(name, "strtol") || win_equal(name, "strtoul")
+        || win_equal(name, "strncmp") || win_equal(name, "strncpy")
+        || win_equal(name, "ReleaseSemaphore")
+        || win_equal(name, "SysReAllocStringLen") || win_equal(name, "SetConsoleWindowInfo")
+        || win_equal(name, "EnumResourceTypesA") || win_equal(name, "FindResourceA")
+        || win_equal(name, "FileTimeToDosDateTime") || win_equal(name, "DosDateTimeToFileTime")
+        || win_equal(name, "GetShortPathNameA") || win_equal(name, "OpenThread")
+        || win_equal(name, "SafeArrayCreate") || win_equal(name, "SafeArrayGetElement")
+        || win_equal(name, "SafeArrayGetLBound") || win_equal(name, "SafeArrayGetUBound")
+        || win_equal(name, "SafeArrayPtrOfIndex") || win_equal(name, "SafeArrayPutElement")
+        || win_equal(name, "GetWindowTextA") || win_equal(name, "OemToCharBuffA")) return 3u;
+    if (win_equal(name, "GetProcAddress") || win_equal(name, "AddVectoredExceptionHandler")
+        || win_equal(name, "WaitForSingleObject") || win_equal(name, "GetCurrentDirectoryA")
+        || win_equal(name, "GetCurrentDirectoryW") || win_equal(name, "GetFileSize")
+        || win_equal(name, "GetFileSizeEx") || win_equal(name, "GetConsoleMode")
+        || win_equal(name, "SetConsoleMode") || win_equal(name, "GetConsoleCursorInfo")
+        || win_equal(name, "GetConsoleScreenBufferInfo") || win_equal(name, "SetConsoleCursorInfo")
+        || win_equal(name, "SetConsoleCursorPosition") || win_equal(name, "SetConsoleTextAttribute")
+        || win_equal(name, "GetHandleInformation") || win_equal(name, "SetProcessAffinityMask")
+        || win_equal(name, "SetThreadPriority") || win_equal(name, "GetThreadContext")
+        || win_equal(name, "SetThreadContext") || win_equal(name, "IsDBCSLeadByteEx")
+        || win_equal(name, "_initterm") || win_equal(name, "setlocale")
+        || win_equal(name, "calloc") || win_equal(name, "realloc")
+        || win_equal(name, "strchr") || win_equal(name, "strrchr")
+        || win_equal(name, "strstr") || win_equal(name, "strcspn")
+        || win_equal(name, "strcmp") || win_equal(name, "_stricmp")
+        || win_equal(name, "strcpy") || win_equal(name, "_stati64")
+        || win_equal(name, "_stat64") || win_equal(name, "_fstati64")
+        || win_equal(name, "_fstat64") || win_equal(name, "_chmod")
+        || win_equal(name, "LocalAlloc") || win_equal(name, "GlobalAlloc")
+        || win_equal(name, "SetConsoleCtrlHandler") || win_equal(name, "FindFirstFileA")
+        || win_equal(name, "FindFirstFileW") || win_equal(name, "FindNextFileA")
+        || win_equal(name, "FindNextFileW") || win_equal(name, "GetFileInformationByHandle")
+        || win_equal(name, "SysAllocStringLen") || win_equal(name, "SetConsoleScreenBufferSize")
+        || win_equal(name, "TlsSetValue") || win_equal(name, "FlsSetValue")
+        || win_equal(name, "InitializeCriticalSectionAndSpinCount")
+        || win_equal(name, "RtlPcToFileHeader") || win_equal(name, "SetPriorityClass")
+        || win_equal(name, "SetFileAttributesW") || win_equal(name, "ConvertStringSidToSidW")
+        || win_equal(name, "ConvertSidToStringSidW") || win_equal(name, "CharToOemA")
+        || win_equal(name, "OemToCharA") || win_equal(name, "ExitWindowsEx")
+        || win_equal(name, "SHGetPathFromIDListW") || win_equal(name, "FileTimeToSystemTime")
+        || win_equal(name, "SystemTimeToFileTime")
+        || win_equal(name, "CreateDirectoryW") || win_equal(name, "MoveFileW")
+        || win_equal(name, "SetEnvironmentVariableW") || win_equal(name, "GetCPInfo")
+        || win_equal(name, "GetExitCodeProcess") || win_equal(name, "GetWindowsDirectoryA")
+        || win_equal(name, "GetSystemDirectoryW") || win_equal(name, "LocalFileTimeToFileTime")
+        || win_equal(name, "FileTimeToLocalFileTime") || win_equal(name, "LoadResource")
+        || win_equal(name, "SizeofResource") || win_equal(name, "SetStdHandle")
+        || win_equal(name, "SleepEx") || win_equal(name, "TerminateProcess")
+        || win_equal(name, "TerminateThread") || win_equal(name, "SafeArrayAccessData")
+        || win_equal(name, "SafeArrayRedim") || win_equal(name, "VariantCopy")
+        || win_equal(name, "CharLowerBuffA") || win_equal(name, "CharLowerBuffW")
+        || win_equal(name, "CharUpperBuffA") || win_equal(name, "CharUpperBuffW")
+        || win_equal(name, "EnumWindows") || win_equal(name, "GetWindowThreadProcessId")
+        || win_equal(name, "SetClipboardData") || win_equal(name, "SetWindowTextA")
+        || win_equal(name, "VkKeyScanExA") || win_equal(name, "GetFileVersionInfoSizeA")) return 2u;
+    if (win_equal(name, "QueryPerformanceCounter") || win_equal(name, "QueryPerformanceFrequency")
         || win_equal(name, "LoadLibraryA") || win_equal(name, "LoadLibraryW")
-        || win_equal(name, "ExitProcess")
-        || win_equal(name, "exit")
-        || win_equal(name, "GetModuleHandleA")
-        || win_equal(name, "GetModuleHandleW")
-        || win_equal(name, "GetStdHandle")
-        || win_equal(name, "GetFileType")
-        || win_equal(name, "FlushFileBuffers")
-        || win_equal(name, "CloseHandle")
-        || win_equal(name, "RemoveVectoredExceptionHandler")
-        || win_equal(name, "InitializeCriticalSection")
-        || win_equal(name, "DeleteCriticalSection")
-        || win_equal(name, "EnterCriticalSection")
-        || win_equal(name, "LeaveCriticalSection")
-        || win_equal(name, "TryEnterCriticalSection")
-        || win_equal(name, "GetSystemTimeAsFileTime")
-        || win_equal(name, "GetThreadPriority")
-        || win_equal(name, "SetUnhandledExceptionFilter")
-        || win_equal(name, "TlsGetValue")
-        || win_equal(name, "OutputDebugStringA")
-        || win_equal(name, "SetEvent")
-        || win_equal(name, "ResetEvent")
-        || win_equal(name, "SetLastError")
-        || win_equal(name, "GetStartupInfoA")
-        || win_equal(name, "GetSystemInfo")
-        || win_equal(name, "ResumeThread")
-        || win_equal(name, "SuspendThread")
-        || win_equal(name, "Sleep")
-        || win_equal(name, "__set_app_type")
-        || win_equal(name, "__setusermatherr")
-        || win_equal(name, "malloc")
-        || win_equal(name, "free")
-        || win_equal(name, "strlen")
-        || win_equal(name, "wcslen")
-        || win_equal(name, "_strdup")
-        || win_equal(name, "_onexit")
-        || win_equal(name, "_time64")
-        || win_equal(name, "time")
-        || win_equal(name, "srand")
-        || win_equal(name, "_get_osfhandle")
-        || win_equal(name, "_isatty")
-        || win_equal(name, "_fileno")
-        || win_equal(name, "_close")
-        || win_equal(name, "_unlink")
-        || win_equal(name, "fflush")
-        || win_equal(name, "getenv")
-        || win_equal(name, "tolower")
-        || win_equal(name, "islower")
-        || win_equal(name, "isspace")
-        || win_equal(name, "isupper")
-        || win_equal(name, "isxdigit")
+        || win_equal(name, "ExitProcess") || win_equal(name, "exit")
+        || win_equal(name, "GetModuleHandleA") || win_equal(name, "GetModuleHandleW")
+        || win_equal(name, "GetStdHandle") || win_equal(name, "GetFileType")
+        || win_equal(name, "FlushFileBuffers") || win_equal(name, "CloseHandle")
+        || win_equal(name, "RemoveVectoredExceptionHandler") || win_equal(name, "InitializeCriticalSection")
+        || win_equal(name, "DeleteCriticalSection") || win_equal(name, "EnterCriticalSection")
+        || win_equal(name, "LeaveCriticalSection") || win_equal(name, "TryEnterCriticalSection")
+        || win_equal(name, "GetSystemTimeAsFileTime") || win_equal(name, "GetThreadPriority")
+        || win_equal(name, "SetUnhandledExceptionFilter") || win_equal(name, "TlsGetValue")
+        || win_equal(name, "FlsGetValue") || win_equal(name, "FlsGetValue2") || win_equal(name, "FlsAlloc") || win_equal(name, "FlsFree")
+        || win_equal(name, "AcquireSRWLockExclusive") || win_equal(name, "ReleaseSRWLockExclusive")
+        || win_equal(name, "AcquireSRWLockShared") || win_equal(name, "ReleaseSRWLockShared")
+        || win_equal(name, "WakeAllConditionVariable") || win_equal(name, "WakeConditionVariable")
+        || win_equal(name, "InitializeSListHead") || win_equal(name, "EncodePointer")
+        || win_equal(name, "DecodePointer") || win_equal(name, "SetErrorMode")
+        || win_equal(name, "SetThreadExecutionState") || win_equal(name, "GetDriveTypeW")
+        || win_equal(name, "GetDriveTypeA") || win_equal(name, "IsValidCodePage")
+        || win_equal(name, "FreeSid") || win_equal(name, "CharLowerW")
+        || win_equal(name, "SHGetMalloc") || win_equal(name, "ShellExecuteExW")
+        || win_equal(name, "SHFileOperationW") || win_equal(name, "LsaClose")
+        || win_equal(name, "GetStartupInfoW") || win_equal(name, "GetVersionExW")
+        || win_equal(name, "GetSystemTime") || win_equal(name, "GetShortPathNameW")
+        || win_equal(name, "IsDBCSLeadByte") || win_equal(name, "SetDllDirectoryW")
+        || win_equal(name, "SetDllDirectoryA")
+        || win_equal(name, "AreFileApisANSI") || win_equal(name, "GetCPInfo")
+        || win_equal(name, "OutputDebugStringA") || win_equal(name, "SetEvent")
+        || win_equal(name, "ResetEvent") || win_equal(name, "SetLastError")
+        || win_equal(name, "GetStartupInfoA") || win_equal(name, "GetSystemInfo")
+        || win_equal(name, "GetActiveProcessorGroupCount") || win_equal(name, "GetActiveProcessorCount")
+        || win_equal(name, "ResumeThread") || win_equal(name, "SuspendThread")
+        || win_equal(name, "Sleep") || win_equal(name, "__set_app_type")
+        || win_equal(name, "__setusermatherr") || win_equal(name, "malloc")
+        || win_equal(name, "free") || win_equal(name, "strlen")
+        || win_equal(name, "wcslen") || win_equal(name, "_strdup")
+        || win_equal(name, "_onexit") || win_equal(name, "_time64")
+        || win_equal(name, "time") || win_equal(name, "srand")
+        || win_equal(name, "_get_osfhandle") || win_equal(name, "_isatty")
+        || win_equal(name, "_fileno") || win_equal(name, "_close")
+        || win_equal(name, "_unlink") || win_equal(name, "fflush")
+        || win_equal(name, "getenv") || win_equal(name, "tolower")
+        || win_equal(name, "islower") || win_equal(name, "isspace")
+        || win_equal(name, "isupper") || win_equal(name, "isxdigit")
+        || win_equal(name, "LocalFree") || win_equal(name, "GlobalFree")
+        || win_equal(name, "GlobalLock") || win_equal(name, "GlobalUnlock")
+        || win_equal(name, "TlsFree") || win_equal(name, "IsProcessorFeaturePresent")
+        || win_equal(name, "CharUpperW") || win_equal(name, "GetFileAttributesA")
+        || win_equal(name, "GetFileAttributesW") || win_equal(name, "FindClose")
+        || win_equal(name, "SetEndOfFile") || win_equal(name, "SysFreeString")
+        || win_equal(name, "GetVersionExA") || win_equal(name, "SetThreadLocale")
+        || win_equal(name, "SetConsoleCP") || win_equal(name, "SetConsoleActiveScreenBuffer")
+        || win_equal(name, "FlushConsoleInputBuffer") || win_equal(name, "GetNumberOfConsoleMouseButtons")
+        || win_equal(name, "GetLocalTime") || win_equal(name, "FreeLibrary")
+        || win_equal(name, "DeleteFileW") || win_equal(name, "ExitThread")
+        || win_equal(name, "FreeEnvironmentStringsA") || win_equal(name, "FreeResource")
+        || win_equal(name, "LockResource") || win_equal(name, "RemoveDirectoryW")
+        || win_equal(name, "SetCurrentDirectoryW") || win_equal(name, "RegCloseKey")
+        || win_equal(name, "CoTaskMemFree") || win_equal(name, "SafeArrayUnaccessData")
+        || win_equal(name, "VariantClear") || win_equal(name, "VariantInit")
+        || win_equal(name, "CharLowerA") || win_equal(name, "CharUpperA")
+        || win_equal(name, "GetClipboardData") || win_equal(name, "GetKeyboardLayout")
+        || win_equal(name, "GetSystemMetrics") || win_equal(name, "MessageBeep")
+        || win_equal(name, "OpenClipboard")
+        || win_equal(name, "GetActiveProcessorCount")
         || win_equal(name, "atoi")) return 1u;
-    if (win_equal(name, "ReleaseSemaphore")) return 3u;
     return 0u;
 }
 
@@ -710,13 +805,8 @@ static uint64_t win_resolve(xxemul_windows *process,
     size_t i;
     win_api *api;
     uint64_t address;
-    int is_crt = win_crt_api(name);
-    if (!win_known_api(name) && !is_crt) return 0;
-    if (is_crt) {
-        if (!win_suffix(module, "msvcrt.dll")
-            && !win_suffix(module, "ucrtbase.dll")) return 0;
-    } else if (!win_suffix(module, "kernel32.dll")
-        && !win_suffix(module, "kernelbase.dll")) return 0;
+    int is_crt = win_crt_api(name) || win_suffix(module, "msvcrt.dll")
+        || win_suffix(module, "ucrtbase.dll");
     if (win_equal(name, "_iob")) return process->iob_address;
     if (win_equal(name, "__initenv"))
         return process->runtime_base + WIN_CRT_DATA_OFFSET;
@@ -751,6 +841,21 @@ static uint64_t win_resolve(xxemul_windows *process,
     if (!win_store(process, address, 1u, 0xccu)) return 0;
     ++process->api_count;
     return address;
+}
+
+static const char *win_oleaut32_ordinal_name(uint16_t ordinal)
+{
+    switch (ordinal) {
+    case 2: return "SysAllocString";
+    case 4: return "SysAllocStringLen";
+    case 6: return "SysFreeString";
+    case 7: return "SysStringLen";
+    case 8: return "VariantInit";
+    case 9: return "VariantClear";
+    case 10: return "VariantCopy";
+    case 149: return "SysStringByteLen";
+    default: return NULL;
+    }
 }
 
 static int win_bind_imports(xxemul_windows *process, const uint8_t *optional,
@@ -793,9 +898,21 @@ static int win_bind_imports(xxemul_windows *process, const uint8_t *optional,
             raw = is_64 ? win_le64(slot) : win_le32(slot);
             if (raw == 0) break;
             if (raw & (is_64 ? UINT64_C(0x8000000000000000)
-                             : UINT64_C(0x80000000))) return 0;
-            if (raw > UINT32_MAX || !win_image_string(process,
-                    raw + 2u, name, sizeof(name))) return 0;
+                             : UINT64_C(0x80000000))) {
+                uint16_t ordinal = (uint16_t)(raw & 0xffffu);
+                const char *ord_name = NULL;
+                if (win_suffix(module, "oleaut32.dll")) {
+                    ord_name = win_oleaut32_ordinal_name(ordinal);
+                }
+                if (ord_name != NULL) {
+                    snprintf(name, sizeof(name), "%s", ord_name);
+                } else {
+                    snprintf(name, sizeof(name), "#%u", ordinal);
+                }
+            } else {
+                if (raw > UINT32_MAX || !win_image_string(process,
+                        raw + 2u, name, sizeof(name))) return 0;
+            }
             address = win_resolve(process, module, name);
             if (address == 0 || !win_store(process,
                     process->image_base + slot_rva,
@@ -803,7 +920,70 @@ static int win_bind_imports(xxemul_windows *process, const uint8_t *optional,
         }
         if (symbol_index == 4096u) return 0;
     }
-    return 0;
+    return 1;
+}
+
+static int win_bind_tls(xxemul_windows *process, const uint8_t *optional,
+    size_t optional_size, int is_64)
+{
+    size_t directory_offset = is_64 ? 112u : 96u;
+    uint8_t pointer_size = (uint8_t)(is_64 ? 8u : 4u);
+    uint32_t tls_rva = 0, tls_size = 0;
+    uint64_t tls_array = process->runtime_base + WIN_TLS_ARRAY_OFFSET;
+    uint64_t default_data = process->runtime_base + WIN_TLS_DEFAULT_DATA_OFFSET;
+    uint64_t target_tls_data = default_data;
+
+    win_store(process, default_data, pointer_size, 0);
+    win_store(process, tls_array, pointer_size, default_data);
+
+    if (is_64) {
+        win_store(process, process->runtime_base + 0x58u, 8u, tls_array);
+    } else {
+        win_store(process, process->runtime_base + 0x2cu, 4u, tls_array);
+    }
+
+    if (optional_size >= directory_offset + 80u) {
+        tls_rva = win_le32(optional + directory_offset + 72u);
+        tls_size = win_le32(optional + directory_offset + 76u);
+    }
+
+    if (tls_rva != 0 && tls_size >= (is_64 ? 40u : 24u)) {
+        const uint8_t *dir;
+        if (win_image_rva(process, tls_rva, tls_size, &dir)) {
+            uint64_t start_raw = is_64 ? win_le64(dir) : win_le32(dir);
+            uint64_t end_raw = is_64 ? win_le64(dir + 8u) : win_le32(dir + 4u);
+            uint64_t addr_index = is_64 ? win_le64(dir + 16u) : win_le32(dir + 8u);
+            uint32_t zero_fill = win_le32(dir + (is_64 ? 32u : 16u));
+            uint64_t raw_size = (end_raw > start_raw) ? (end_raw - start_raw) : 0u;
+            uint64_t total_size = raw_size + zero_fill;
+
+            if (addr_index != 0) {
+                win_store(process, addr_index, 4u, 0);
+            }
+
+            if (total_size > 0) {
+                target_tls_data = win_heap_alloc(process, total_size > 16u ? total_size : 16u);
+                if (target_tls_data != 0) {
+                    if (raw_size > 0) {
+                        uint8_t temp[1024];
+                        uint64_t copied = 0;
+                        while (copied < raw_size) {
+                            size_t chunk = (size_t)(raw_size - copied);
+                            if (chunk > sizeof(temp)) chunk = sizeof(temp);
+                            if (win_read(process, start_raw + copied, temp, chunk)) {
+                                win_write(process, target_tls_data + copied, temp, chunk);
+                            }
+                            copied += chunk;
+                        }
+                    }
+                    win_store(process, tls_array, pointer_size, target_tls_data);
+                }
+            } else if (start_raw != 0) {
+                win_store(process, tls_array, pointer_size, start_raw);
+            }
+        }
+    }
+    return 1;
 }
 
 static int win_prepare_runtime(xxemul_windows *process,
@@ -878,6 +1058,10 @@ static int win_prepare_runtime(xxemul_windows *process,
                 1u, 0xffu)) return 0;
     }
 
+    win_store(process, process->runtime_base + WIN_TLS_DEFAULT_DATA_OFFSET, word_size, 0);
+    win_store(process, process->runtime_base + WIN_TLS_ARRAY_OFFSET, word_size,
+        process->runtime_base + WIN_TLS_DEFAULT_DATA_OFFSET);
+
     if (word_size == 4u) {
         if (!win_store(process, process->runtime_base + 0x04u, 4u,
                 process->runtime_base)
@@ -885,6 +1069,8 @@ static int win_prepare_runtime(xxemul_windows *process,
                 process->runtime_base - 0x40000u)
             || !win_store(process, process->runtime_base + 0x18u, 4u,
                 process->runtime_base)
+            || !win_store(process, process->runtime_base + 0x2cu, 4u,
+                process->runtime_base + WIN_TLS_ARRAY_OFFSET)
             || !win_store(process, process->runtime_base + 0x30u, 4u, peb)
             || !win_store(process, peb + 0x08u, 4u, process->image_base)
             || !win_store(process, peb + 0x10u, 4u, params)
@@ -901,6 +1087,8 @@ static int win_prepare_runtime(xxemul_windows *process,
                 process->runtime_base - 0x40000u)
             || !win_store(process, process->runtime_base + 0x30u, 8u,
                 process->runtime_base)
+            || !win_store(process, process->runtime_base + 0x58u, 8u,
+                process->runtime_base + WIN_TLS_ARRAY_OFFSET)
             || !win_store(process, process->runtime_base + 0x60u, 8u, peb)
             || !win_store(process, peb + 0x10u, 8u, process->image_base)
             || !win_store(process, peb + 0x20u, 8u, params)
@@ -963,6 +1151,13 @@ xxemul_windows *xxemul_windows_create(
     process->virtual_tick = 1000u;
     process->random_state = 1u;
     process->image_size = image_size;
+    {
+        size_t dir_off = is_64 ? 112u : 96u;
+        if (optional_size >= dir_off + 24u) {
+            process->resource_rva = win_le32(optional + dir_off + 16u);
+            process->resource_size = win_le32(optional + dir_off + 20u);
+        }
+    }
     process->runtime_base = emulator->region_address
         + emulator->region_size - WIN_RUNTIME_SIZE;
     process->heap_cursor = (emulator->region_address + image_size + 15u)
@@ -988,7 +1183,8 @@ xxemul_windows *xxemul_windows_create(
             sizeof(process->working_directory), working_directory)
         || process->heap_cursor >= process->heap_limit
         || !win_prepare_runtime(process, arguments, argument_count)
-        || !win_bind_imports(process, optional, optional_size, is_64)) {
+        || !win_bind_imports(process, optional, optional_size, is_64)
+        || !win_bind_tls(process, optional, optional_size, is_64)) {
         free(process);
         if (status != NULL) *status = XXEMUL_STATUS_INVALID_IMAGE;
         return NULL;
@@ -1098,14 +1294,28 @@ const char *xxemul_windows_thunk_name(
 
 static uint64_t win_module_handle(xxemul_windows *process, const char *name)
 {
+    char base[260];
+    const char *dot;
     if (name == NULL || *name == '\0') return process->image_base;
-    if (win_suffix(name, "kernel32.dll")
-        || win_suffix(name, "kernelbase.dll")) return 0x76000000u;
-    if (win_suffix(name, "msvcrt.dll")
-        || win_suffix(name, "ucrtbase.dll")) return 0x77000000u;
-    if (win_suffix(name, "ntdll.dll")) return 0x78000000u;
-    if (win_suffix(name, "user32.dll")) return 0x79000000u;
-    if (win_suffix(name, "advapi32.dll")) return 0x7a000000u;
+    if (win_copy(base, sizeof(base), name)) {
+        dot = strrchr(base, '.');
+        if (dot == NULL && strlen(base) + 4 < sizeof(base)) {
+            memcpy(base + strlen(base), ".dll", 5);
+        }
+    } else {
+        win_copy(base, sizeof(base), name);
+    }
+    if (win_suffix(base, "kernel32.dll")
+        || win_suffix(base, "kernelbase.dll")
+        || win_prefix(base, "api-ms-win-core-")) return 0x76000000u;
+    if (win_suffix(base, "msvcrt.dll")
+        || win_suffix(base, "ucrtbase.dll")
+        || win_prefix(base, "api-ms-win-crt-")) return 0x77000000u;
+    if (win_suffix(base, "ntdll.dll")) return 0x78000000u;
+    if (win_suffix(base, "user32.dll")) return 0x79000000u;
+    if (win_suffix(base, "advapi32.dll")) return 0x7a000000u;
+    if (win_suffix(base, "shell32.dll")) return 0x7b000000u;
+    if (win_suffix(base, "powrprof.dll")) return 0x7c000000u;
     return 0;
 }
 
@@ -1117,6 +1327,8 @@ static const char *win_module_name(uint64_t handle)
     case 0x78000000u: return "ntdll.dll";
     case 0x79000000u: return "user32.dll";
     case 0x7a000000u: return "advapi32.dll";
+    case 0x7b000000u: return "shell32.dll";
+    case 0x7c000000u: return "powrprof.dll";
     default: return NULL;
     }
 }
@@ -1547,6 +1759,8 @@ static uint64_t win_create_sync(xxemul_windows *process, uint8_t kind,
 
 static int win_sync_ready(const win_handle *entry)
 {
+    if (entry->kind == WIN_HANDLE_PROCESS || entry->kind == WIN_HANDLE_THREAD)
+        return 1;
     return entry->kind == WIN_HANDLE_EVENT ? entry->signaled != 0
         : entry->kind == WIN_HANDLE_SEMAPHORE
             && entry->semaphore_count != 0u;
@@ -1594,12 +1808,15 @@ static xxemul_status win_critical_initialize(
     uint8_t zero[40] = {0};
     win_critical_section *entry = NULL;
     size_t index;
-    if (address == 0u || win_critical_at(process, address) != NULL)
+    if (address == 0u)
         return XXEMUL_STATUS_INVALID_ARGUMENT;
-    for (index = 0; index < WIN_MAX_CRITICAL_SECTIONS; ++index) {
-        if (!process->critical_sections[index].active) {
-            entry = &process->critical_sections[index];
-            break;
+    entry = win_critical_at(process, address);
+    if (entry == NULL) {
+        for (index = 0; index < WIN_MAX_CRITICAL_SECTIONS; ++index) {
+            if (!process->critical_sections[index].active) {
+                entry = &process->critical_sections[index];
+                break;
+            }
         }
     }
     if (entry == NULL) return XXEMUL_STATUS_OUT_OF_MEMORY;
@@ -1635,6 +1852,13 @@ static uint64_t win_file_read(xxemul_windows *process,
             && !win_store(process, bytes_read, 4u, (uint32_t)result))))
         result = -1;
     free(bytes);
+    if (result == 0 && count > 0) {
+        win_handle *entry = win_handle_at(process, handle);
+        if (entry != NULL && entry->file_path[0] == '\0') {
+            process->last_error = 109u; /* ERROR_BROKEN_PIPE */
+            return 0u;
+        }
+    }
     process->last_error = result < 0 ? 6u : 0u;
     return result < 0 ? 0u : 1u;
 }
@@ -1673,6 +1897,7 @@ static uint64_t win_file_write(xxemul_windows *process,
         } else {
             FILE *stream = handle == 0x11u ? stdout : stderr;
             result = (ssize_t)fwrite(bytes, 1, (size_t)count, stream);
+            fflush(stream);
         }
     } else {
         result = io == NULL ? -1 : xx_io_write(io, bytes, (size_t)count);
@@ -1683,6 +1908,73 @@ static uint64_t win_file_write(xxemul_windows *process,
         result = -1;
     process->last_error = result < 0 ? 6u : 0u;
     return result < 0 ? 0u : 1u;
+}
+
+static uint64_t win_console_write_w(xxemul_windows *process,
+    uint64_t handle, uint64_t buffer, uint64_t count,
+    uint64_t chars_written)
+{
+    uint16_t *chars;
+    size_t i;
+    if (chars_written != 0 && !win_store(process, chars_written, 4u, 0)) return 0;
+    if (count == 0) return 1;
+    if (count > WIN_MAX_IO) {
+        process->last_error = 8u;
+        return 0;
+    }
+    chars = (uint16_t *)malloc((size_t)(count * 2u));
+    if (chars == NULL) {
+        process->last_error = 8u;
+        return 0;
+    }
+    if (!win_read(process, buffer, chars, (size_t)count * 2u)) {
+        free(chars);
+        process->last_error = 487u;
+        return 0;
+    }
+    for (i = 0; i < (size_t)count; ++i) {
+        uint16_t ch = chars[i];
+        if (process->emulator->output_callback != NULL) {
+            if (ch < 0x80) {
+                process->emulator->output_callback(
+                    process->emulator->output_context, (uint8_t)ch);
+            } else {
+                char utf8[4];
+                int len = WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)&ch, 1,
+                    utf8, sizeof(utf8), NULL, NULL);
+                int k;
+                for (k = 0; k < len; ++k) {
+                    process->emulator->output_callback(
+                        process->emulator->output_context, (uint8_t)utf8[k]);
+                }
+            }
+        } else {
+            FILE *stream = handle == 0x12u ? stderr : stdout;
+            if (ch < 0x80) {
+                fputc((int)ch, stream);
+            } else {
+#if defined(_WIN32)
+                char utf8[8];
+                int len = WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)&ch, 1,
+                    utf8, sizeof(utf8), NULL, NULL);
+                if (len > 0) {
+                    fwrite(utf8, 1, (size_t)len, stream);
+                } else {
+                    fputc('?', stream);
+                }
+#else
+                fputc('?', stream);
+#endif
+            }
+        }
+    }
+    if (process->emulator->output_callback == NULL) {
+        fflush(handle == 0x12u ? stderr : stdout);
+    }
+    free(chars);
+    if (chars_written != 0)
+        win_store(process, chars_written, 4u, (uint32_t)count);
+    return 1;
 }
 
 static int win_get_arg(xxemul_windows *process,
@@ -2397,6 +2689,99 @@ static xxemul_status win_crt_parse_number(xxemul_windows *process,
     return status;
 }
 
+static int win_load_string(xxemul_windows *process, uint32_t uid,
+    uint64_t buffer, uint32_t max_chars, uint64_t *result)
+{
+    uint32_t block_id = (uid / 16u) + 1u;
+    uint32_t str_idx = uid % 16u;
+    uint64_t rsrc_base;
+    uint64_t named_entries = 0, id_entries = 0;
+    uint32_t i, j, k;
+    uint64_t block_dir_offset = 0, lang_dir_offset = 0, data_entry_offset = 0;
+    uint64_t offset_to_data = 0, data_size = 0;
+
+    if (process->resource_rva == 0 || process->resource_size == 0) return 0;
+    rsrc_base = process->image_base + process->resource_rva;
+
+    /* Level 1: Find Type 6 (RT_STRING) */
+    if (!win_load(process, rsrc_base + 12u, 2u, &named_entries)
+        || !win_load(process, rsrc_base + 14u, 2u, &id_entries)) return 0;
+    for (i = 0; i < (uint32_t)named_entries + (uint32_t)id_entries; ++i) {
+        uint64_t entry_addr = rsrc_base + 16u + (uint64_t)i * 8u;
+        uint64_t type_id = 0, offset = 0;
+        win_load(process, entry_addr, 4u, &type_id);
+        win_load(process, entry_addr + 4u, 4u, &offset);
+        if (type_id == 6u && (offset & 0x80000000u)) {
+            block_dir_offset = rsrc_base + (offset & 0x7fffffffu);
+            break;
+        }
+    }
+    if (block_dir_offset == 0) return 0;
+
+    /* Level 2: Find block_id */
+    if (!win_load(process, block_dir_offset + 12u, 2u, &named_entries)
+        || !win_load(process, block_dir_offset + 14u, 2u, &id_entries)) return 0;
+    for (j = 0; j < (uint32_t)named_entries + (uint32_t)id_entries; ++j) {
+        uint64_t entry_addr = block_dir_offset + 16u + (uint64_t)j * 8u;
+        uint64_t cur_id = 0, offset = 0;
+        win_load(process, entry_addr, 4u, &cur_id);
+        win_load(process, entry_addr + 4u, 4u, &offset);
+        if (cur_id == block_id && (offset & 0x80000000u)) {
+            lang_dir_offset = rsrc_base + (offset & 0x7fffffffu);
+            break;
+        }
+    }
+    if (lang_dir_offset == 0) return 0;
+
+    /* Level 3: First language entry */
+    if (!win_load(process, lang_dir_offset + 12u, 2u, &named_entries)
+        || !win_load(process, lang_dir_offset + 14u, 2u, &id_entries)) return 0;
+    if ((uint32_t)named_entries + (uint32_t)id_entries == 0) return 0;
+    {
+        uint64_t offset = 0;
+        win_load(process, lang_dir_offset + 16u + 4u, 4u, &offset);
+        data_entry_offset = rsrc_base + (offset & 0x7fffffffu);
+    }
+
+    /* Read IMAGE_RESOURCE_DATA_ENTRY */
+    win_load(process, data_entry_offset, 4u, &offset_to_data);
+    win_load(process, data_entry_offset + 4u, 4u, &data_size);
+    if (offset_to_data == 0 || data_size == 0) return 0;
+
+    /* Read the 16 counted UTF-16 strings */
+    {
+        uint64_t curr = process->image_base + offset_to_data;
+        uint64_t end = curr + data_size;
+        for (k = 0; k < 16u && curr + 2u <= end; ++k) {
+            uint64_t str_len = 0;
+            win_load(process, curr, 2u, &str_len);
+            curr += 2u;
+            if (k == str_idx) {
+                if (max_chars == 0) {
+                    if (buffer != 0) {
+                        win_store(process, buffer, process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u, curr);
+                    }
+                    *result = str_len;
+                    return 1;
+                }
+                uint32_t to_copy = (uint32_t)str_len < max_chars - 1u ? (uint32_t)str_len : max_chars - 1u;
+                if (buffer != 0) {
+                    uint8_t temp[2048];
+                    uint32_t bytes_to_copy = to_copy * 2u;
+                    if (bytes_to_copy > sizeof(temp)) bytes_to_copy = sizeof(temp);
+                    win_read(process, curr, temp, bytes_to_copy);
+                    win_write(process, buffer, temp, bytes_to_copy);
+                    win_store(process, buffer + (uint64_t)to_copy * 2u, 2u, 0);
+                }
+                *result = to_copy;
+                return 1;
+            }
+            curr += (uint64_t)str_len * 2u;
+        }
+    }
+    return 0;
+}
+
 static xxemul_status win_call(xxemul_windows *process,
     const win_api *api, const uint64_t *arg, uint64_t *result)
 {
@@ -2412,6 +2797,7 @@ static xxemul_status win_call(xxemul_windows *process,
     if (strcmp(name, "LoadLibraryA") == 0
         || strcmp(name, "LoadLibraryW") == 0
         || strcmp(name, "LoadLibraryExA") == 0
+        || strcmp(name, "LoadLibraryExW") == 0
         || strcmp(name, "GetModuleHandleA") == 0
         || strcmp(name, "GetModuleHandleW") == 0) {
         if (arg[0] == 0 && name[0] == 'G') {
@@ -2423,6 +2809,21 @@ static xxemul_status win_call(xxemul_windows *process,
                 sizeof(text), wide)) return XXEMUL_STATUS_ADDRESS_FAULT;
         *result = win_module_handle(process, text);
         if (*result == 0) process->last_error = 126u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetModuleHandleExW") == 0
+        || strcmp(name, "GetModuleHandleExA") == 0) {
+        uint64_t mod = 0;
+        if (arg[1] == 0) {
+            mod = process->image_base;
+        } else {
+            wide = win_suffix(name, "W");
+            if (win_guest_string(process, arg[1], text, sizeof(text), wide))
+                mod = win_module_handle(process, text);
+        }
+        if (mod == 0) mod = process->image_base;
+        if (arg[2] != 0) win_store(process, arg[2], word_size, mod);
+        *result = 1u;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetProcAddress") == 0) {
@@ -2687,6 +3088,34 @@ static xxemul_status win_call(xxemul_windows *process,
         if (arg[0] >= 3u) process->crt_fd_handles[arg[0]] = 0u;
         return XXEMUL_STATUS_OK;
     }
+    if (strcmp(name, "fputs") == 0) {
+        char *str = NULL;
+        size_t len = 0u;
+        xxemul_status s = win_crt_read_string(process, arg[0], &str, &len);
+        if (s != XXEMUL_STATUS_OK || str == NULL) return s;
+        if (process->emulator->output_callback != NULL) {
+            size_t k;
+            for (k = 0; k < len; ++k)
+                process->emulator->output_callback(process->emulator->output_context, (uint8_t)str[k]);
+        } else {
+            fputs(str, stdout);
+            fflush(stdout);
+        }
+        free(str);
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "fputc") == 0) {
+        uint8_t ch = (uint8_t)arg[0];
+        if (process->emulator->output_callback != NULL) {
+            process->emulator->output_callback(process->emulator->output_context, ch);
+        } else {
+            fputc(ch, stdout);
+            fflush(stdout);
+        }
+        *result = ch;
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "_lseeki64") == 0) {
         uint64_t handle = win_crt_handle(process, arg[0]);
         xx_io_device *opened = win_handle_io(process, handle);
@@ -2852,8 +3281,21 @@ static xxemul_status win_call(xxemul_windows *process,
         process->emulator->halted = 1;
         return XXEMUL_STATUS_HALTED;
     }
-    if (strcmp(name, "RaiseException") == 0)
+    if (strcmp(name, "RaiseException") == 0) {
+        if (arg[0] == 0xe06d7363u) {
+            uint64_t exit_code = 0;
+            if (arg[3] != 0 && arg[2] >= 2) {
+                uint64_t p_obj = 0;
+                if (win_load(process, arg[3] + 8u, 8u, &p_obj) && p_obj != 0) {
+                    win_load(process, p_obj, 4u, &exit_code);
+                }
+            }
+            process->exit_code = (int32_t)exit_code;
+            *result = 0u;
+            return XXEMUL_STATUS_HALTED;
+        }
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    }
     if (strcmp(name, "VirtualProtect") == 0) {
         uint64_t base = process->emulator->region_address;
         uint64_t span = process->emulator->region_size;
@@ -3085,6 +3527,47 @@ static xxemul_status win_call(xxemul_windows *process,
         }
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
+    if (strcmp(name, "IsDBCSLeadByte") == 0) {
+        uint8_t character = (uint8_t)arg[0];
+#if defined(_WIN32)
+        *result = IsDBCSLeadByte(character) != 0;
+#else
+        *result = 0u;
+#endif
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SetDllDirectoryW") == 0
+        || strcmp(name, "SetDllDirectoryA") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "AreFileApisANSI") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetCPInfo") == 0) {
+        uint32_t code_page = (uint32_t)arg[0];
+        uint8_t buffer[20] = {0};
+#if defined(_WIN32)
+        CPINFO cp;
+        memset(&cp, 0, sizeof(cp));
+        if (GetCPInfo(code_page, &cp)) {
+            memcpy(buffer, &cp, sizeof(cp));
+            *result = 1u;
+        } else {
+            *result = 0u;
+        }
+#else
+        buffer[0] = 1; /* MaxCharSize = 1 */
+        buffer[4] = '?'; /* DefaultChar = '?' */
+        *result = 1u;
+#endif
+        if (*result != 0u && arg[1] != 0u) {
+            if (!win_write(process, arg[1], buffer, sizeof(buffer)))
+                return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "IsDBCSLeadByteEx") == 0) {
         uint32_t code_page = (uint32_t)arg[0];
         uint8_t character = (uint8_t)arg[1];
@@ -3137,7 +3620,7 @@ static xxemul_status win_call(xxemul_windows *process,
         }
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "TlsAlloc") == 0) {
+    if (strcmp(name, "TlsAlloc") == 0 || strcmp(name, "FlsAlloc") == 0) {
         if (process->tls_count >= WIN_MAX_TLS_SLOTS) {
             process->last_error = 8u;
             *result = UINT32_MAX;
@@ -3147,7 +3630,8 @@ static xxemul_status win_call(xxemul_windows *process,
         }
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "TlsGetValue") == 0) {
+    if (strcmp(name, "TlsGetValue") == 0 || strcmp(name, "FlsGetValue") == 0
+        || strcmp(name, "FlsGetValue2") == 0) {
         if (arg[0] >= process->tls_count) {
             process->last_error = 87u;
         } else {
@@ -3156,13 +3640,17 @@ static xxemul_status win_call(xxemul_windows *process,
         }
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "TlsSetValue") == 0) {
+    if (strcmp(name, "TlsSetValue") == 0 || strcmp(name, "FlsSetValue") == 0) {
         if (arg[0] >= process->tls_count) {
             process->last_error = 87u;
         } else {
             process->tls_values[arg[0]] = arg[1];
             *result = 1u;
         }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "TlsFree") == 0 || strcmp(name, "FlsFree") == 0) {
+        *result = 1u;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetSystemTimeAsFileTime") == 0) {
@@ -3184,39 +3672,70 @@ static xxemul_status win_call(xxemul_windows *process,
                 sizeof(text), 0)) return XXEMUL_STATUS_ADDRESS_FAULT;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "InitializeCriticalSection") == 0)
+    if (strcmp(name, "InitializeCriticalSection") == 0
+        || strcmp(name, "InitializeCriticalSectionAndSpinCount") == 0
+        || strcmp(name, "InitializeCriticalSectionEx") == 0) {
+        *result = 1u;
         return win_critical_initialize(process, arg[0]);
+    }
     if (strcmp(name, "DeleteCriticalSection") == 0
         || strcmp(name, "EnterCriticalSection") == 0
         || strcmp(name, "LeaveCriticalSection") == 0
         || strcmp(name, "TryEnterCriticalSection") == 0) {
         win_critical_section *entry = win_critical_at(process, arg[0]);
-        if (entry == NULL) return XXEMUL_STATUS_INVALID_ARGUMENT;
+        if (entry == NULL) {
+            if (strcmp(name, "TryEnterCriticalSection") == 0) *result = 1u;
+            return XXEMUL_STATUS_OK;
+        }
         if (strcmp(name, "DeleteCriticalSection") == 0) {
-            if (entry->recursion != 0u)
-                return XXEMUL_STATUS_INVALID_ARGUMENT;
             entry->active = 0u;
             return XXEMUL_STATUS_OK;
         }
         if (strcmp(name, "LeaveCriticalSection") == 0) {
-            if (entry->recursion == 0u)
-                return XXEMUL_STATUS_INVALID_ARGUMENT;
-            --entry->recursion;
+            if (entry->recursion > 0u) --entry->recursion;
         } else {
-            if (entry->recursion == UINT32_MAX)
-                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-            ++entry->recursion;
+            if (entry->recursion < UINT32_MAX) ++entry->recursion;
             if (strcmp(name, "TryEnterCriticalSection") == 0)
                 *result = 1u;
         }
         return win_critical_write(process, entry);
     }
-    if (strcmp(name, "CreateEventA") == 0) {
+    if (strcmp(name, "AcquireSRWLockExclusive") == 0
+        || strcmp(name, "ReleaseSRWLockExclusive") == 0
+        || strcmp(name, "AcquireSRWLockShared") == 0
+        || strcmp(name, "ReleaseSRWLockShared") == 0
+        || strcmp(name, "WakeAllConditionVariable") == 0
+        || strcmp(name, "WakeConditionVariable") == 0) {
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SleepConditionVariableSRW") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "InitializeSListHead") == 0) {
+        uint8_t zero16[16] = {0};
+        if (arg[0] != 0) win_write(process, arg[0], zero16, word_size == 8u ? 16u : 8u);
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "EncodePointer") == 0 || strcmp(name, "DecodePointer") == 0) {
+        *result = arg[0];
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SetErrorMode") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SetPriorityClass") == 0
+        || strcmp(name, "SetThreadExecutionState") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CreateEventA") == 0 || strcmp(name, "CreateEventW") == 0) {
         *result = win_create_sync(process, WIN_HANDLE_EVENT,
             arg[1], arg[2], arg[3]);
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "CreateSemaphoreA") == 0) {
+    if (strcmp(name, "CreateSemaphoreA") == 0 || strcmp(name, "CreateSemaphoreW") == 0) {
         *result = win_create_sync(process, WIN_HANDLE_SEMAPHORE,
             arg[1], arg[2], arg[3]);
         return XXEMUL_STATUS_OK;
@@ -3404,6 +3923,138 @@ static xxemul_status win_call(xxemul_windows *process,
         }
         return XXEMUL_STATUS_OK;
     }
+#if defined(_WIN32)
+    if (strcmp(name, "GetFileAttributesW") == 0
+        || strcmp(name, "GetFileAttributesA") == 0) {
+        wide = win_suffix(name, "W");
+        if (!win_guest_string(process, arg[0], text, sizeof(text), wide))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = (uint64_t)GetFileAttributesA(text);
+        if (*result == (uint64_t)INVALID_FILE_ATTRIBUTES) {
+            *result = (uint32_t)INVALID_FILE_ATTRIBUTES;
+            process->last_error = GetLastError();
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FindFirstFileW") == 0
+        || strcmp(name, "FindFirstFileExW") == 0) {
+        wchar_t wpath[MAX_PATH];
+        WIN32_FIND_DATAW fd;
+        HANDLE h;
+        uint64_t data_addr = strcmp(name, "FindFirstFileExW") == 0 ? arg[2] : arg[1];
+        if (!win_guest_string(process, arg[0], text, sizeof(text), 1))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        MultiByteToWideChar(CP_UTF8, 0, text, -1, wpath, MAX_PATH);
+        h = FindFirstFileW(wpath, &fd);
+        if (h == INVALID_HANDLE_VALUE) {
+            process->last_error = GetLastError();
+            *result = (uint64_t)INVALID_HANDLE_VALUE;
+            return XXEMUL_STATUS_OK;
+        }
+        if (!win_write(process, data_addr, (const uint8_t *)&fd, sizeof(fd))) {
+            FindClose(h);
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        *result = (uint64_t)(uintptr_t)h;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FindNextFileW") == 0) {
+        WIN32_FIND_DATAW fd;
+        BOOL ok = FindNextFileW((HANDLE)(uintptr_t)arg[0], &fd);
+        if (!ok) {
+            process->last_error = GetLastError();
+            *result = 0;
+            return XXEMUL_STATUS_OK;
+        }
+        if (!win_write(process, arg[1], (const uint8_t *)&fd, sizeof(fd)))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = 1;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FindFirstFileA") == 0) {
+        WIN32_FIND_DATAA fd;
+        HANDLE h;
+        if (!win_guest_string(process, arg[0], text, sizeof(text), 0))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        h = FindFirstFileA(text, &fd);
+        if (h == INVALID_HANDLE_VALUE) {
+            process->last_error = GetLastError();
+            *result = (uint64_t)INVALID_HANDLE_VALUE;
+            return XXEMUL_STATUS_OK;
+        }
+        if (!win_write(process, arg[1], (const uint8_t *)&fd, sizeof(fd))) {
+            FindClose(h);
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        *result = (uint64_t)(uintptr_t)h;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FindNextFileA") == 0) {
+        WIN32_FIND_DATAA fd;
+        BOOL ok = FindNextFileA((HANDLE)(uintptr_t)arg[0], &fd);
+        if (!ok) {
+            process->last_error = GetLastError();
+            *result = 0;
+            return XXEMUL_STATUS_OK;
+        }
+        if (!win_write(process, arg[1], (const uint8_t *)&fd, sizeof(fd)))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = 1;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FileTimeToLocalFileTime") == 0) {
+        FILETIME ft_in, ft_out;
+        if (!win_read(process, arg[0], (uint8_t *)&ft_in, sizeof(ft_in)))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        FileTimeToLocalFileTime(&ft_in, &ft_out);
+        if (!win_write(process, arg[1], (const uint8_t *)&ft_out, sizeof(ft_out)))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = 1;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FileTimeToDosDateTime") == 0) {
+        FILETIME ft;
+        WORD fat_date = 0, fat_time = 0;
+        if (!win_read(process, arg[0], (uint8_t *)&ft, sizeof(ft)))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        FileTimeToDosDateTime(&ft, &fat_date, &fat_time);
+        if (arg[1] != 0) win_store(process, arg[1], 2u, fat_date);
+        if (arg[2] != 0) win_store(process, arg[2], 2u, fat_time);
+        *result = 1;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FindClose") == 0) {
+        if (arg[0] != 0 && arg[0] != (uint64_t)INVALID_HANDLE_VALUE)
+            FindClose((HANDLE)(uintptr_t)arg[0]);
+        *result = 1;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetFileInformationByHandle") == 0) {
+        BY_HANDLE_FILE_INFORMATION info;
+        memset(&info, 0, sizeof(info));
+        io = win_handle_io(process, arg[0]);
+        if (io != NULL) {
+            int64_t sz = xx_io_size(io);
+            if (sz >= 0) {
+                info.nFileSizeLow = (DWORD)sz;
+                info.nFileSizeHigh = (DWORD)((uint64_t)sz >> 32);
+            }
+            info.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+            info.nNumberOfLinks = 1;
+            if (!win_write(process, arg[1], (const uint8_t *)&info, sizeof(info)))
+                return XXEMUL_STATUS_ADDRESS_FAULT;
+            *result = 1;
+            return XXEMUL_STATUS_OK;
+        }
+        process->last_error = 6u;
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SetEndOfFile") == 0) {
+        *result = 1;
+        return XXEMUL_STATUS_OK;
+    }
+#endif
     if (strcmp(name, "GetFileType") == 0) {
         *result = arg[0] == 0x10u || arg[0] == 0x11u
             || arg[0] == 0x12u ? 2u
@@ -3460,6 +4111,27 @@ static xxemul_status win_call(xxemul_windows *process,
             : allocation->size;
         return XXEMUL_STATUS_OK;
     }
+    if (strcmp(name, "LocalAlloc") == 0
+        || strcmp(name, "GlobalAlloc") == 0) {
+        *result = win_heap_alloc(process, arg[1]);
+        if (*result == 0) process->last_error = 8u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "LocalFree") == 0
+        || strcmp(name, "GlobalFree") == 0) {
+        win_allocation *allocation = win_find_allocation(process, arg[0]);
+        if (allocation != NULL) allocation->active = 0u;
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GlobalLock") == 0) {
+        *result = arg[0];
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GlobalUnlock") == 0) {
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "GetCurrentDirectoryA") == 0
         || strcmp(name, "GetCurrentDirectoryW") == 0) {
         size_t length = strlen(process->working_directory);
@@ -3487,7 +4159,12 @@ static xxemul_status win_call(xxemul_windows *process,
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetTickCount") == 0) {
+#if defined(_WIN32)
+        *result = (uint32_t)GetTickCount();
+#else
+        process->virtual_tick += 10u;
         *result = process->virtual_tick;
+#endif
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "Sleep") == 0) {
@@ -3503,6 +4180,270 @@ static xxemul_status win_call(xxemul_windows *process,
     }
     if (strcmp(name, "GetVersion") == 0) {
         *result = 0x0a000006u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetFileVersionInfoSizeA") == 0
+        || strcmp(name, "GetFileVersionInfoA") == 0) {
+        process->last_error = 1813u;
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CreateProcessA") == 0
+        || strcmp(name, "CreateProcessW") == 0) {
+        char cmd[512] = {0};
+        size_t i;
+        win_guest_string(process, arg[1] ? arg[1] : arg[0], cmd, sizeof(cmd), strcmp(name, "CreateProcessW") == 0);
+        fprintf(stderr, "[CreateProcess] cmd='%s'\n", cmd);
+
+        /* Find pipe read handle to provide mock output to */
+        for (i = 0; i < WIN_MAX_HANDLES; ++i) {
+            if (process->handles[i].in_use && process->handles[i].kind == WIN_HANDLE_FILE
+                && process->handles[i].file_path[0] == '\0' && process->handles[i].io == NULL) {
+                if (strstr(cmd, "gdb") != NULL) {
+                    static const char gdb_banner[] = "GNU gdb (GDB) 7.2\r\n(gdb) \r\n";
+                    process->handles[i].io = xx_io_mem_open_ro(gdb_banner, strlen(gdb_banner));
+                    break;
+                } else if (strstr(cmd, "fpc") != NULL) {
+                    static const char fpc_banner[] = "Free Pascal Compiler version 3.2.2 [2021/05/15] for i386\r\n";
+                    process->handles[i].io = xx_io_mem_open_ro(fpc_banner, strlen(fpc_banner));
+                    break;
+                }
+            }
+        }
+
+        /* Fill PROCESS_INFORMATION */
+        if (arg[9] != 0) {
+            size_t proc_slot = WIN_MAX_HANDLES, thread_slot = WIN_MAX_HANDLES, s;
+            for (s = 0; s < WIN_MAX_HANDLES; ++s) {
+                if (!process->handles[s].in_use) {
+                    if (proc_slot == WIN_MAX_HANDLES) proc_slot = s;
+                    else if (thread_slot == WIN_MAX_HANDLES) { thread_slot = s; break; }
+                }
+            }
+            if (proc_slot < WIN_MAX_HANDLES) {
+                memset(&process->handles[proc_slot], 0, sizeof(process->handles[proc_slot]));
+                process->handles[proc_slot].kind = WIN_HANDLE_PROCESS;
+                process->handles[proc_slot].references = 1u;
+                process->handles[proc_slot].root_slot = (uint16_t)proc_slot;
+                process->handles[proc_slot].in_use = 1u;
+            }
+            if (thread_slot < WIN_MAX_HANDLES) {
+                memset(&process->handles[thread_slot], 0, sizeof(process->handles[thread_slot]));
+                process->handles[thread_slot].kind = WIN_HANDLE_THREAD;
+                process->handles[thread_slot].references = 1u;
+                process->handles[thread_slot].root_slot = (uint16_t)thread_slot;
+                process->handles[thread_slot].in_use = 1u;
+            }
+            win_store(process, arg[9], word_size, 0x100u + (proc_slot < WIN_MAX_HANDLES ? proc_slot : 0));
+            win_store(process, arg[9] + word_size, word_size, 0x100u + (thread_slot < WIN_MAX_HANDLES ? thread_slot : 0));
+            win_store(process, arg[9] + word_size * 2, 4u, 1234u);
+            win_store(process, arg[9] + word_size * 2 + 4u, 4u, 5678u);
+        }
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CreatePipe") == 0) {
+        size_t r = WIN_MAX_HANDLES, w = WIN_MAX_HANDLES, i;
+        for (i = 0; i < WIN_MAX_HANDLES; ++i) {
+            if (!process->handles[i].in_use) {
+                if (r == WIN_MAX_HANDLES) r = i;
+                else if (w == WIN_MAX_HANDLES) { w = i; break; }
+            }
+        }
+        if (r == WIN_MAX_HANDLES || w == WIN_MAX_HANDLES) {
+            process->last_error = 4u;
+            *result = 0u;
+            return XXEMUL_STATUS_OK;
+        }
+        memset(&process->handles[r], 0, sizeof(process->handles[r]));
+        process->handles[r].kind = WIN_HANDLE_FILE;
+        process->handles[r].references = 1u;
+        process->handles[r].root_slot = (uint16_t)w;
+        process->handles[r].in_use = 1u;
+
+        memset(&process->handles[w], 0, sizeof(process->handles[w]));
+        process->handles[w].kind = WIN_HANDLE_FILE;
+        process->handles[w].references = 1u;
+        process->handles[w].root_slot = (uint16_t)r;
+        process->handles[w].in_use = 1u;
+
+        if (arg[0] != 0) win_store(process, arg[0], word_size, 0x100u + r);
+        if (arg[1] != 0) win_store(process, arg[1], word_size, 0x100u + w);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "PeekNamedPipe") == 0) {
+        uint32_t avail = 0;
+        io = win_handle_io(process, arg[0]);
+        if (io != NULL) {
+            int64_t total = xx_io_size(io);
+            int64_t cur = xx_io_tell(io);
+            if (total > cur) avail = (uint32_t)(total - cur);
+        }
+        if (arg[1] != 0 && avail > 0 && (uint32_t)arg[2] > 0) {
+            uint32_t to_read = (uint32_t)arg[2] < avail ? (uint32_t)arg[2] : avail;
+            uint8_t *tmp = (uint8_t *)malloc(to_read);
+            if (tmp != NULL) {
+                int64_t pos = xx_io_tell(io);
+                xx_io_read(io, tmp, to_read);
+                xx_io_seek64(io, pos, SEEK_SET);
+                win_write(process, arg[1], tmp, to_read);
+                free(tmp);
+            }
+        }
+        if (arg[3] != 0) win_store(process, arg[3], 4u, 0u);
+        if (arg[4] != 0) win_store(process, arg[4], 4u, avail);
+        if (arg[5] != 0) win_store(process, arg[5], 4u, avail);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetExitCodeProcess") == 0) {
+        if (arg[1] != 0) win_store(process, arg[1], 4u, 0u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "DuplicateHandle") == 0) {
+        if (arg[3] != 0) win_store(process, arg[3], word_size, arg[1]);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetVersionExA") == 0
+        || strcmp(name, "GetVersionExW") == 0) {
+        if (arg[0] == 0) return XXEMUL_STATUS_ADDRESS_FAULT;
+        win_store(process, arg[0] + 4u, 4u, 10u);
+        win_store(process, arg[0] + 8u, 4u, 0u);
+        win_store(process, arg[0] + 12u, 4u, 19045u);
+        win_store(process, arg[0] + 16u, 4u, 2u);
+        uint8_t zero256[256] = {0};
+        win_write(process, arg[0] + 20u, zero256,
+            strcmp(name, "GetVersionExW") == 0 ? 256u : 128u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SysAllocStringLen") == 0) {
+        uint64_t psz = arg[0];
+        uint32_t len = (uint32_t)arg[1];
+        uint32_t byte_len = len * 2u;
+        uint64_t alloc = win_heap_alloc(process, (uint64_t)byte_len + 6u);
+        if (alloc == 0) {
+            *result = 0;
+            return XXEMUL_STATUS_OK;
+        }
+        win_store(process, alloc, 4u, byte_len);
+        uint64_t bstr = alloc + 4u;
+        if (psz != 0) {
+            uint8_t buf[512];
+            uint32_t copied = 0;
+            while (copied < byte_len) {
+                uint32_t chunk = byte_len - copied;
+                if (chunk > (uint32_t)sizeof(buf)) chunk = (uint32_t)sizeof(buf);
+                if (!win_read(process, psz + copied, buf, chunk)) break;
+                win_write(process, bstr + copied, buf, chunk);
+                copied += chunk;
+            }
+        }
+        win_store(process, bstr + byte_len, 2u, 0u);
+        *result = bstr;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SysFreeString") == 0) {
+        uint64_t bstr = arg[0];
+        if (bstr >= 4u) {
+            win_allocation *allocation = win_find_allocation(process, bstr - 4u);
+            if (allocation != NULL) allocation->active = 0u;
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SysReAllocStringLen") == 0) {
+        uint64_t pbstr = arg[0];
+        uint64_t psz = arg[1];
+        uint32_t len = (uint32_t)arg[2];
+        if (pbstr == 0) {
+            *result = 0;
+            return XXEMUL_STATUS_OK;
+        }
+        uint32_t byte_len = len * 2u;
+        uint64_t alloc = win_heap_alloc(process, (uint64_t)byte_len + 6u);
+        if (alloc == 0) {
+            *result = 0;
+            return XXEMUL_STATUS_OK;
+        }
+        win_store(process, alloc, 4u, byte_len);
+        uint64_t bstr = alloc + 4u;
+        if (psz != 0) {
+            uint8_t buf[512];
+            uint32_t copied = 0;
+            while (copied < byte_len) {
+                uint32_t chunk = byte_len - copied;
+                if (chunk > (uint32_t)sizeof(buf)) chunk = (uint32_t)sizeof(buf);
+                if (!win_read(process, psz + copied, buf, chunk)) break;
+                win_write(process, bstr + copied, buf, chunk);
+                copied += chunk;
+            }
+        }
+        win_store(process, bstr + byte_len, 2u, 0u);
+        uint64_t old_bstr = 0;
+        win_load(process, pbstr, word_size, &old_bstr);
+        if (old_bstr >= 4u) {
+            win_allocation *allocation = win_find_allocation(process, old_bstr - 4u);
+            if (allocation != NULL) allocation->active = 0u;
+        }
+        win_store(process, pbstr, word_size, bstr);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetProcessHeap") == 0) {
+        *result = 0x10000u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetCurrentProcess") == 0) {
+        *result = (uint64_t)(int64_t)-1;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetCurrentThread") == 0) {
+        *result = (uint64_t)(int64_t)-2;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetConsoleCP") == 0) {
+        *result = 1252u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "IsDebuggerPresent") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetUserDefaultLCID") == 0 || strcmp(name, "GetThreadLocale") == 0) {
+        *result = 0x0409u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SetThreadLocale") == 0
+        || strcmp(name, "SetConsoleCP") == 0
+        || strcmp(name, "SetConsoleActiveScreenBuffer") == 0
+        || strcmp(name, "FlushConsoleInputBuffer") == 0
+        || strcmp(name, "SetConsoleScreenBufferSize") == 0
+        || strcmp(name, "SetConsoleWindowInfo") == 0
+        || strcmp(name, "AllocConsole") == 0
+        || strcmp(name, "FreeConsole") == 0
+        || strcmp(name, "FreeLibrary") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetNumberOfConsoleMouseButtons") == 0) {
+        if (arg[0] != 0) win_store(process, arg[0], 4u, 3u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetLocalTime") == 0) {
+#if defined(_WIN32)
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        win_write(process, arg[0], (const uint8_t *)&st, sizeof(st));
+#else
+        uint8_t zero16[16] = {0};
+        win_write(process, arg[0], zero16, 16u);
+#endif
+        *result = 0;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetACP") == 0
@@ -3616,22 +4557,52 @@ static xxemul_status win_call(xxemul_windows *process,
         *result = 1u;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "GetStartupInfoA") == 0) {
+    if (strcmp(name, "GetStartupInfoA") == 0
+        || strcmp(name, "GetStartupInfoW") == 0) {
         if (!win_store(process, arg[0], 4u, word_size == 8u ? 104u : 68u))
             return XXEMUL_STATUS_ADDRESS_FAULT;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetSystemInfo") == 0) {
-        if (!win_store(process, arg[0] + 4u, 4u, 4096u))
-            return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (process->emulator->mode == XXEMUL_MODE_X86_64) {
+            win_store(process, arg[0], 2u, 9u);
+            win_store(process, arg[0] + 4u, 4u, 4096u);
+            win_store(process, arg[0] + 8u, 8u, 0x10000u);
+            win_store(process, arg[0] + 16u, 8u, UINT64_C(0x7ffffffeffff));
+            win_store(process, arg[0] + 24u, 8u, 0x0fu);
+            win_store(process, arg[0] + 32u, 4u, 4u);
+            win_store(process, arg[0] + 36u, 4u, 8664u);
+            win_store(process, arg[0] + 40u, 4u, 65536u);
+            win_store(process, arg[0] + 44u, 2u, 6u);
+        } else {
+            win_store(process, arg[0], 2u, 0u);
+            win_store(process, arg[0] + 4u, 4u, 4096u);
+            win_store(process, arg[0] + 8u, 4u, 0x10000u);
+            win_store(process, arg[0] + 12u, 4u, 0x0fu);
+            win_store(process, arg[0] + 16u, 4u, 4u);
+            win_store(process, arg[0] + 20u, 4u, 586u);
+            win_store(process, arg[0] + 24u, 4u, 65536u);
+            win_store(process, arg[0] + 28u, 2u, 6u);
+        }
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "QueryPerformanceCounter") == 0
-        || strcmp(name, "QueryPerformanceFrequency") == 0) {
-        if (!win_store(process, arg[0], 8u,
-                strcmp(name, "QueryPerformanceFrequency") == 0
-                    ? 1000000u
-                    : (uint64_t)process->virtual_tick * 1000u))
+    if (strcmp(name, "GetActiveProcessorGroupCount") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetActiveProcessorCount") == 0) {
+        *result = 4u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "QueryPerformanceFrequency") == 0) {
+        if (!win_store(process, arg[0], 8u, 1000000u))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "QueryPerformanceCounter") == 0) {
+        process->virtual_tick += 500u;
+        if (!win_store(process, arg[0], 8u, (uint64_t)process->virtual_tick * 1000u))
             return XXEMUL_STATUS_ADDRESS_FAULT;
         *result = 1u;
         return XXEMUL_STATUS_OK;
@@ -3882,7 +4853,458 @@ static xxemul_status win_call(xxemul_windows *process,
         || strcmp(name, "strtoul") == 0)
         return win_crt_parse_number(process, arg, word_size,
             strcmp(name, "strtoul") == 0, result);
-    return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (strcmp(name, "_c_exit") == 0
+        || strcmp(name, "_cexit") == 0) {
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_exit") == 0) {
+        process->exit_code = (uint32_t)arg[0];
+        return XXEMUL_STATUS_HALTED;
+    }
+    if (strcmp(name, "_XcptFilter") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "__dllonexit") == 0) {
+        *result = arg[0];
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SetFileApisToOEM") == 0
+        || strcmp(name, "SetConsoleCtrlHandler") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetLargePageMinimum") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "IsProcessorFeaturePresent") == 0) {
+        uint32_t feat = (uint32_t)arg[0];
+        if (feat == 2u || feat == 3u || feat == 6u || feat == 8u
+            || feat == 10u || feat == 12u || feat == 13u || feat == 17u) {
+            *result = 1u;
+        } else if (feat == 14u) {
+            *result = process->emulator->mode == XXEMUL_MODE_X86_64 ? 1u : 0u;
+        } else {
+            *result = 0u;
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "wcscmp") == 0) {
+        uint64_t idx = 0;
+        *result = 0;
+        for (;; idx += 2u) {
+            uint64_t c1 = 0, c2 = 0;
+            if (!win_load(process, arg[0] + idx, 2u, &c1)
+                || !win_load(process, arg[1] + idx, 2u, &c2))
+                return XXEMUL_STATUS_ADDRESS_FAULT;
+            if (c1 != c2) {
+                *result = (uint64_t)(c1 < c2 ? -1 : 1);
+                return XXEMUL_STATUS_OK;
+            }
+            if (c1 == 0) return XXEMUL_STATUS_OK;
+        }
+    }
+    if (strcmp(name, "CharUpperW") == 0) {
+        if (arg[0] < 0x10000u) {
+            uint16_t c = (uint16_t)arg[0];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            *result = c;
+        } else {
+            uint64_t ptr = arg[0];
+            for (;; ptr += 2u) {
+                uint64_t w = 0;
+                if (!win_load(process, ptr, 2u, &w) || w == 0) break;
+                if (w >= 'a' && w <= 'z') win_store(process, ptr, 2u, w - 32);
+            }
+            *result = arg[0];
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetDriveTypeW") == 0
+        || strcmp(name, "GetDriveTypeA") == 0) {
+        *result = 3u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetDiskFreeSpaceExW") == 0
+        || strcmp(name, "GetDiskFreeSpaceExA") == 0) {
+        uint64_t bytes = 100ULL * 1024ULL * 1024ULL * 1024ULL;
+        if (arg[1] != 0) win_store(process, arg[1], 8u, bytes);
+        if (arg[2] != 0) win_store(process, arg[2], 8u, bytes * 2u);
+        if (arg[3] != 0) win_store(process, arg[3], 8u, bytes);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetVolumeInformationW") == 0) {
+        static const uint16_t fs_name[] = {'N','T','F','S', 0};
+        if (arg[3] != 0) win_store(process, arg[3], 4u, 0x12345678u);
+        if (arg[4] != 0) win_store(process, arg[4], 4u, 255u);
+        if (arg[5] != 0) win_store(process, arg[5], 4u, 0x00000003u);
+        if (arg[6] != 0 && arg[7] >= sizeof(fs_name)/2)
+            win_write(process, arg[6], fs_name, sizeof(fs_name));
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetFullPathNameW") == 0) {
+        uint64_t len = 0;
+        uint64_t last_slash = 0;
+        for (;; ++len) {
+            uint64_t w = 0;
+            if (!win_load(process, arg[0] + len * 2u, 2u, &w)) break;
+            if (w == '\\' || w == '/') last_slash = len + 1u;
+            if (arg[2] != 0 && len < arg[1]) win_store(process, arg[2] + len * 2u, 2u, w);
+            if (w == 0) break;
+        }
+        if (arg[3] != 0 && arg[2] != 0 && last_slash > 0) {
+            win_store(process, arg[3], word_size, arg[2] + last_slash * 2u);
+        }
+        *result = (uint32_t)len;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetLongPathNameW") == 0
+        || strcmp(name, "GetShortPathNameW") == 0
+        || strcmp(name, "ExpandEnvironmentStringsW") == 0) {
+        uint64_t len = 0;
+        for (;; ++len) {
+            uint64_t w = 0;
+            if (!win_load(process, arg[0] + len * 2u, 2u, &w)) break;
+            if (arg[1] != 0 && len < arg[2]) win_store(process, arg[1] + len * 2u, 2u, w);
+            if (w == 0) break;
+        }
+        *result = (uint32_t)len;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "LCMapStringW") == 0) {
+        int cch_src = (int)arg[3];
+        int cch_dest = (int)arg[5];
+        if (cch_src <= 0) {
+            uint64_t len = 0;
+            for (;; ++len) {
+                uint64_t w = 0;
+                if (!win_load(process, arg[2] + len * 2u, 2u, &w)) break;
+                if (w == 0) { ++len; break; }
+            }
+            cch_src = (int)len;
+        }
+        if (cch_dest == 0 || arg[4] == 0) {
+            *result = (uint32_t)cch_src;
+            return XXEMUL_STATUS_OK;
+        }
+        int count = cch_src < cch_dest ? cch_src : cch_dest;
+        int i;
+        for (i = 0; i < count; ++i) {
+            uint64_t w = 0;
+            if (!win_load(process, arg[2] + (uint64_t)i * 2u, 2u, &w)) break;
+            if ((arg[1] & 0x00000100u) != 0 && w >= 'A' && w <= 'Z') w += 32;
+            else if ((arg[1] & 0x00000200u) != 0 && w >= 'a' && w <= 'z') w -= 32;
+            win_store(process, arg[4] + (uint64_t)i * 2u, 2u, w);
+        }
+        *result = (uint32_t)count;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetStringTypeW") == 0) {
+        int count = (int)arg[2];
+        if (count < 0) {
+            uint64_t len = 0;
+            for (;; ++len) {
+                uint64_t w = 0;
+                if (!win_load(process, arg[1] + len * 2u, 2u, &w) || w == 0) break;
+            }
+            count = (int)len;
+        }
+        if (arg[3] != 0 && count > 0) {
+            int i;
+            for (i = 0; i < count; ++i) {
+                uint64_t w = 0;
+                uint16_t type = 0;
+                win_load(process, arg[1] + (uint64_t)i * 2u, 2u, &w);
+                if ((w >= 'a' && w <= 'z') || (w >= 'A' && w <= 'Z')) type |= 0x0001u | 0x0004u;
+                if (w >= '0' && w <= '9') type |= 0x0004u;
+                if (w == ' ' || w == '\t' || w == '\r' || w == '\n') type |= 0x0008u;
+                win_store(process, arg[3] + (uint64_t)i * 2u, 2u, type);
+            }
+        }
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "IsValidCodePage") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CompareStringW") == 0 || strcmp(name, "CompareStringA") == 0) {
+        int is_wide = strcmp(name, "CompareStringW") == 0;
+        int step = is_wide ? 2 : 1;
+        uint64_t i = 0;
+        int cmp = 0;
+        for (;; ++i) {
+            uint64_t c1 = 0, c2 = 0;
+            int has1 = (arg[3] == (uint64_t)(int64_t)-1) || (i < arg[3]);
+            int has2 = (arg[5] == (uint64_t)(int64_t)-1) || (i < arg[5]);
+            if (!has1 && !has2) { cmp = 0; break; }
+            if (has1) win_load(process, arg[2] + i * (uint64_t)step, (uint8_t)step, &c1);
+            if (has2) win_load(process, arg[4] + i * (uint64_t)step, (uint8_t)step, &c2);
+            if (arg[1] & 1u) {
+                if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+                if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+            }
+            if (c1 != c2) { cmp = c1 < c2 ? -1 : 1; break; }
+            if (c1 == 0) { cmp = 0; break; }
+        }
+        *result = cmp < 0 ? 1u : cmp == 0 ? 2u : 3u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FoldStringW") == 0) {
+        int count = (int)arg[2];
+        if (count < 0) {
+            uint64_t len = 0;
+            for (;; ++len) {
+                uint64_t w = 0;
+                if (!win_load(process, arg[1] + len * 2u, 2u, &w) || w == 0) { ++len; break; }
+            }
+            count = (int)len;
+        }
+        if (arg[3] != 0 && arg[4] > 0) {
+            int n = count < (int)arg[4] ? count : (int)arg[4];
+            int i;
+            for (i = 0; i < n; ++i) {
+                uint64_t w = 0;
+                win_load(process, arg[1] + (uint64_t)i * 2u, 2u, &w);
+                win_store(process, arg[3] + (uint64_t)i * 2u, 2u, w);
+            }
+        }
+        *result = (uint32_t)count;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FormatMessageW") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "WriteConsoleW") == 0) {
+        *result = win_console_write_w(process, arg[0], arg[1], arg[2], arg[3]);
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "ReadConsoleW") == 0) {
+        if (arg[3] != 0) win_store(process, arg[3], 4u, 0u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CharLowerW") == 0) {
+        if (arg[0] < 0x10000u) {
+            uint16_t c = (uint16_t)arg[0];
+            if (c >= 'A' && c <= 'Z') c += 32;
+            *result = c;
+        } else {
+            uint64_t ptr = arg[0];
+            for (;; ptr += 2u) {
+                uint64_t w = 0;
+                if (!win_load(process, ptr, 2u, &w) || w == 0) break;
+                if (w >= 'A' && w <= 'Z') win_store(process, ptr, 2u, w + 32);
+            }
+            *result = arg[0];
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "OemToCharBuffW") == 0
+        || strcmp(name, "CharToOemBuffW") == 0
+        || strcmp(name, "CharToOemBuffA") == 0
+        || strcmp(name, "OemToCharBuffA") == 0) {
+        int is_w = win_suffix(name, "W");
+        size_t bytes = (size_t)arg[2] * (is_w ? 2u : 1u);
+        if (arg[0] != arg[1] && bytes > 0 && bytes < WIN_MAX_IO) {
+            uint8_t *tmp = (uint8_t *)malloc(bytes);
+            if (tmp != NULL) {
+                if (win_read(process, arg[0], tmp, bytes))
+                    win_write(process, arg[1], tmp, bytes);
+                free(tmp);
+            }
+        }
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CharToOemA") == 0 || strcmp(name, "OemToCharA") == 0) {
+        if (arg[0] != arg[1]) {
+            char buf[1024];
+            if (win_guest_string(process, arg[0], buf, sizeof(buf), 0))
+                win_write(process, arg[1], buf, strlen(buf) + 1);
+        }
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "RtlPcToFileHeader") == 0) {
+        if (arg[1] != 0) win_store(process, arg[1], word_size, process->image_base);
+        *result = process->image_base;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "RtlUnwindEx") == 0 || strcmp(name, "RtlVirtualUnwind") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "DeviceIoControl") == 0) {
+        if (arg[6] != 0) win_store(process, arg[6], 4u, 0u);
+        process->last_error = 1u;
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "BackupRead") == 0 || strcmp(name, "BackupSeek") == 0) {
+        process->last_error = 50u;
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "OpenProcessToken") == 0) {
+        if (arg[2] != 0) win_store(process, arg[2], word_size, 0x100u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetTokenInformation") == 0) {
+        if (arg[4] != 0) win_store(process, arg[4], 4u, 4u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "LookupPrivilegeValueW") == 0
+        || strcmp(name, "LookupPrivilegeValueA") == 0) {
+        if (arg[2] != 0) win_store(process, arg[2], 8u, 0x1234u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "AdjustTokenPrivileges") == 0
+        || strcmp(name, "LsaAddAccountRights") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CheckTokenMembership") == 0) {
+        if (arg[2] != 0) win_store(process, arg[2], 4u, 1u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "AllocateAndInitializeSid") == 0) {
+        if (arg[10] != 0) win_store(process, arg[10], word_size, 0x500u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FreeSid") == 0 || strcmp(name, "LsaClose") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "LsaOpenPolicy") == 0) {
+        if (arg[3] != 0) win_store(process, arg[3], word_size, 0x600u);
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "RegOpenKeyExW") == 0 || strcmp(name, "RegOpenKeyExA") == 0) {
+        if (arg[4] != 0) win_store(process, arg[4], word_size, 0x200u);
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "RegQueryValueExW") == 0 || strcmp(name, "RegQueryValueExA") == 0) {
+        *result = 2u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "ConvertStringSidToSidW") == 0
+        || strcmp(name, "ConvertSidToStringSidW") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CreateThread") == 0) {
+        if (arg[5] != 0) win_store(process, arg[5], 4u, 0x42u);
+        *result = 0x300u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetSystemTime") == 0) {
+        uint16_t st[8] = {2026, 9, 5, 25, 12, 0, 0, 0};
+        win_write(process, arg[0], st, sizeof(st));
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FileTimeToSystemTime") == 0) {
+        uint16_t st[8] = {2026, 9, 5, 25, 12, 0, 0, 0};
+        win_write(process, arg[1], st, sizeof(st));
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SystemTimeToFileTime") == 0) {
+        uint64_t ft = 133000000000000000ULL;
+        win_store(process, arg[1], 8u, ft);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SystemTimeToTzSpecificLocalTime") == 0
+        || strcmp(name, "TzSpecificLocalTimeToSystemTime") == 0) {
+        uint8_t st[16];
+        if (win_read(process, arg[1], st, 16u)) win_write(process, arg[2], st, 16u);
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SetFileAttributesW") == 0
+        || strcmp(name, "CreateHardLinkW") == 0
+        || strcmp(name, "ExitWindowsEx") == 0
+        || strcmp(name, "SetSuspendState") == 0) {
+        *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SHGetMalloc") == 0) {
+        uint64_t obj = process->runtime_base + WIN_SHELL_MALLOC_OFFSET;
+        uint64_t vtbl = process->runtime_base + WIN_SHELL_MALLOC_OFFSET + 8u;
+        uint64_t stub = process->runtime_base + WIN_SHELL_MALLOC_OFFSET + 0x80u;
+        size_t i;
+        word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+        if (word_size == 8u) {
+            uint8_t ret_code[3] = { 0x31, 0xc0, 0xc3 }; /* xor eax, eax; ret */
+            win_write(process, stub, ret_code, sizeof(ret_code));
+        } else {
+            uint8_t ret_code[4] = { 0x31, 0xc0, 0xc2, 0x08 }; /* xor eax, eax; ret 8 */
+            win_write(process, stub, ret_code, sizeof(ret_code));
+        }
+        for (i = 0; i < 10; ++i) {
+            win_store(process, vtbl + i * word_size, word_size, stub);
+        }
+        win_store(process, obj, word_size, vtbl);
+        if (arg[0] != 0u) {
+            if (!win_store(process, arg[0], word_size, obj))
+                return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        *result = 0u; /* S_OK */
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SHGetSpecialFolderLocation") == 0) {
+        if (arg[2] != 0u) {
+            uint64_t dummy_pidl = process->runtime_base + WIN_SHELL_MALLOC_OFFSET + 0x90u;
+            if (!win_store(process, arg[2], process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u, dummy_pidl))
+                return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        *result = 0u; /* S_OK */
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "SHGetPathFromIDListW") == 0) {
+        const char *appdata = getenv("APPDATA");
+        if (appdata == NULL || appdata[0] == '\0') {
+            appdata = "C:\\Users\\Default\\AppData\\Roaming";
+        }
+        if (arg[1] != 0u) {
+            if (!win_write_wide(process, arg[1], appdata, 260u))
+                return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        *result = 1u; /* TRUE */
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "LoadStringW") == 0) {
+        uint32_t uid = (uint32_t)arg[1];
+        uint64_t buffer = arg[2];
+        uint32_t max_chars = (uint32_t)arg[3];
+        if (!win_load_string(process, uid, buffer, max_chars, result)) {
+            if (max_chars > 0 && buffer != 0) {
+                win_store(process, buffer, 2u, 0);
+            }
+            *result = 0u;
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "ShellExecuteExW") == 0
+        || strcmp(name, "SHFileOperationW") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    fprintf(stderr, "[xxemul API stub] %s::%s\n", api->module, name);
+    *result = 0u;
+    return XXEMUL_STATUS_OK;
 }
 
 static xxemul_status win_initterm_continue(xxemul_windows *process,
@@ -4067,7 +5489,7 @@ int xxemul_windows_try_step(
     xxemul_status *status)
 {
     uint64_t ip, index, return_address, value = 0;
-    uint64_t arguments[8] = {0};
+    uint64_t arguments[16] = {0};
     uint8_t word_size, i;
     win_api *api;
     xxemul_status call_status;
@@ -4096,10 +5518,23 @@ int xxemul_windows_try_step(
         *status = XXEMUL_STATUS_ADDRESS_FAULT;
         return 1;
     }
-    for (i = 0; i < api->argument_count; ++i) {
-        if (!win_get_arg(process, i, &arguments[i])) {
-            *status = XXEMUL_STATUS_ADDRESS_FAULT;
-            return 1;
+    if (process->emulator->mode == XXEMUL_MODE_X86_64) {
+        arguments[0] = process->emulator->x86.gpr[XXEMUL_X86_RCX];
+        arguments[1] = process->emulator->x86.gpr[XXEMUL_X86_RDX];
+        arguments[2] = process->emulator->x86.gpr[XXEMUL_X86_R8];
+        arguments[3] = process->emulator->x86.gpr[XXEMUL_X86_R9];
+        for (i = 4; i < api->argument_count && i < 16; ++i) {
+            if (!win_get_arg(process, i, &arguments[i])) {
+                *status = XXEMUL_STATUS_ADDRESS_FAULT;
+                return 1;
+            }
+        }
+    } else {
+        for (i = 0; i < api->argument_count && i < 16; ++i) {
+            if (!win_get_arg(process, i, &arguments[i])) {
+                *status = XXEMUL_STATUS_ADDRESS_FAULT;
+                return 1;
+            }
         }
     }
     if (strcmp(api->name, "_initterm") == 0) {

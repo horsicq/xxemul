@@ -2,6 +2,7 @@
 #include "platforms/xxemul_windows.h"
 #include "platforms/xxemul_linux.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -2155,9 +2156,33 @@ static xxemul_status xxemul_x87_push(xxemul *emulator, double value)
     size_t index;
     if (emulator->x87_depth == 8u)
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-    for (index = emulator->x87_depth; index != 0u; --index)
+    for (index = emulator->x87_depth; index != 0u; --index) {
         emulator->x87_stack[index] = emulator->x87_stack[index - 1u];
+        emulator->x87_int_val[index] = emulator->x87_int_val[index - 1u];
+        emulator->x87_is_int[index] = emulator->x87_is_int[index - 1u];
+    }
     emulator->x87_stack[0] = value;
+    emulator->x87_int_val[0] = 0;
+    emulator->x87_is_int[0] = 0;
+    ++emulator->x87_depth;
+    emulator->x87_top = (uint8_t)((emulator->x87_top - 1u) & 7u);
+    return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status xxemul_x87_push_int(xxemul *emulator, uint64_t int_val, uint8_t size)
+{
+    size_t index;
+    uint64_t sign_ext = xxemul_sign_extend(int_val, size);
+    if (emulator->x87_depth == 8u)
+        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    for (index = emulator->x87_depth; index != 0u; --index) {
+        emulator->x87_stack[index] = emulator->x87_stack[index - 1u];
+        emulator->x87_int_val[index] = emulator->x87_int_val[index - 1u];
+        emulator->x87_is_int[index] = emulator->x87_is_int[index - 1u];
+    }
+    emulator->x87_stack[0] = (double)(int64_t)sign_ext;
+    emulator->x87_int_val[0] = sign_ext;
+    emulator->x87_is_int[0] = 1;
     ++emulator->x87_depth;
     emulator->x87_top = (uint8_t)((emulator->x87_top - 1u) & 7u);
     return XXEMUL_STATUS_OK;
@@ -2168,8 +2193,11 @@ static xxemul_status xxemul_x87_pop(xxemul *emulator)
     size_t index;
     if (emulator->x87_depth == 0u)
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-    for (index = 1u; index < emulator->x87_depth; ++index)
+    for (index = 1u; index < emulator->x87_depth; ++index) {
         emulator->x87_stack[index - 1u] = emulator->x87_stack[index];
+        emulator->x87_int_val[index - 1u] = emulator->x87_int_val[index];
+        emulator->x87_is_int[index - 1u] = emulator->x87_is_int[index];
+    }
     --emulator->x87_depth;
     emulator->x87_top = (uint8_t)((emulator->x87_top + 1u) & 7u);
     return XXEMUL_STATUS_OK;
@@ -2207,6 +2235,58 @@ static xxemul_status xxemul_x87_read(
         memcpy(value, &bits, sizeof(*value));
     }
     return XXEMUL_STATUS_OK;
+}
+
+static uint64_t xxemul_x87_convert_to_integer(
+    xxemul *emulator, double val, size_t size, int truncate_mode)
+{
+    double rounded;
+    if (isnan(val) || isinf(val)) {
+        emulator->x87_status |= 0x0001u; /* IE */
+        if (size == 2u) return UINT64_C(0x8000);
+        if (size == 4u) return UINT64_C(0x80000000);
+        return UINT64_C(0x8000000000000000);
+    }
+
+    if (truncate_mode) {
+        rounded = trunc(val);
+    } else {
+        switch ((emulator->x87_control >> 10) & 3u) {
+        case 0: /* Round to nearest (even) */
+            rounded = nearbyint(val);
+            break;
+        case 1: /* Round down (-inf) */
+            rounded = floor(val);
+            break;
+        case 2: /* Round up (+inf) */
+            rounded = ceil(val);
+            break;
+        case 3: /* Truncate */
+        default:
+            rounded = trunc(val);
+            break;
+        }
+    }
+
+    if (size == 2u) {
+        if (rounded < -32768.0 || rounded > 32767.0) {
+            emulator->x87_status |= 0x0001u; /* IE */
+            return UINT64_C(0x8000);
+        }
+        return (uint16_t)(int16_t)rounded;
+    } else if (size == 4u) {
+        if (rounded < -2147483648.0 || rounded > 2147483647.0) {
+            emulator->x87_status |= 0x0001u; /* IE */
+            return UINT64_C(0x80000000);
+        }
+        return (uint32_t)(int32_t)rounded;
+    } else {
+        if (rounded < -9223372036854775808.0 || rounded >= 9223372036854775808.0) {
+            emulator->x87_status |= 0x0001u; /* IE */
+            return UINT64_C(0x8000000000000000);
+        }
+        return (uint64_t)(int64_t)rounded;
+    }
 }
 
 static xxemul_status xxemul_x86_read_xmm_operand(
@@ -2506,6 +2586,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
         }
         break;
     case CDISASM_X86_NAME_BSF:
+    case CDISASM_X86_NAME_TZCNT:
     case CDISASM_X86_NAME_BSR:
         if (instruction.operand_count != 2u
             || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
@@ -2533,36 +2614,51 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 &instruction.opcode[0], next_ip, bit);
         }
         break;
+    case CDISASM_X86_NAME_MOVD:
     case CDISASM_X86_NAME_MOVQ:
         if (instruction.operand_count != 2u)
             return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        if (instruction.opcode[1].type == CDISASM_OPERAND_REGISTER
-            && instruction.opcode[1].reg >= CDISASM_X86_REG_XMM0
-            && instruction.opcode[1].reg <= CDISASM_X86_REG_XMM15) {
-            memcpy(&right, emulator->x86.xmm[
-                instruction.opcode[1].reg - CDISASM_X86_REG_XMM0],
-                sizeof(right));
-            status = XXEMUL_STATUS_OK;
-        } else if (instruction.opcode[1].size == 8u) {
-            status = xxemul_x86_read_operand(emulator, &instruction,
-                &instruction.opcode[1], next_ip, &right);
-        } else {
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        }
-        if (status != XXEMUL_STATUS_OK) return status;
-        if (instruction.opcode[0].type == CDISASM_OPERAND_REGISTER
-            && instruction.opcode[0].reg >= CDISASM_X86_REG_XMM0
-            && instruction.opcode[0].reg <= CDISASM_X86_REG_XMM15) {
-            uint8_t *destination = emulator->x86.xmm[
-                instruction.opcode[0].reg - CDISASM_X86_REG_XMM0];
-            memset(destination, 0, 16u);
-            memcpy(destination, &right, sizeof(right));
-            status = XXEMUL_STATUS_OK;
-        } else if (instruction.opcode[0].size == 8u) {
-            status = xxemul_x86_write_operand(emulator, &instruction,
-                &instruction.opcode[0], next_ip, right);
-        } else {
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        {
+            size_t op_size = (instruction.name_id == CDISASM_X86_NAME_MOVD) ? 4u : 8u;
+            if (instruction.opcode[0].size == 4u || instruction.opcode[0].size == 8u) {
+                if (instruction.opcode[0].type != CDISASM_OPERAND_REGISTER ||
+                    instruction.opcode[0].reg < CDISASM_X86_REG_XMM0 || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15)
+                    op_size = (size_t)instruction.opcode[0].size;
+            }
+            if (instruction.opcode[1].size == 4u || instruction.opcode[1].size == 8u) {
+                if (instruction.opcode[1].type != CDISASM_OPERAND_REGISTER ||
+                    instruction.opcode[1].reg < CDISASM_X86_REG_XMM0 || instruction.opcode[1].reg > CDISASM_X86_REG_XMM15)
+                    op_size = (size_t)instruction.opcode[1].size;
+            }
+            if (instruction.opcode[1].type == CDISASM_OPERAND_REGISTER
+                && instruction.opcode[1].reg >= CDISASM_X86_REG_XMM0
+                && instruction.opcode[1].reg <= CDISASM_X86_REG_XMM15) {
+                right = 0;
+                memcpy(&right, emulator->x86.xmm[
+                    instruction.opcode[1].reg - CDISASM_X86_REG_XMM0],
+                    op_size);
+                status = XXEMUL_STATUS_OK;
+            } else if (instruction.opcode[1].size == op_size) {
+                status = xxemul_x86_read_operand(emulator, &instruction,
+                    &instruction.opcode[1], next_ip, &right);
+            } else {
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            }
+            if (status != XXEMUL_STATUS_OK) return status;
+            if (instruction.opcode[0].type == CDISASM_OPERAND_REGISTER
+                && instruction.opcode[0].reg >= CDISASM_X86_REG_XMM0
+                && instruction.opcode[0].reg <= CDISASM_X86_REG_XMM15) {
+                uint8_t *destination = emulator->x86.xmm[
+                    instruction.opcode[0].reg - CDISASM_X86_REG_XMM0];
+                memset(destination, 0, 16u);
+                memcpy(destination, &right, op_size);
+                status = XXEMUL_STATUS_OK;
+            } else if (instruction.opcode[0].size == op_size) {
+                status = xxemul_x86_write_operand(emulator, &instruction,
+                    &instruction.opcode[0], next_ip, right);
+            } else {
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            }
         }
         break;
     case CDISASM_X86_NAME_MOVUPS:
@@ -2571,6 +2667,10 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
     case CDISASM_X86_NAME_MOVAPD:
     case CDISASM_X86_NAME_MOVDQU:
     case CDISASM_X86_NAME_MOVDQA:
+    case CDISASM_X86_NAME_VMOVUPS:
+    case CDISASM_X86_NAME_VMOVAPS:
+    case CDISASM_X86_NAME_VMOVUPD:
+    case CDISASM_X86_NAME_VMOVAPD:
         if (instruction.operand_count != 2u)
             return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         {
@@ -2580,6 +2680,164 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             if (status == XXEMUL_STATUS_OK)
                 status = xxemul_x86_write_xmm_operand(emulator, &instruction,
                     &instruction.opcode[0], next_ip, bytes);
+        }
+        break;
+    case CDISASM_X86_NAME_PMOVMSKB:
+    case CDISASM_X86_NAME_MOVMSKPS:
+    case CDISASM_X86_NAME_MOVMSKPD:
+    case CDISASM_X86_NAME_VMOVMSKPS:
+    case CDISASM_X86_NAME_VMOVMSKPD:
+        if (instruction.operand_count != 2u
+            || instruction.opcode[1].type != CDISASM_OPERAND_REGISTER
+            || instruction.opcode[1].reg < CDISASM_X86_REG_XMM0
+            || instruction.opcode[1].reg > CDISASM_X86_REG_XMM15)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        {
+            const uint8_t *source = emulator->x86.xmm[
+                instruction.opcode[1].reg - CDISASM_X86_REG_XMM0];
+            uint32_t mask = 0;
+            size_t i;
+            if (instruction.name_id == CDISASM_X86_NAME_PMOVMSKB) {
+                for (i = 0u; i < 16u; ++i) {
+                    if (source[i] & 0x80u) mask |= (1u << i);
+                }
+            } else if (instruction.name_id == CDISASM_X86_NAME_MOVMSKPS
+                || instruction.name_id == CDISASM_X86_NAME_VMOVMSKPS) {
+                for (i = 0u; i < 4u; ++i) {
+                    if (source[i * 4u + 3u] & 0x80u) mask |= (1u << i);
+                }
+            } else {
+                for (i = 0u; i < 2u; ++i) {
+                    if (source[i * 8u + 7u] & 0x80u) mask |= (1u << i);
+                }
+            }
+            status = xxemul_x86_write_operand(emulator, &instruction,
+                &instruction.opcode[0], next_ip, (uint64_t)mask);
+        }
+        break;
+    case CDISASM_X86_NAME_PSHUFD:
+    case CDISASM_X86_NAME_VPSHUFD:
+    case CDISASM_X86_NAME_PSHUFHW:
+    case CDISASM_X86_NAME_VPSHUFHW:
+    case CDISASM_X86_NAME_PSHUFLW:
+    case CDISASM_X86_NAME_VPSHUFLW:
+        if (instruction.operand_count != 3u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        {
+            uint8_t src[16];
+            uint8_t dest[16];
+            uint64_t imm_val = 0;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
+                &instruction.opcode[1], next_ip, src);
+            if (status != XXEMUL_STATUS_OK) return status;
+            status = xxemul_x86_read_operand(emulator, &instruction,
+                &instruction.opcode[2], next_ip, &imm_val);
+            if (status != XXEMUL_STATUS_OK) return status;
+            uint8_t imm = (uint8_t)imm_val;
+
+            if (instruction.name_id == CDISASM_X86_NAME_PSHUFD
+                || instruction.name_id == CDISASM_X86_NAME_VPSHUFD) {
+                uint32_t s[4], d[4];
+                memcpy(s, src, 16u);
+                d[0] = s[(imm >> 0) & 3u];
+                d[1] = s[(imm >> 2) & 3u];
+                d[2] = s[(imm >> 4) & 3u];
+                d[3] = s[(imm >> 6) & 3u];
+                memcpy(dest, d, 16u);
+            } else if (instruction.name_id == CDISASM_X86_NAME_PSHUFLW
+                || instruction.name_id == CDISASM_X86_NAME_VPSHUFLW) {
+                uint16_t s[8], d[8];
+                memcpy(s, src, 16u);
+                d[0] = s[(imm >> 0) & 3u];
+                d[1] = s[(imm >> 2) & 3u];
+                d[2] = s[(imm >> 4) & 3u];
+                d[3] = s[(imm >> 6) & 3u];
+                d[4] = s[4];
+                d[5] = s[5];
+                d[6] = s[6];
+                d[7] = s[7];
+                memcpy(dest, d, 16u);
+            } else {
+                uint16_t s[8], d[8];
+                memcpy(s, src, 16u);
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+                d[3] = s[3];
+                d[4] = s[4u + ((imm >> 0) & 3u)];
+                d[5] = s[4u + ((imm >> 2) & 3u)];
+                d[6] = s[4u + ((imm >> 4) & 3u)];
+                d[7] = s[4u + ((imm >> 6) & 3u)];
+                memcpy(dest, d, 16u);
+            }
+            status = xxemul_x86_write_xmm_operand(emulator, &instruction,
+                &instruction.opcode[0], next_ip, dest);
+        }
+        break;
+    case CDISASM_X86_NAME_SHUFPS:
+    case CDISASM_X86_NAME_SHUFPD:
+        if (instruction.operand_count != 3u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        {
+            uint8_t d_orig[16];
+            uint8_t src[16];
+            uint8_t dest[16];
+            uint64_t imm_val = 0;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
+                &instruction.opcode[0], next_ip, d_orig);
+            if (status != XXEMUL_STATUS_OK) return status;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
+                &instruction.opcode[1], next_ip, src);
+            if (status != XXEMUL_STATUS_OK) return status;
+            status = xxemul_x86_read_operand(emulator, &instruction,
+                &instruction.opcode[2], next_ip, &imm_val);
+            if (status != XXEMUL_STATUS_OK) return status;
+            uint8_t imm = (uint8_t)imm_val;
+
+            if (instruction.name_id == CDISASM_X86_NAME_SHUFPS) {
+                uint32_t d_in[4], s[4], d[4];
+                memcpy(d_in, d_orig, 16u);
+                memcpy(s, src, 16u);
+                d[0] = d_in[(imm >> 0) & 3u];
+                d[1] = d_in[(imm >> 2) & 3u];
+                d[2] = s[(imm >> 4) & 3u];
+                d[3] = s[(imm >> 6) & 3u];
+                memcpy(dest, d, 16u);
+            } else {
+                uint64_t d_in[2], s[2], d[2];
+                memcpy(d_in, d_orig, 16u);
+                memcpy(s, src, 16u);
+                d[0] = d_in[(imm >> 0) & 1u];
+                d[1] = s[(imm >> 1) & 1u];
+                memcpy(dest, d, 16u);
+            }
+            status = xxemul_x86_write_xmm_operand(emulator, &instruction,
+                &instruction.opcode[0], next_ip, dest);
+        }
+        break;
+    case CDISASM_X86_NAME_PSHUFB:
+        if (instruction.operand_count != 2u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        {
+            uint8_t d_orig[16];
+            uint8_t mask[16];
+            uint8_t dest[16];
+            size_t i;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
+                &instruction.opcode[0], next_ip, d_orig);
+            if (status != XXEMUL_STATUS_OK) return status;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
+                &instruction.opcode[1], next_ip, mask);
+            if (status != XXEMUL_STATUS_OK) return status;
+            for (i = 0u; i < 16u; ++i) {
+                if (mask[i] & 0x80u) {
+                    dest[i] = 0u;
+                } else {
+                    dest[i] = d_orig[mask[i] & 0x0fu];
+                }
+            }
+            status = xxemul_x86_write_xmm_operand(emulator, &instruction,
+                &instruction.opcode[0], next_ip, dest);
         }
         break;
     case CDISASM_X86_NAME_CVTSI2SS:
@@ -2665,6 +2923,8 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
     case CDISASM_X86_NAME_FNINIT:
     case CDISASM_X86_NAME_FINIT:
         memset(emulator->x87_stack, 0, sizeof(emulator->x87_stack));
+        memset(emulator->x87_int_val, 0, sizeof(emulator->x87_int_val));
+        memset(emulator->x87_is_int, 0, sizeof(emulator->x87_is_int));
         emulator->x87_depth = 0u;
         emulator->x87_top = 0u;
         emulator->x87_control = 0x037fu;
@@ -2905,8 +3165,22 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             }
         }
         break;
+    case CDISASM_X86_NAME_PUNPCKLBW:
+    case CDISASM_X86_NAME_PUNPCKHBW:
+    case CDISASM_X86_NAME_PUNPCKLWD:
+    case CDISASM_X86_NAME_PUNPCKHWD:
+    case CDISASM_X86_NAME_PUNPCKLDQ:
+    case CDISASM_X86_NAME_PUNPCKHDQ:
     case CDISASM_X86_NAME_PUNPCKLQDQ:
     case CDISASM_X86_NAME_PUNPCKHQDQ:
+    case CDISASM_X86_NAME_VPUNPCKLBW:
+    case CDISASM_X86_NAME_VPUNPCKHBW:
+    case CDISASM_X86_NAME_VPUNPCKLWD:
+    case CDISASM_X86_NAME_VPUNPCKHWD:
+    case CDISASM_X86_NAME_VPUNPCKLDQ:
+    case CDISASM_X86_NAME_VPUNPCKHDQ:
+    case CDISASM_X86_NAME_VPUNPCKLQDQ:
+    case CDISASM_X86_NAME_VPUNPCKHQDQ:
         if (instruction.operand_count != 2u
             || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
             || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
@@ -2915,18 +3189,54 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         {
             uint8_t source[16];
+            uint8_t dest[16];
             uint8_t *destination = emulator->x86.xmm[
                 instruction.opcode[0].reg - CDISASM_X86_REG_XMM0];
-            size_t half = instruction.name_id
-                == CDISASM_X86_NAME_PUNPCKHQDQ ? 8u : 0u;
             status = xxemul_x86_read_xmm_operand(emulator, &instruction,
                 &instruction.opcode[1], next_ip, source);
             if (status != XXEMUL_STATUS_OK) return status;
-            memmove(destination, destination + half, 8u);
-            memcpy(destination + 8u, source + half, 8u);
+            size_t elem_size = 1u;
+            int is_high = 0;
+            switch (instruction.name_id) {
+            case CDISASM_X86_NAME_PUNPCKHBW:
+            case CDISASM_X86_NAME_VPUNPCKHBW:
+                elem_size = 1u; is_high = 1; break;
+            case CDISASM_X86_NAME_PUNPCKLWD:
+            case CDISASM_X86_NAME_VPUNPCKLWD:
+                elem_size = 2u; is_high = 0; break;
+            case CDISASM_X86_NAME_PUNPCKHWD:
+            case CDISASM_X86_NAME_VPUNPCKHWD:
+                elem_size = 2u; is_high = 1; break;
+            case CDISASM_X86_NAME_PUNPCKLDQ:
+            case CDISASM_X86_NAME_VPUNPCKLDQ:
+                elem_size = 4u; is_high = 0; break;
+            case CDISASM_X86_NAME_PUNPCKHDQ:
+            case CDISASM_X86_NAME_VPUNPCKHDQ:
+                elem_size = 4u; is_high = 1; break;
+            case CDISASM_X86_NAME_PUNPCKLQDQ:
+            case CDISASM_X86_NAME_VPUNPCKLQDQ:
+                elem_size = 8u; is_high = 0; break;
+            case CDISASM_X86_NAME_PUNPCKHQDQ:
+            case CDISASM_X86_NAME_VPUNPCKHQDQ:
+                elem_size = 8u; is_high = 1; break;
+            default:
+                elem_size = 1u; is_high = 0; break;
+            }
+            size_t base = is_high ? 8u : 0u;
+            size_t i;
+            for (i = 0u; i < 8u / elem_size; ++i) {
+                memcpy(dest + (2u * i) * elem_size, destination + base + i * elem_size, elem_size);
+                memcpy(dest + (2u * i + 1u) * elem_size, source + base + i * elem_size, elem_size);
+            }
+            memcpy(destination, dest, 16u);
         }
         break;
     case CDISASM_X86_NAME_PXOR:
+    case CDISASM_X86_NAME_XORPS:
+    case CDISASM_X86_NAME_XORPD:
+    case CDISASM_X86_NAME_VXORPS:
+    case CDISASM_X86_NAME_VXORPD:
+    case CDISASM_X86_NAME_VPXOR:
         if (instruction.operand_count != 2u
             || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
             || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
@@ -2946,6 +3256,78 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
         }
         status = XXEMUL_STATUS_OK;
         break;
+    case CDISASM_X86_NAME_PAND:
+    case CDISASM_X86_NAME_ANDPS:
+    case CDISASM_X86_NAME_ANDPD:
+    case CDISASM_X86_NAME_VPAND:
+    case CDISASM_X86_NAME_VANDPS:
+    case CDISASM_X86_NAME_VANDPD:
+        if (instruction.operand_count != 2u
+            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
+            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
+            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
+            || instruction.opcode[0].size != 16u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        {
+            uint8_t source[16];
+            size_t destination = (size_t)(instruction.opcode[0].reg
+                - CDISASM_X86_REG_XMM0);
+            size_t index;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
+                &instruction.opcode[1], next_ip, source);
+            if (status != XXEMUL_STATUS_OK) return status;
+            for (index = 0u; index < sizeof(source); ++index)
+                emulator->x86.xmm[destination][index] &= source[index];
+        }
+        status = XXEMUL_STATUS_OK;
+        break;
+    case CDISASM_X86_NAME_PANDN:
+    case CDISASM_X86_NAME_VPANDN:
+        if (instruction.operand_count != 2u
+            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
+            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
+            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
+            || instruction.opcode[0].size != 16u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        {
+            uint8_t source[16];
+            size_t destination = (size_t)(instruction.opcode[0].reg
+                - CDISASM_X86_REG_XMM0);
+            size_t index;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
+                &instruction.opcode[1], next_ip, source);
+            if (status != XXEMUL_STATUS_OK) return status;
+            for (index = 0u; index < sizeof(source); ++index)
+                emulator->x86.xmm[destination][index] =
+                    (~emulator->x86.xmm[destination][index]) & source[index];
+        }
+        status = XXEMUL_STATUS_OK;
+        break;
+    case CDISASM_X86_NAME_POR:
+    case CDISASM_X86_NAME_ORPS:
+    case CDISASM_X86_NAME_ORPD:
+    case CDISASM_X86_NAME_VPOR:
+    case CDISASM_X86_NAME_VORPS:
+    case CDISASM_X86_NAME_VORPD:
+        if (instruction.operand_count != 2u
+            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
+            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
+            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
+            || instruction.opcode[0].size != 16u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        {
+            uint8_t source[16];
+            size_t destination = (size_t)(instruction.opcode[0].reg
+                - CDISASM_X86_REG_XMM0);
+            size_t index;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
+                &instruction.opcode[1], next_ip, source);
+            if (status != XXEMUL_STATUS_OK) return status;
+            for (index = 0u; index < sizeof(source); ++index)
+                emulator->x86.xmm[destination][index] |= source[index];
+        }
+        status = XXEMUL_STATUS_OK;
+        break;
     case CDISASM_X86_NAME_FXCH:
         if (instruction.operand_count != 1u
             || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
@@ -2961,6 +3343,14 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             value = emulator->x87_stack[0];
             emulator->x87_stack[0] = emulator->x87_stack[index];
             emulator->x87_stack[index] = value;
+            {
+                uint64_t int_tmp = emulator->x87_int_val[0];
+                emulator->x87_int_val[0] = emulator->x87_int_val[index];
+                emulator->x87_int_val[index] = int_tmp;
+                uint8_t is_int_tmp = emulator->x87_is_int[0];
+                emulator->x87_is_int[0] = emulator->x87_is_int[index];
+                emulator->x87_is_int[index] = is_int_tmp;
+            }
         }
         status = XXEMUL_STATUS_OK;
         break;
@@ -3035,6 +3425,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                     / emulator->x87_stack[destination];
                 break;
             }
+            emulator->x87_is_int[destination] = 0;
             if (pop) {
                 status = xxemul_x87_pop(emulator);
             } else {
@@ -3111,17 +3502,31 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
         status = xxemul_x86_read_operand(emulator, &instruction,
             &instruction.opcode[0], next_ip, &right);
         if (status != XXEMUL_STATUS_OK) return status;
-        status = xxemul_x87_push(emulator,
-            (double)(int64_t)xxemul_sign_extend(
-                right, instruction.opcode[0].size));
+        status = xxemul_x87_push_int(emulator,
+            right, instruction.opcode[0].size);
         break;
     case CDISASM_X86_NAME_FST:
     case CDISASM_X86_NAME_FSTP:
-        if (instruction.operand_count != 1u
-            || instruction.opcode[0].type != CDISASM_OPERAND_MEMORY
+        if (instruction.operand_count != 1u || emulator->x87_depth == 0u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        if (instruction.opcode[0].type == CDISASM_OPERAND_REGISTER
+            && instruction.opcode[0].reg >= CDISASM_X86_REG_ST0
+            && instruction.opcode[0].reg <= CDISASM_X86_REG_ST7) {
+            size_t reg_index = (size_t)(instruction.opcode[0].reg - CDISASM_X86_REG_ST0);
+            if (reg_index >= emulator->x87_depth)
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            emulator->x87_stack[reg_index] = emulator->x87_stack[0];
+            emulator->x87_int_val[reg_index] = emulator->x87_int_val[0];
+            emulator->x87_is_int[reg_index] = emulator->x87_is_int[0];
+            if (instruction.name_id == CDISASM_X86_NAME_FSTP)
+                status = xxemul_x87_pop(emulator);
+            else
+                status = XXEMUL_STATUS_OK;
+            break;
+        }
+        if (instruction.opcode[0].type != CDISASM_OPERAND_MEMORY
             || (instruction.opcode[0].size != 4u
-                && instruction.opcode[0].size != 8u)
-            || emulator->x87_depth == 0u)
+                && instruction.opcode[0].size != 8u))
             return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         if (instruction.opcode[0].size == 4u) {
             float value = (float)emulator->x87_stack[0];
@@ -3131,11 +3536,45 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
         } else {
             memcpy(&right, &emulator->x87_stack[0], sizeof(right));
         }
-        status = xxemul_x86_write_operand(emulator, &instruction,
-            &instruction.opcode[0], next_ip, right);
+        page_fault_error = UINT32_MAX;
+        status = xxemul_x86_write_operand_tracked(emulator, &instruction,
+            &instruction.opcode[0], next_ip, right, &page_fault_error);
         if (status == XXEMUL_STATUS_OK
             && instruction.name_id == CDISASM_X86_NAME_FSTP)
             status = xxemul_x87_pop(emulator);
+        else if (status != XXEMUL_STATUS_OK)
+            status = xxemul_x86_dos_page_fault(emulator, status,
+                page_fault_error, current_ip, &next_ip);
+        break;
+    case CDISASM_X86_NAME_FIST:
+    case CDISASM_X86_NAME_FISTP:
+    case CDISASM_X86_NAME_FISTTP:
+        if (instruction.operand_count != 1u
+            || instruction.opcode[0].type != CDISASM_OPERAND_MEMORY
+            || (instruction.opcode[0].size != 2u
+                && instruction.opcode[0].size != 4u
+                && instruction.opcode[0].size != 8u)
+            || emulator->x87_depth == 0u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        if (emulator->x87_is_int[0]) {
+            if (instruction.opcode[0].size == 8u) right = emulator->x87_int_val[0];
+            else if (instruction.opcode[0].size == 4u) right = (uint32_t)emulator->x87_int_val[0];
+            else right = (uint16_t)emulator->x87_int_val[0];
+        } else {
+            right = xxemul_x87_convert_to_integer(
+                emulator, emulator->x87_stack[0],
+                instruction.opcode[0].size,
+                instruction.name_id == CDISASM_X86_NAME_FISTTP);
+        }
+        page_fault_error = UINT32_MAX;
+        status = xxemul_x86_write_operand_tracked(emulator, &instruction,
+            &instruction.opcode[0], next_ip, right, &page_fault_error);
+        if (status == XXEMUL_STATUS_OK
+            && instruction.name_id != CDISASM_X86_NAME_FIST)
+            status = xxemul_x87_pop(emulator);
+        else if (status != XXEMUL_STATUS_OK)
+            status = xxemul_x86_dos_page_fault(emulator, status,
+                page_fault_error, current_ip, &next_ip);
         break;
     case CDISASM_X86_NAME_NOP:
     case CDISASM_X86_NAME_ENDBR32:
@@ -3185,6 +3624,35 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             status = xxemul_x86_write_register(
                 emulator, accumulator, left);
         }
+        break;
+    case CDISASM_X86_NAME_XADD:
+        if (instruction.operand_count < 2u
+            || instruction.opcode[0].size == 0u
+            || instruction.opcode[0].size > 8u)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        size = instruction.opcode[0].size;
+        page_fault_error = UINT32_MAX;
+        status = xxemul_x86_read_operand_tracked(emulator, &instruction,
+            &instruction.opcode[0], next_ip, &left, &page_fault_error);
+        if (status != XXEMUL_STATUS_OK) {
+            status = xxemul_x86_dos_page_fault(emulator, status,
+                page_fault_error, current_ip, &next_ip);
+            break;
+        }
+        status = xxemul_x86_read_operand(emulator, &instruction,
+            &instruction.opcode[1], next_ip, &right);
+        if (status != XXEMUL_STATUS_OK) return status;
+        target = (left + right) & xxemul_mask_for_size(size);
+        xxemul_x86_set_add_flags(emulator, left, right, target, size);
+        status = xxemul_x86_write_operand(emulator, &instruction,
+            &instruction.opcode[1], next_ip, left);
+        if (status != XXEMUL_STATUS_OK) return status;
+        page_fault_error = UINT32_MAX;
+        status = xxemul_x86_write_operand_tracked(emulator, &instruction,
+            &instruction.opcode[0], next_ip, target, &page_fault_error);
+        if (status != XXEMUL_STATUS_OK)
+            status = xxemul_x86_dos_page_fault(emulator, status,
+                page_fault_error, current_ip, &next_ip);
         break;
     case CDISASM_X86_NAME_IMUL:
         if (instruction.operand_count == 1u) {
@@ -3828,6 +4296,11 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
         if (emulator->linux_process != NULL && right == 0x80u) {
             status = xxemul_linux_dispatch(emulator->linux_process);
             if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
+        } else if (emulator->windows != NULL && right == 0x29u) {
+            fprintf(stderr, "[xxemul] Windows __fastfail (code 0x%llx)\n",
+                (unsigned long long)emulator->x86.gpr[XXEMUL_X86_RCX]);
+            status = XXEMUL_STATUS_HALTED;
+            emulator->halted = 1;
         } else if (emulator->dos_mode) {
             status = (right == 0x20u || right == 0x21u || right == 0x29u)
                 ? xxemul_msdos_interrupt(emulator, (uint8_t)right)
