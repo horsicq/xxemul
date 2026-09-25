@@ -637,7 +637,8 @@ static uint8_t win_argument_count(const char *name)
         || win_equal(name, "VariantChangeTypeEx") || win_equal(name, "RegOpenKeyExA")
         || win_equal(name, "RegOpenKeyExW") || win_equal(name, "WriteConsoleW")
         || win_equal(name, "ReadConsoleW") || win_equal(name, "FoldStringW")
-        || win_equal(name, "GetTokenInformation")) return 5u;
+        || win_equal(name, "GetTokenInformation")
+        || win_equal(name, "__stdio_common_vfprintf")) return 5u;
     if (win_equal(name, "VirtualProtect") || win_equal(name, "VirtualAlloc")
         || win_equal(name, "qsort") || win_equal(name, "CreateEventA")
         || win_equal(name, "CreateSemaphoreA") || win_equal(name, "RaiseException")
@@ -806,7 +807,8 @@ static uint64_t win_resolve(xxemul_windows *process,
     win_api *api;
     uint64_t address;
     int is_crt = win_crt_api(name) || win_suffix(module, "msvcrt.dll")
-        || win_suffix(module, "ucrtbase.dll");
+        || win_suffix(module, "ucrtbase.dll")
+        || strstr(module, "api-ms-win-crt-") != NULL;
     if (win_equal(name, "_iob")) return process->iob_address;
     if (win_equal(name, "__initenv"))
         return process->runtime_base + WIN_CRT_DATA_OFFSET;
@@ -1044,6 +1046,12 @@ static int win_prepare_runtime(xxemul_windows *process,
             process->command_line_a)
         || !win_store(process, process->runtime_base
             + WIN_CRT_DATA_OFFSET + 28u, 4u, 0x4000u)
+        || !win_store(process, process->runtime_base
+            + WIN_CRT_DATA_OFFSET + 40u, 4u, process->argc)
+        || !win_store(process, process->runtime_base
+            + WIN_CRT_DATA_OFFSET + 48u, word_size, process->argv_address)
+        || !win_store(process, process->runtime_base
+            + WIN_CRT_DATA_OFFSET + 56u, word_size, process->envp_address)
         || !win_write(process, process->runtime_base + 0xbb00u,
             ".\0\0C\0", 5u)) return 0;
     for (i = 0u; i < 10u; ++i) {
@@ -1352,6 +1360,9 @@ static int win_guest_path(xxemul_windows *process, const char *guest,
     relative[j] = '\0';
     if (win_equal(relative, program))
         return win_copy(host, capacity, process->program_path);
+    if (guest[0] != '\0' && guest[1] == ':') {
+        return win_copy(host, capacity, guest);
+    }
     if (relative[0] == '/' || strchr(relative, ':') != NULL) return 0;
     i = 0;
     while (i < j) {
@@ -2190,6 +2201,9 @@ static int win_utf8_scalar(const uint8_t *bytes, size_t available,
 static xxemul_status win_multi_byte_to_wide(xxemul_windows *process,
     const uint64_t *arg, uint64_t *result)
 {
+    fprintf(stderr, "[MultiByteToWideChar cp=%llu flags=0x%llx src=0x%llx srclen=%lld dst=0x%llx dstlen=%lld]\n",
+        (unsigned long long)arg[0], (unsigned long long)arg[1], (unsigned long long)arg[2],
+        (long long)(int32_t)arg[3], (unsigned long long)arg[4], (long long)(int32_t)arg[5]);
     uint32_t code_page = win_code_page((uint32_t)arg[0]);
     uint32_t flags = (uint32_t)arg[1];
     uint8_t *input = NULL, *output;
@@ -2782,10 +2796,231 @@ static int win_load_string(xxemul_windows *process, uint32_t uid,
     return 0;
 }
 
+static xxemul_status win_stdio_vfprintf(xxemul_windows *process,
+    uint64_t stream, uint64_t format_addr, uint64_t valist, uint64_t *result)
+{
+    char *fmt = NULL;
+    size_t fmt_len = 0;
+    xxemul_status status;
+    char out_buf[4096];
+    size_t out_len = 0;
+    const char *p;
+    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint64_t stride = word_size == 8u ? 48u : 32u;
+
+    if (format_addr == 0) {
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    status = win_crt_read_string(process, format_addr, &fmt, &fmt_len);
+    if (status != XXEMUL_STATUS_OK || fmt == NULL) return status;
+
+    p = fmt;
+    while (*p != '\0') {
+        if (*p != '%') {
+            if (out_len + 1 < sizeof(out_buf)) out_buf[out_len++] = *p;
+            p++;
+            continue;
+        }
+        p++;
+        if (*p == '%') {
+            if (out_len + 1 < sizeof(out_buf)) out_buf[out_len++] = '%';
+            p++;
+            continue;
+        }
+
+        char spec[32];
+        size_t sidx = 0;
+        spec[sidx++] = '%';
+        while (*p && strchr("-+ #0", *p)) {
+            if (sidx + 1 < sizeof(spec)) spec[sidx++] = *p;
+            p++;
+        }
+        while (*p && (*p >= '0' && *p <= '9')) {
+            if (sidx + 1 < sizeof(spec)) spec[sidx++] = *p;
+            p++;
+        }
+        if (*p == '.') {
+            if (sidx + 1 < sizeof(spec)) spec[sidx++] = *p;
+            p++;
+            while (*p && (*p >= '0' && *p <= '9')) {
+                if (sidx + 1 < sizeof(spec)) spec[sidx++] = *p;
+                p++;
+            }
+        }
+        int is_64bit = (word_size == 8u);
+        if (*p == 'l' && *(p + 1) == 'l') {
+            is_64bit = 1;
+            spec[sidx++] = 'l'; spec[sidx++] = 'l';
+            p += 2;
+        } else if (*p == 'l') {
+            spec[sidx++] = 'l';
+            p++;
+        } else if (*p == 'z') {
+            is_64bit = (word_size == 8u);
+            spec[sidx++] = 'z';
+            p++;
+        } else if (*p == 'h') {
+            spec[sidx++] = 'h';
+            p++;
+        } else if (p[0] == 'I' && p[1] == '6' && p[2] == '4') {
+            is_64bit = 1;
+            spec[sidx++] = 'l'; spec[sidx++] = 'l';
+            p += 3;
+        }
+
+        char type = *p ? *p++ : '\0';
+        spec[sidx++] = type;
+        spec[sidx] = '\0';
+
+        if (type == 's') {
+            uint64_t str_ptr = 0;
+            win_load(process, valist, word_size, &str_ptr);
+            valist += word_size;
+            if (str_ptr != 0) {
+                char *s_arg = NULL;
+                size_t s_len = 0;
+                if (win_crt_read_string(process, str_ptr, &s_arg, &s_len) == XXEMUL_STATUS_OK && s_arg != NULL) {
+                    size_t rem = sizeof(out_buf) - out_len - 1;
+                    if (s_len > rem) s_len = rem;
+                    memcpy(out_buf + out_len, s_arg, s_len);
+                    out_len += s_len;
+                    free(s_arg);
+                }
+            } else {
+                const char *null_str = "(null)";
+                size_t nlen = strlen(null_str);
+                size_t rem = sizeof(out_buf) - out_len - 1;
+                if (nlen > rem) nlen = rem;
+                memcpy(out_buf + out_len, null_str, nlen);
+                out_len += nlen;
+            }
+        } else if (type == 'c') {
+            uint64_t val = 0;
+            win_load(process, valist, word_size, &val);
+            valist += word_size;
+            if (out_len + 1 < sizeof(out_buf)) out_buf[out_len++] = (char)val;
+        } else if (type == 'd' || type == 'i') {
+            uint64_t val = 0;
+            win_load(process, valist, word_size, &val);
+            valist += word_size;
+            char piece[64];
+            int plen;
+            if (is_64bit) {
+                plen = snprintf(piece, sizeof(piece), spec, (long long)val);
+            } else {
+                plen = snprintf(piece, sizeof(piece), spec, (int)(int32_t)val);
+            }
+            if (plen > 0) {
+                size_t rem = sizeof(out_buf) - out_len - 1;
+                if ((size_t)plen > rem) plen = (int)rem;
+                memcpy(out_buf + out_len, piece, (size_t)plen);
+                out_len += (size_t)plen;
+            }
+        } else if (type == 'u' || type == 'x' || type == 'X' || type == 'o') {
+            uint64_t val = 0;
+            win_load(process, valist, word_size, &val);
+            valist += word_size;
+            char piece[64];
+            int plen;
+            if (is_64bit) {
+                plen = snprintf(piece, sizeof(piece), spec, (unsigned long long)val);
+            } else {
+                plen = snprintf(piece, sizeof(piece), spec, (unsigned int)(uint32_t)val);
+            }
+            if (plen > 0) {
+                size_t rem = sizeof(out_buf) - out_len - 1;
+                if ((size_t)plen > rem) plen = (int)rem;
+                memcpy(out_buf + out_len, piece, (size_t)plen);
+                out_len += (size_t)plen;
+            }
+        } else if (type == 'p') {
+            uint64_t val = 0;
+            win_load(process, valist, word_size, &val);
+            valist += word_size;
+            char piece[64];
+            int plen = snprintf(piece, sizeof(piece), "%016llx", (unsigned long long)val);
+            if (plen > 0) {
+                size_t rem = sizeof(out_buf) - out_len - 1;
+                if ((size_t)plen > rem) plen = (int)rem;
+                memcpy(out_buf + out_len, piece, (size_t)plen);
+                out_len += (size_t)plen;
+            }
+        } else {
+            valist += word_size;
+        }
+    }
+    out_buf[out_len] = '\0';
+    free(fmt);
+
+    if (stream == process->iob_address || stream == process->iob_address + stride || stream == process->iob_address + 2u * stride) {
+        FILE *target_file = (stream == process->iob_address + 2u * stride) ? stderr : stdout;
+        if (process->emulator->output_callback != NULL) {
+            size_t k;
+            for (k = 0; k < out_len; ++k)
+                process->emulator->output_callback(process->emulator->output_context, (uint8_t)out_buf[k]);
+        } else {
+            fputs(out_buf, target_file);
+            fflush(target_file);
+        }
+    } else {
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            uint64_t handle = win_crt_handle(process, fd);
+            xx_io_device *opened = win_handle_io(process, handle);
+            if (opened != NULL) {
+                xx_io_write(opened, out_buf, out_len);
+            }
+        }
+    }
+
+    *result = (uint64_t)out_len;
+    return XXEMUL_STATUS_OK;
+}
+
+static uint64_t win_crt_fopen(xxemul_windows *process, const char *filename, const char *mode)
+{
+    uint32_t access = 0x80000000u;
+    uint32_t disposition = 3u;
+    uint64_t handle;
+    size_t fd;
+    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint64_t stride = word_size == 8u ? 48u : 32u;
+
+    if (filename == NULL || mode == NULL) return 0;
+    if (strchr(mode, 'w') != NULL) {
+        access = 0x40000000u;
+        disposition = 2u;
+    } else if (strchr(mode, 'a') != NULL) {
+        access = 0x40000000u;
+        disposition = 4u;
+    }
+    if (strchr(mode, '+') != NULL) {
+        access |= 0xc0000000u;
+    }
+    handle = win_file_open(process, filename, access, disposition);
+    if (handle == WIN_INVALID_HANDLE) return 0;
+    for (fd = 3u; fd < WIN_MAX_CRT_FDS; ++fd) {
+        if (process->crt_fd_handles[fd] == 0u) break;
+    }
+    if (fd == WIN_MAX_CRT_FDS) {
+        win_close_handle(process, handle);
+        return 0;
+    }
+    process->crt_fd_handles[fd] = handle;
+    if (strchr(mode, 'a') != NULL) {
+        xx_io_device *opened = win_handle_io(process, handle);
+        if (opened != NULL) xx_io_seek64(opened, 0, SEEK_END);
+    }
+    return process->iob_address + (uint64_t)fd * stride;
+}
+
 static xxemul_status win_call(xxemul_windows *process,
     const win_api *api, const uint64_t *arg, uint64_t *result)
 {
     const char *name = api->name;
+    fprintf(stderr, "[CALL] %s::%s\n", api->module, name);
     uint8_t word_size = process->emulator->mode == XXEMUL_MODE_X86_64
         ? 8u : 4u;
     char text[1024];
@@ -2856,12 +3091,376 @@ static xxemul_status win_call(xxemul_windows *process,
         *result = process->runtime_base + WIN_CRT_DATA_OFFSET + 24u;
     else if (strcmp(name, "__p__fmode") == 0)
         *result = process->runtime_base + WIN_CRT_DATA_OFFSET + 28u;
+    else if (strcmp(name, "__p___argc") == 0)
+        *result = process->runtime_base + WIN_CRT_DATA_OFFSET + 40u;
+    else if (strcmp(name, "__p___argv") == 0)
+        *result = process->runtime_base + WIN_CRT_DATA_OFFSET + 48u;
+    else if (strcmp(name, "__p__environ") == 0)
+        *result = process->runtime_base + WIN_CRT_DATA_OFFSET;
     if (strcmp(name, "__p__acmdln") == 0
         || strcmp(name, "__p__commode") == 0
-        || strcmp(name, "__p__fmode") == 0)
+        || strcmp(name, "__p__fmode") == 0
+        || strcmp(name, "__p___argc") == 0
+        || strcmp(name, "__p___argv") == 0
+        || strcmp(name, "__p__environ") == 0)
         return XXEMUL_STATUS_OK;
-    if (strcmp(name, "__set_app_type") == 0) {
+    if (strcmp(name, "__set_app_type") == 0 || strcmp(name, "_set_app_type") == 0) {
         process->app_type = (uint32_t)arg[0];
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_set_invalid_parameter_handler") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_initialize_narrow_environment") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_configure_narrow_argv") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_crt_atexit") == 0) {
+        if (arg[0] != 0u && process->onexit_count < WIN_MAX_ONEXIT) {
+            process->onexit_callbacks[process->onexit_count++] = arg[0];
+        }
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_configthreadlocale") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_set_new_mode") == 0) {
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_lock_file") == 0 || strcmp(name, "_unlock_file") == 0) {
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "__acrt_iob_func") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        *result = process->iob_address + arg[0] * stride;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "__stdio_common_vfprintf") == 0) {
+        return win_stdio_vfprintf(process, arg[1], arg[2], arg[4], result);
+    }
+    if (strcmp(name, "vfprintf") == 0) {
+        return win_stdio_vfprintf(process, arg[0], arg[1], arg[2], result);
+    }
+    if (strcmp(name, "putc") == 0) {
+        uint8_t ch = (uint8_t)arg[0];
+        if (process->emulator->output_callback != NULL) {
+            process->emulator->output_callback(process->emulator->output_context, ch);
+        } else {
+            fputc(ch, stdout);
+            fflush(stdout);
+        }
+        *result = ch;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "perror") == 0) {
+        char *msg = NULL;
+        size_t mlen = 0;
+        if (arg[0] != 0 && win_crt_read_string(process, arg[0], &msg, &mlen) == XXEMUL_STATUS_OK && msg != NULL) {
+            fprintf(stderr, "%s: error\n", msg);
+            free(msg);
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "fopen") == 0 || strcmp(name, "_wfopen") == 0) {
+        char fn[1024];
+        char md[64];
+        int w = strcmp(name, "_wfopen") == 0;
+        int s1 = win_guest_string(process, arg[0], fn, sizeof(fn), w);
+        int s2 = win_guest_string(process, arg[1], md, sizeof(md), w);
+        if (!s1 || !s2) {
+            fprintf(stderr, "[%s failed string: s1=%d s2=%d fn_addr=0x%llx md_addr=0x%llx]\n", name, s1, s2, (unsigned long long)arg[0], (unsigned long long)arg[1]);
+            *result = 0;
+            return XXEMUL_STATUS_OK;
+        }
+        *result = win_crt_fopen(process, fn, md);
+        fprintf(stderr, "[%s: fn='%s' md='%s' res=0x%llx]\n", name, fn, md, (unsigned long long)*result);
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "fclose") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[0];
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            if (fd >= 3u && process->crt_fd_handles[fd] != 0u) {
+                win_close_handle(process, process->crt_fd_handles[fd]);
+                process->crt_fd_handles[fd] = 0u;
+            }
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "fwrite") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[3];
+        uint64_t total = arg[1] * arg[2];
+        if (total == 0) { *result = 0; return XXEMUL_STATUS_OK; }
+        if (stream == process->iob_address || stream == process->iob_address + stride || stream == process->iob_address + 2u * stride) {
+            FILE *tgt = (stream == process->iob_address + 2u * stride) ? stderr : stdout;
+            uint8_t buf[2048];
+            uint64_t done = 0;
+            while (done < total) {
+                size_t chunk = (size_t)(total - done);
+                if (chunk > sizeof(buf)) chunk = sizeof(buf);
+                if (!win_read(process, arg[0] + done, buf, chunk)) break;
+                if (process->emulator->output_callback != NULL) {
+                    size_t k;
+                    for (k = 0; k < chunk; ++k) process->emulator->output_callback(process->emulator->output_context, buf[k]);
+                } else {
+                    fwrite(buf, 1, chunk, tgt);
+                }
+                done += chunk;
+            }
+            if (process->emulator->output_callback == NULL) fflush(tgt);
+            *result = arg[1] > 0 ? (done / arg[1]) : 0;
+            return XXEMUL_STATUS_OK;
+        } else {
+            uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+            if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+                size_t fd = (size_t)(offset / stride);
+                uint64_t handle = win_crt_handle(process, fd);
+                xx_io_device *opened = win_handle_io(process, handle);
+                if (opened != NULL) {
+                    uint8_t buf[4096];
+                    uint64_t done = 0;
+                    while (done < total) {
+                        size_t chunk = (size_t)(total - done);
+                        if (chunk > sizeof(buf)) chunk = sizeof(buf);
+                        if (!win_read(process, arg[0] + done, buf, chunk)) break;
+                        xx_io_write(opened, buf, chunk);
+                        done += chunk;
+                    }
+                    *result = arg[1] > 0 ? (done / arg[1]) : 0;
+                    return XXEMUL_STATUS_OK;
+                }
+            }
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "fread") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[3];
+        uint64_t total = arg[1] * arg[2];
+        if (total == 0) { *result = 0; return XXEMUL_STATUS_OK; }
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            uint64_t handle = win_crt_handle(process, fd);
+            xx_io_device *opened = win_handle_io(process, handle);
+            if (opened != NULL) {
+                uint8_t buf[4096];
+                uint64_t done = 0;
+                while (done < total) {
+                    size_t chunk = (size_t)(total - done);
+                    if (chunk > sizeof(buf)) chunk = sizeof(buf);
+                    int64_t r = xx_io_read(opened, buf, chunk);
+                    if (r <= 0) break;
+                    if (!win_write(process, arg[0] + done, buf, (size_t)r)) break;
+                    done += (size_t)r;
+                    if ((size_t)r < chunk) break;
+                }
+                *result = arg[1] > 0 ? (done / arg[1]) : 0;
+                return XXEMUL_STATUS_OK;
+            }
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "fgetc") == 0 || strcmp(name, "getc") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[0];
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            uint64_t handle = win_crt_handle(process, fd);
+            xx_io_device *opened = win_handle_io(process, handle);
+            if (opened != NULL) {
+                uint8_t b = 0;
+                if (xx_io_read(opened, &b, 1) == 1) {
+                    *result = (uint64_t)b;
+                    return XXEMUL_STATUS_OK;
+                }
+            }
+        }
+        *result = UINT64_MAX;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "fgets") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[2];
+        int count = (int)arg[1];
+        if (count <= 1 || arg[0] == 0) { *result = 0; return XXEMUL_STATUS_OK; }
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            uint64_t handle = win_crt_handle(process, fd);
+            xx_io_device *opened = win_handle_io(process, handle);
+            if (opened != NULL) {
+                int i;
+                for (i = 0; i < count - 1; ++i) {
+                    uint8_t b = 0;
+                    if (xx_io_read(opened, &b, 1) != 1) {
+                        if (i == 0) { *result = 0; return XXEMUL_STATUS_OK; }
+                        break;
+                    }
+                    win_store(process, arg[0] + (uint64_t)i, 1u, b);
+                    if (b == '\n') { i++; break; }
+                }
+                win_store(process, arg[0] + (uint64_t)i, 1u, 0);
+                *result = arg[0];
+                return XXEMUL_STATUS_OK;
+            }
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "feof") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[0];
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            uint64_t handle = win_crt_handle(process, fd);
+            xx_io_device *opened = win_handle_io(process, handle);
+            if (opened != NULL && xx_io_tell(opened) >= xx_io_size(opened)) {
+                *result = 1;
+                return XXEMUL_STATUS_OK;
+            }
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "ferror") == 0 || strcmp(name, "setvbuf") == 0) {
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_fseeki64") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[0];
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            uint64_t handle = win_crt_handle(process, fd);
+            xx_io_device *opened = win_handle_io(process, handle);
+            if (opened != NULL) {
+                int whence = arg[2] == 0 ? SEEK_SET : arg[2] == 1 ? SEEK_CUR : SEEK_END;
+                *result = (uint64_t)xx_io_seek64(opened, (int64_t)arg[1], whence);
+                return XXEMUL_STATUS_OK;
+            }
+        }
+        *result = UINT64_MAX;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_ftelli64") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[0];
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            uint64_t handle = win_crt_handle(process, fd);
+            xx_io_device *opened = win_handle_io(process, handle);
+            if (opened != NULL) {
+                *result = (uint64_t)xx_io_tell(opened);
+                return XXEMUL_STATUS_OK;
+            }
+        }
+        *result = UINT64_MAX;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_fullpath") == 0) {
+        char rel[1024];
+        char abs_path[2048];
+        size_t maxlen = (size_t)arg[2];
+        if (!win_guest_string(process, arg[1], rel, sizeof(rel), 0))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        char host_rel[2048];
+        win_guest_path(process, rel, host_rel, sizeof(host_rel));
+#if defined(_WIN32)
+        if (_fullpath(abs_path, host_rel, sizeof(abs_path)) == NULL) {
+            *result = 0;
+            return win_crt_errno(process, 2u);
+        }
+#else
+        if (realpath(host_rel, abs_path) == NULL) {
+            *result = 0;
+            return win_crt_errno(process, 2u);
+        }
+#endif
+        size_t alen = strlen(abs_path);
+        uint64_t out_addr = arg[0];
+        if (out_addr == 0) {
+            out_addr = win_heap_alloc(process, alen + 1);
+            if (out_addr == 0) return win_crt_errno(process, 12u);
+        } else if (alen >= maxlen) {
+            *result = 0;
+            return win_crt_errno(process, 34u);
+        }
+        win_write(process, out_addr, abs_path, alen + 1);
+        *result = out_addr;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_wstat64") == 0) {
+        char host_path[2048];
+        if (!win_guest_string(process, arg[0], text, sizeof(text), 1))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (!win_guest_path(process, text, host_path, sizeof(host_path))) {
+            *result = UINT32_MAX;
+            return win_crt_errno(process, 2u);
+        }
+        return win_crt_store_stat(process, host_path, arg[1], 8u, result);
+    }
+    if (strcmp(name, "_waccess") == 0) {
+        char host_path[2048];
+        if (!win_guest_string(process, arg[0], text, sizeof(text), 1))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (!win_guest_path(process, text, host_path, sizeof(host_path))) {
+            *result = UINT32_MAX;
+            return win_crt_errno(process, 2u);
+        }
+#if defined(_WIN32)
+        int acc = _access(host_path, (int)arg[1]);
+#else
+        int acc = access(host_path, (int)arg[1]);
+#endif
+        if (acc != 0) {
+            *result = UINT32_MAX;
+            return win_crt_errno(process, 2u);
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "remove") == 0) {
+        char host_path[2048];
+        if (!win_guest_string(process, arg[0], text, sizeof(text), 0))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (!win_guest_path(process, text, host_path, sizeof(host_path))) {
+            *result = UINT32_MAX;
+            return win_crt_errno(process, 2u);
+        }
+        if (remove(host_path) != 0) {
+            *result = UINT32_MAX;
+            return win_crt_errno(process, 2u);
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_chsize_s") == 0) {
+        uint64_t handle = win_crt_handle(process, arg[0]);
+        xx_io_device *opened = win_handle_io(process, handle);
+        if (opened == NULL) {
+            *result = 9u;
+            return XXEMUL_STATUS_OK;
+        }
+        *result = 0;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "__setusermatherr") == 0) {
@@ -2886,6 +3485,81 @@ static xxemul_status win_call(xxemul_windows *process,
         if (word_size == 4u && result_size == 8u)
             process->emulator->x86.gpr[XXEMUL_X86_RDX]
                 = (uint32_t)(*result >> 32u);
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_localtime64") == 0 || strcmp(name, "localtime") == 0
+        || strcmp(name, "_gmtime64") == 0 || strcmp(name, "gmtime") == 0) {
+        uint64_t tval = 0;
+        time_t tt;
+        struct tm t_res_buf;
+        struct tm *t_res = NULL;
+        uint64_t tm_buf = process->runtime_base + WIN_CRT_DATA_OFFSET + 64u;
+        uint8_t t_size = (strcmp(name, "_localtime64") == 0 || strcmp(name, "_gmtime64") == 0) ? 8u : 4u;
+        if (arg[0] == 0 || !win_load(process, arg[0], t_size, &tval)) {
+            *result = 0;
+            return XXEMUL_STATUS_OK;
+        }
+        tt = (time_t)tval;
+        memset(&t_res_buf, 0, sizeof(t_res_buf));
+#if defined(_MSC_VER)
+        if (strcmp(name, "_gmtime64") == 0 || strcmp(name, "gmtime") == 0) {
+            if (_gmtime64_s(&t_res_buf, &tt) != 0) { *result = 0; return XXEMUL_STATUS_OK; }
+        } else {
+            if (_localtime64_s(&t_res_buf, &tt) != 0) { *result = 0; return XXEMUL_STATUS_OK; }
+        }
+        t_res = &t_res_buf;
+#else
+        if (strcmp(name, "_gmtime64") == 0 || strcmp(name, "gmtime") == 0) {
+            t_res = gmtime_r(&tt, &t_res_buf);
+        } else {
+            t_res = localtime_r(&tt, &t_res_buf);
+        }
+        if (t_res == NULL) {
+            *result = 0;
+            return XXEMUL_STATUS_OK;
+        }
+#endif
+        win_store(process, tm_buf + 0u, 4u, (uint32_t)t_res->tm_sec);
+        win_store(process, tm_buf + 4u, 4u, (uint32_t)t_res->tm_min);
+        win_store(process, tm_buf + 8u, 4u, (uint32_t)t_res->tm_hour);
+        win_store(process, tm_buf + 12u, 4u, (uint32_t)t_res->tm_mday);
+        win_store(process, tm_buf + 16u, 4u, (uint32_t)t_res->tm_mon);
+        win_store(process, tm_buf + 20u, 4u, (uint32_t)t_res->tm_year);
+        win_store(process, tm_buf + 24u, 4u, (uint32_t)t_res->tm_wday);
+        win_store(process, tm_buf + 28u, 4u, (uint32_t)t_res->tm_yday);
+        win_store(process, tm_buf + 32u, 4u, (uint32_t)t_res->tm_isdst);
+        *result = tm_buf;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "strftime") == 0) {
+        char *fmt = NULL;
+        size_t flen = 0;
+        uint64_t tm_addr = arg[3];
+        struct tm t_val;
+        char s_buf[1024];
+        size_t written = 0;
+        uint64_t fld;
+        memset(&t_val, 0, sizeof(t_val));
+        if (tm_addr != 0) {
+            win_load(process, tm_addr + 0u, 4u, &fld); t_val.tm_sec = (int)fld;
+            win_load(process, tm_addr + 4u, 4u, &fld); t_val.tm_min = (int)fld;
+            win_load(process, tm_addr + 8u, 4u, &fld); t_val.tm_hour = (int)fld;
+            win_load(process, tm_addr + 12u, 4u, &fld); t_val.tm_mday = (int)fld;
+            win_load(process, tm_addr + 16u, 4u, &fld); t_val.tm_mon = (int)fld;
+            win_load(process, tm_addr + 20u, 4u, &fld); t_val.tm_year = (int)fld;
+            win_load(process, tm_addr + 24u, 4u, &fld); t_val.tm_wday = (int)fld;
+            win_load(process, tm_addr + 28u, 4u, &fld); t_val.tm_yday = (int)fld;
+            win_load(process, tm_addr + 32u, 4u, &fld); t_val.tm_isdst = (int)fld;
+        }
+        if (win_crt_read_string(process, arg[2], &fmt, &flen) == XXEMUL_STATUS_OK && fmt != NULL) {
+            written = strftime(s_buf, sizeof(s_buf), fmt, &t_val);
+            if (written > 0 && arg[0] != 0 && arg[1] > 0) {
+                if (written >= arg[1]) written = arg[1] - 1;
+                win_write(process, arg[0], s_buf, written + 1);
+            }
+            free(fmt);
+        }
+        *result = (uint64_t)written;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "clock") == 0) {
@@ -4722,10 +5396,104 @@ static xxemul_status win_call(xxemul_windows *process,
         return win_crt_string_length(process, arg[0], 2u, result);
     if (strcmp(name, "strcmp") == 0
         || strcmp(name, "strncmp") == 0
-        || strcmp(name, "_stricmp") == 0)
+        || strcmp(name, "_stricmp") == 0
+        || strcmp(name, "_strnicmp") == 0)
         return win_crt_compare_strings(process, arg[0], arg[1],
-            strcmp(name, "strncmp") == 0 ? arg[2] : UINT64_MAX,
-            strcmp(name, "_stricmp") == 0, result);
+            (strcmp(name, "strncmp") == 0 || strcmp(name, "_strnicmp") == 0) ? arg[2] : UINT64_MAX,
+            (strcmp(name, "_stricmp") == 0 || strcmp(name, "_strnicmp") == 0), result);
+    if (strcmp(name, "strcat") == 0) {
+        uint64_t dest_len = 0, src_len = 0;
+        win_crt_string_length(process, arg[0], 1u, &dest_len);
+        win_crt_string_length(process, arg[1], 1u, &src_len);
+        win_crt_copy(process, arg[0] + dest_len, arg[1], src_len + 1u);
+        *result = arg[0];
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "strnlen") == 0) {
+        uint64_t maxlen = arg[1];
+        uint64_t i, ch;
+        for (i = 0; i < maxlen; ++i) {
+            if (!win_load(process, arg[0] + i, 1u, &ch) || ch == 0) break;
+        }
+        *result = i;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "wcsnlen") == 0) {
+        uint64_t maxlen = arg[1];
+        uint64_t i, ch;
+        for (i = 0; i < maxlen; ++i) {
+            if (!win_load(process, arg[0] + i * 2u, 2u, &ch) || ch == 0) break;
+        }
+        *result = i;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "isalpha") == 0) { *result = isalpha((int)(unsigned char)arg[0]) != 0; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "isdigit") == 0) { *result = isdigit((int)(unsigned char)arg[0]) != 0; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "isspace") == 0) { *result = isspace((int)(unsigned char)arg[0]) != 0; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "isxdigit") == 0) { *result = isxdigit((int)(unsigned char)arg[0]) != 0; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "iscntrl") == 0) { *result = iscntrl((int)(unsigned char)arg[0]) != 0; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "ispunct") == 0) { *result = ispunct((int)(unsigned char)arg[0]) != 0; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "tolower") == 0) { *result = (uint32_t)tolower((int)(unsigned char)arg[0]); return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "toupper") == 0) { *result = (uint32_t)toupper((int)(unsigned char)arg[0]); return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "strspn") == 0 || strcmp(name, "strpbrk") == 0) {
+        char *left = NULL, *right = NULL;
+        size_t left_length = 0u, right_length = 0u;
+        xxemul_status s = win_crt_read_string(process, arg[0], &left, &left_length);
+        if (s != XXEMUL_STATUS_OK || left == NULL) return s;
+        s = win_crt_read_string(process, arg[1], &right, &right_length);
+        if (s == XXEMUL_STATUS_OK && right != NULL) {
+            if (strcmp(name, "strspn") == 0) {
+                *result = strspn(left, right);
+            } else {
+                char *f = strpbrk(left, right);
+                *result = f != NULL ? arg[0] + (size_t)(f - left) : 0u;
+            }
+        }
+        free(left);
+        free(right);
+        return s;
+    }
+    if (strcmp(name, "strtoll") == 0 || strcmp(name, "strtoull") == 0) {
+        char *str = NULL;
+        size_t len = 0;
+        char *endp = NULL;
+        xxemul_status s = win_crt_read_string(process, arg[0], &str, &len);
+        if (s != XXEMUL_STATUS_OK || str == NULL) return s;
+        if (strcmp(name, "strtoll") == 0) {
+            *result = (uint64_t)strtoll(str, &endp, (int)arg[2]);
+        } else {
+            *result = (uint64_t)strtoull(str, &endp, (int)arg[2]);
+        }
+        if (arg[1] != 0u && endp != NULL) {
+            win_store(process, arg[1], word_size, arg[0] + (size_t)(endp - str));
+        }
+        free(str);
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "mbrlen") == 0) {
+        *result = arg[0] != 0 ? 1u : 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "mbrtowc") == 0) {
+        uint64_t ch = 0;
+        if (arg[1] != 0) {
+            win_load(process, arg[1], 1u, &ch);
+            if (arg[0] != 0) win_store(process, arg[0], 2u, (uint16_t)ch);
+            *result = ch == 0 ? 0u : 1u;
+        } else {
+            *result = 0u;
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "wcrtomb") == 0) {
+        if (arg[0] != 0) {
+            win_store(process, arg[0], 1u, (uint8_t)arg[1]);
+            *result = 1u;
+        } else {
+            *result = 1u;
+        }
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "strcpy") == 0
         || strcmp(name, "_strdup") == 0) {
         uint64_t length;
@@ -5537,7 +6305,7 @@ int xxemul_windows_try_step(
             }
         }
     }
-    if (strcmp(api->name, "_initterm") == 0) {
+    if (strcmp(api->name, "_initterm") == 0 || strcmp(api->name, "_initterm_e") == 0) {
         win_initterm_frame *frame;
         if (process->initterm_depth >= WIN_MAX_INITTERM_DEPTH
             || arguments[1] < arguments[0]
