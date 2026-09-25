@@ -173,6 +173,7 @@ struct xxemul_windows {
     uint64_t onexit_callbacks[WIN_MAX_ONEXIT];
     size_t onexit_count;
     uint64_t crt_fd_handles[WIN_MAX_CRT_FDS];
+    uint8_t crt_fd_eof[WIN_MAX_CRT_FDS];
     uint16_t console_cursor_x;
     uint16_t console_cursor_y;
     uint16_t console_attributes;
@@ -685,7 +686,8 @@ static uint8_t win_argument_count(const char *name)
         || win_equal(name, "SafeArrayCreate") || win_equal(name, "SafeArrayGetElement")
         || win_equal(name, "SafeArrayGetLBound") || win_equal(name, "SafeArrayGetUBound")
         || win_equal(name, "SafeArrayPtrOfIndex") || win_equal(name, "SafeArrayPutElement")
-        || win_equal(name, "GetWindowTextA") || win_equal(name, "OemToCharBuffA")) return 3u;
+        || win_equal(name, "GetWindowTextA") || win_equal(name, "OemToCharBuffA")
+        || win_equal(name, "fseek")) return 3u;
     if (win_equal(name, "GetProcAddress") || win_equal(name, "AddVectoredExceptionHandler")
         || win_equal(name, "WaitForSingleObject") || win_equal(name, "GetCurrentDirectoryA")
         || win_equal(name, "GetCurrentDirectoryW") || win_equal(name, "GetFileSize")
@@ -730,7 +732,9 @@ static uint8_t win_argument_count(const char *name)
         || win_equal(name, "CharUpperBuffA") || win_equal(name, "CharUpperBuffW")
         || win_equal(name, "EnumWindows") || win_equal(name, "GetWindowThreadProcessId")
         || win_equal(name, "SetClipboardData") || win_equal(name, "SetWindowTextA")
-        || win_equal(name, "VkKeyScanExA") || win_equal(name, "GetFileVersionInfoSizeA")) return 2u;
+        || win_equal(name, "VkKeyScanExA") || win_equal(name, "GetFileVersionInfoSizeA")
+        || win_equal(name, "fputc") || win_equal(name, "putc") || win_equal(name, "ungetc")
+        || win_equal(name, "fputs") || win_equal(name, "_setmode")) return 2u;
     if (win_equal(name, "QueryPerformanceCounter") || win_equal(name, "QueryPerformanceFrequency")
         || win_equal(name, "LoadLibraryA") || win_equal(name, "LoadLibraryW")
         || win_equal(name, "ExitProcess") || win_equal(name, "exit")
@@ -772,6 +776,8 @@ static uint8_t win_argument_count(const char *name)
         || win_equal(name, "_get_osfhandle") || win_equal(name, "_isatty")
         || win_equal(name, "_fileno") || win_equal(name, "_close")
         || win_equal(name, "_unlink") || win_equal(name, "fflush")
+        || win_equal(name, "ftell") || win_equal(name, "_ftelli64")
+        || win_equal(name, "feof") || win_equal(name, "clearerr") || win_equal(name, "ferror")
         || win_equal(name, "getenv") || win_equal(name, "tolower")
         || win_equal(name, "islower") || win_equal(name, "isspace")
         || win_equal(name, "isupper") || win_equal(name, "isxdigit")
@@ -3114,11 +3120,43 @@ static uint64_t win_crt_fopen(xxemul_windows *process, const char *filename, con
         return 0;
     }
     process->crt_fd_handles[fd] = handle;
+    process->crt_fd_eof[fd] = 0;
     if (strchr(mode, 'a') != NULL) {
         xx_io_device *opened = win_handle_io(process, handle);
         if (opened != NULL) xx_io_seek64(opened, 0, SEEK_END);
     }
     return process->iob_address + (uint64_t)fd * stride;
+}
+
+static xxemul_status win_crt_fputc(xxemul_windows *process, uint8_t ch, uint64_t stream, uint64_t *result)
+{
+    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint64_t stride = word_size == 8u ? 48u : 32u;
+    if (stream == process->iob_address || stream == process->iob_address + stride || stream == process->iob_address + 2u * stride) {
+        FILE *target_file = (stream == process->iob_address + 2u * stride) ? stderr : stdout;
+        if (process->emulator->output_callback != NULL) {
+            process->emulator->output_callback(process->emulator->output_context, ch);
+        } else {
+            fputc(ch, target_file);
+            fflush(target_file);
+        }
+        *result = ch;
+        return XXEMUL_STATUS_OK;
+    }
+    uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+    if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+        size_t fd = (size_t)(offset / stride);
+        uint64_t handle = win_crt_handle(process, fd);
+        xx_io_device *opened = win_handle_io(process, handle);
+        if (opened != NULL) {
+            if (xx_io_write(opened, &ch, 1) == 1) {
+                *result = ch;
+                return XXEMUL_STATUS_OK;
+            }
+        }
+    }
+    *result = UINT32_MAX;
+    return win_crt_errno(process, 9u);
 }
 
 static xxemul_status win_call(xxemul_windows *process,
@@ -3253,16 +3291,8 @@ static xxemul_status win_call(xxemul_windows *process,
     if (strcmp(name, "vfprintf") == 0) {
         return win_stdio_vfprintf(process, arg[0], arg[1], arg[2], result);
     }
-    if (strcmp(name, "putc") == 0) {
-        uint8_t ch = (uint8_t)arg[0];
-        if (process->emulator->output_callback != NULL) {
-            process->emulator->output_callback(process->emulator->output_context, ch);
-        } else {
-            fputc(ch, stdout);
-            fflush(stdout);
-        }
-        *result = ch;
-        return XXEMUL_STATUS_OK;
+    if (strcmp(name, "putc") == 0 || strcmp(name, "fputc") == 0) {
+        return win_crt_fputc(process, (uint8_t)arg[0], arg[1], result);
     }
     if (strcmp(name, "perror") == 0) {
         char *msg = NULL;
@@ -3289,12 +3319,10 @@ static xxemul_status win_call(xxemul_windows *process,
         int s1 = win_guest_string(process, arg[0], fn, sizeof(fn), w);
         int s2 = win_guest_string(process, arg[1], md, sizeof(md), w);
         if (!s1 || !s2) {
-            fprintf(stderr, "[%s failed string: s1=%d s2=%d fn_addr=0x%llx md_addr=0x%llx]\n", name, s1, s2, (unsigned long long)arg[0], (unsigned long long)arg[1]);
             *result = 0;
             return XXEMUL_STATUS_OK;
         }
         *result = win_crt_fopen(process, fn, md);
-        fprintf(stderr, "[%s: fn='%s' md='%s' res=0x%llx]\n", name, fn, md, (unsigned long long)*result);
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "fclose") == 0) {
@@ -3306,6 +3334,7 @@ static xxemul_status win_call(xxemul_windows *process,
             if (fd >= 3u && process->crt_fd_handles[fd] != 0u) {
                 win_close_handle(process, process->crt_fd_handles[fd]);
                 process->crt_fd_handles[fd] = 0u;
+                process->crt_fd_eof[fd] = 0;
             }
         }
         *result = 0;
@@ -3339,6 +3368,7 @@ static xxemul_status win_call(xxemul_windows *process,
             uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
             if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
                 size_t fd = (size_t)(offset / stride);
+                process->crt_fd_eof[fd] = 0;
                 uint64_t handle = win_crt_handle(process, fd);
                 xx_io_device *opened = win_handle_io(process, handle);
                 if (opened != NULL) {
@@ -3376,10 +3406,16 @@ static xxemul_status win_call(xxemul_windows *process,
                     size_t chunk = (size_t)(total - done);
                     if (chunk > sizeof(buf)) chunk = sizeof(buf);
                     int64_t r = xx_io_read(opened, buf, chunk);
-                    if (r <= 0) break;
+                    if (r <= 0) {
+                        process->crt_fd_eof[fd] = 1;
+                        break;
+                    }
                     if (!win_write(process, arg[0] + done, buf, (size_t)r)) break;
                     done += (size_t)r;
-                    if ((size_t)r < chunk) break;
+                    if ((size_t)r < chunk) {
+                        process->crt_fd_eof[fd] = 1;
+                        break;
+                    }
                 }
                 *result = arg[1] > 0 ? (done / arg[1]) : 0;
                 return XXEMUL_STATUS_OK;
@@ -3402,6 +3438,7 @@ static xxemul_status win_call(xxemul_windows *process,
                     *result = (uint64_t)b;
                     return XXEMUL_STATUS_OK;
                 }
+                process->crt_fd_eof[fd] = 1;
             }
         }
         *result = UINT64_MAX;
@@ -3422,6 +3459,7 @@ static xxemul_status win_call(xxemul_windows *process,
                 for (i = 0; i < count - 1; ++i) {
                     uint8_t b = 0;
                     if (xx_io_read(opened, &b, 1) != 1) {
+                        process->crt_fd_eof[fd] = 1;
                         if (i == 0) { *result = 0; return XXEMUL_STATUS_OK; }
                         break;
                     }
@@ -3442,12 +3480,19 @@ static xxemul_status win_call(xxemul_windows *process,
         uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
         if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
             size_t fd = (size_t)(offset / stride);
-            uint64_t handle = win_crt_handle(process, fd);
-            xx_io_device *opened = win_handle_io(process, handle);
-            if (opened != NULL && xx_io_tell(opened) >= xx_io_size(opened)) {
-                *result = 1;
-                return XXEMUL_STATUS_OK;
-            }
+            *result = (uint64_t)process->crt_fd_eof[fd];
+            return XXEMUL_STATUS_OK;
+        }
+        *result = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "clearerr") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[0];
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            process->crt_fd_eof[fd] = 0;
         }
         *result = 0;
         return XXEMUL_STATUS_OK;
@@ -3456,7 +3501,34 @@ static xxemul_status win_call(xxemul_windows *process,
         *result = 0;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "_fseeki64") == 0) {
+    if (strcmp(name, "ungetc") == 0) {
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        uint64_t stream = arg[1];
+        if ((int32_t)arg[0] == -1) {
+            *result = UINT32_MAX;
+            return XXEMUL_STATUS_OK;
+        }
+        uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+        if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+            size_t fd = (size_t)(offset / stride);
+            uint64_t handle = win_crt_handle(process, fd);
+            xx_io_device *opened = win_handle_io(process, handle);
+            if (opened != NULL) {
+                if (xx_io_seek64(opened, -1, SEEK_CUR) == 0) {
+                    process->crt_fd_eof[fd] = 0;
+                    *result = (uint8_t)arg[0];
+                    return XXEMUL_STATUS_OK;
+                }
+            }
+        }
+        *result = UINT32_MAX;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_setmode") == 0) {
+        *result = 0x8000; /* _O_BINARY */
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_fseeki64") == 0 || strcmp(name, "fseek") == 0) {
         uint64_t stride = word_size == 8u ? 48u : 32u;
         uint64_t stream = arg[0];
         uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
@@ -3466,14 +3538,16 @@ static xxemul_status win_call(xxemul_windows *process,
             xx_io_device *opened = win_handle_io(process, handle);
             if (opened != NULL) {
                 int whence = arg[2] == 0 ? SEEK_SET : arg[2] == 1 ? SEEK_CUR : SEEK_END;
-                *result = (uint64_t)xx_io_seek64(opened, (int64_t)arg[1], whence);
+                int64_t seek_off = (strcmp(name, "fseek") == 0) ? (int64_t)(int32_t)arg[1] : (int64_t)arg[1];
+                process->crt_fd_eof[fd] = 0;
+                *result = (uint64_t)xx_io_seek64(opened, seek_off, whence);
                 return XXEMUL_STATUS_OK;
             }
         }
         *result = UINT64_MAX;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "_ftelli64") == 0) {
+    if (strcmp(name, "_ftelli64") == 0 || strcmp(name, "ftell") == 0) {
         uint64_t stride = word_size == 8u ? 48u : 32u;
         uint64_t stream = arg[0];
         uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
@@ -3482,7 +3556,12 @@ static xxemul_status win_call(xxemul_windows *process,
             uint64_t handle = win_crt_handle(process, fd);
             xx_io_device *opened = win_handle_io(process, handle);
             if (opened != NULL) {
-                *result = (uint64_t)xx_io_tell(opened);
+                int64_t pos = xx_io_tell(opened);
+                if (strcmp(name, "ftell") == 0) {
+                    *result = (pos < 0) ? UINT32_MAX : (uint32_t)pos;
+                } else {
+                    *result = (pos < 0) ? UINT64_MAX : (uint64_t)pos;
+                }
                 return XXEMUL_STATUS_OK;
             }
         }
@@ -3708,6 +3787,10 @@ static xxemul_status win_call(xxemul_windows *process,
             *result = 1u;
             return XXEMUL_STATUS_OK;
         }
+        if (arg[0] < WIN_MAX_CRT_FDS && process->crt_fd_handles[arg[0]] != 0u) {
+            *result = 0u;
+            return XXEMUL_STATUS_OK;
+        }
         *result = 0u;
         return win_crt_errno(process, 9u);
     }
@@ -3716,9 +3799,12 @@ static xxemul_status win_call(xxemul_windows *process,
         uint64_t offset;
         if (arg[0] >= process->iob_address) {
             offset = arg[0] - process->iob_address;
-            if (offset < 3u * stride && offset % stride == 0u) {
-                *result = offset / stride;
-                return XXEMUL_STATUS_OK;
+            if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+                size_t fd = (size_t)(offset / stride);
+                if (fd < 3u || process->crt_fd_handles[fd] != 0u) {
+                    *result = (uint32_t)fd;
+                    return XXEMUL_STATUS_OK;
+                }
             }
         }
         *result = UINT32_MAX;
@@ -3736,15 +3822,21 @@ static xxemul_status win_call(xxemul_windows *process,
             return XXEMUL_STATUS_OK;
         }
         if (stream >= process->iob_address
-            && stream - process->iob_address < 3u * stride
+            && stream - process->iob_address < (uint64_t)WIN_MAX_CRT_FDS * stride
             && (stream - process->iob_address) % stride == 0u) {
             uint64_t index = (stream - process->iob_address) / stride;
-            if (index != 0u && process->emulator->output_callback == NULL
-                && fflush(index == 1u ? stdout : stderr) != 0) {
-                *result = UINT32_MAX;
-                return win_crt_errno(process, 9u);
+            if (index < 3u) {
+                if (index != 0u && process->emulator->output_callback == NULL
+                    && fflush(index == 1u ? stdout : stderr) != 0) {
+                    *result = UINT32_MAX;
+                    return win_crt_errno(process, 9u);
+                }
+                return XXEMUL_STATUS_OK;
             }
-            return XXEMUL_STATUS_OK;
+            if (process->crt_fd_handles[index] != 0u) {
+                *result = 0u;
+                return XXEMUL_STATUS_OK;
+            }
         }
         *result = UINT32_MAX;
         return win_crt_errno(process, 9u);
@@ -3872,7 +3964,10 @@ static xxemul_status win_call(xxemul_windows *process,
             *result = UINT32_MAX;
             return win_crt_errno(process, 9u);
         }
-        if (arg[0] >= 3u) process->crt_fd_handles[arg[0]] = 0u;
+        if (arg[0] >= 3u) {
+            process->crt_fd_handles[arg[0]] = 0u;
+            process->crt_fd_eof[arg[0]] = 0;
+        }
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "fputs") == 0) {
@@ -3880,27 +3975,31 @@ static xxemul_status win_call(xxemul_windows *process,
         size_t len = 0u;
         xxemul_status s = win_crt_read_string(process, arg[0], &str, &len);
         if (s != XXEMUL_STATUS_OK || str == NULL) return s;
-        if (process->emulator->output_callback != NULL) {
-            size_t k;
-            for (k = 0; k < len; ++k)
-                process->emulator->output_callback(process->emulator->output_context, (uint8_t)str[k]);
+        uint64_t stream = arg[1];
+        uint64_t stride = word_size == 8u ? 48u : 32u;
+        if (stream == process->iob_address || stream == process->iob_address + stride || stream == process->iob_address + 2u * stride) {
+            FILE *target_file = (stream == process->iob_address + 2u * stride) ? stderr : stdout;
+            if (process->emulator->output_callback != NULL) {
+                size_t k;
+                for (k = 0; k < len; ++k)
+                    process->emulator->output_callback(process->emulator->output_context, (uint8_t)str[k]);
+            } else {
+                fputs(str, target_file);
+                fflush(target_file);
+            }
         } else {
-            fputs(str, stdout);
-            fflush(stdout);
+            uint64_t offset = stream >= process->iob_address ? (stream - process->iob_address) : UINT64_MAX;
+            if (offset < (uint64_t)WIN_MAX_CRT_FDS * stride && offset % stride == 0u) {
+                size_t fd = (size_t)(offset / stride);
+                uint64_t handle = win_crt_handle(process, fd);
+                xx_io_device *opened = win_handle_io(process, handle);
+                if (opened != NULL) {
+                    xx_io_write(opened, str, len);
+                }
+            }
         }
         free(str);
         *result = 0u;
-        return XXEMUL_STATUS_OK;
-    }
-    if (strcmp(name, "fputc") == 0) {
-        uint8_t ch = (uint8_t)arg[0];
-        if (process->emulator->output_callback != NULL) {
-            process->emulator->output_callback(process->emulator->output_context, ch);
-        } else {
-            fputc(ch, stdout);
-            fflush(stdout);
-        }
-        *result = ch;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "_lseeki64") == 0) {

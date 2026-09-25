@@ -2339,6 +2339,265 @@ static xxemul_status xxemul_x86_write_xmm_operand(
             (void *)bytes, 16u, 1) : status;
 }
 
+static xxemul_status xxemul_x86_simd_binary(
+    xxemul *emulator, const cdisasm_x86_instruction *instruction,
+    uint64_t next_ip)
+{
+    uint8_t op1[16];
+    uint8_t op2[16];
+    uint8_t res[16];
+    const cdisasm_x86_operand *dest_op;
+    size_t i;
+    xxemul_status status;
+
+    if (instruction->operand_count == 2u) {
+        dest_op = &instruction->opcode[0];
+        status = xxemul_x86_read_xmm_operand(emulator, instruction, &instruction->opcode[0], next_ip, op1);
+        if (status != XXEMUL_STATUS_OK) return status;
+        status = xxemul_x86_read_xmm_operand(emulator, instruction, &instruction->opcode[1], next_ip, op2);
+        if (status != XXEMUL_STATUS_OK) return status;
+    } else if (instruction->operand_count == 3u) {
+        dest_op = &instruction->opcode[0];
+        status = xxemul_x86_read_xmm_operand(emulator, instruction, &instruction->opcode[1], next_ip, op1);
+        if (status != XXEMUL_STATUS_OK) return status;
+        status = xxemul_x86_read_xmm_operand(emulator, instruction, &instruction->opcode[2], next_ip, op2);
+        if (status != XXEMUL_STATUS_OK) return status;
+    } else {
+        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    }
+
+    switch (instruction->name_id) {
+    case CDISASM_X86_NAME_PXOR:
+    case CDISASM_X86_NAME_VPXOR:
+    case CDISASM_X86_NAME_XORPS:
+    case CDISASM_X86_NAME_VXORPS:
+    case CDISASM_X86_NAME_XORPD:
+    case CDISASM_X86_NAME_VXORPD:
+        for (i = 0; i < 16; ++i) res[i] = op1[i] ^ op2[i];
+        break;
+    case CDISASM_X86_NAME_POR:
+    case CDISASM_X86_NAME_VPOR:
+    case CDISASM_X86_NAME_ORPS:
+    case CDISASM_X86_NAME_VORPS:
+    case CDISASM_X86_NAME_ORPD:
+    case CDISASM_X86_NAME_VORPD:
+        for (i = 0; i < 16; ++i) res[i] = op1[i] | op2[i];
+        break;
+    case CDISASM_X86_NAME_PAND:
+    case CDISASM_X86_NAME_VPAND:
+    case CDISASM_X86_NAME_ANDPS:
+    case CDISASM_X86_NAME_VANDPS:
+    case CDISASM_X86_NAME_ANDPD:
+    case CDISASM_X86_NAME_VANDPD:
+        for (i = 0; i < 16; ++i) res[i] = op1[i] & op2[i];
+        break;
+    case CDISASM_X86_NAME_PANDN:
+    case CDISASM_X86_NAME_VPANDN:
+    case CDISASM_X86_NAME_ANDNPS:
+    case CDISASM_X86_NAME_VANDNPS:
+    case CDISASM_X86_NAME_ANDNPD:
+    case CDISASM_X86_NAME_VANDNPD:
+        for (i = 0; i < 16; ++i) res[i] = (uint8_t)((~op1[i]) & op2[i]);
+        break;
+    case CDISASM_X86_NAME_PADDB:
+    case CDISASM_X86_NAME_VPADDB:
+        for (i = 0; i < 16; ++i) res[i] = (uint8_t)(op1[i] + op2[i]);
+        break;
+    case CDISASM_X86_NAME_PADDW:
+    case CDISASM_X86_NAME_VPADDW:
+        for (i = 0; i < 8; ++i) {
+            uint16_t a, b;
+            memcpy(&a, op1 + i * 2, 2);
+            memcpy(&b, op2 + i * 2, 2);
+            a += b;
+            memcpy(res + i * 2, &a, 2);
+        }
+        break;
+    case CDISASM_X86_NAME_PADDD:
+    case CDISASM_X86_NAME_VPADDD:
+        for (i = 0; i < 4; ++i) {
+            uint32_t a, b;
+            memcpy(&a, op1 + i * 4, 4);
+            memcpy(&b, op2 + i * 4, 4);
+            a += b;
+            memcpy(res + i * 4, &a, 4);
+        }
+        break;
+    case CDISASM_X86_NAME_PADDQ:
+    case CDISASM_X86_NAME_VPADDQ:
+        for (i = 0; i < 2; ++i) {
+            uint64_t a, b;
+            memcpy(&a, op1 + i * 8, 8);
+            memcpy(&b, op2 + i * 8, 8);
+            a += b;
+            memcpy(res + i * 8, &a, 8);
+        }
+        break;
+    case CDISASM_X86_NAME_PSUBB:
+    case CDISASM_X86_NAME_VPSUBB:
+        for (i = 0; i < 16; ++i) res[i] = (uint8_t)(op1[i] - op2[i]);
+        break;
+    case CDISASM_X86_NAME_PSUBW:
+    case CDISASM_X86_NAME_VPSUBW:
+        for (i = 0; i < 8; ++i) {
+            uint16_t a, b;
+            memcpy(&a, op1 + i * 2, 2);
+            memcpy(&b, op2 + i * 2, 2);
+            a -= b;
+            memcpy(res + i * 2, &a, 2);
+        }
+        break;
+    case CDISASM_X86_NAME_PSUBD:
+    case CDISASM_X86_NAME_VPSUBD:
+        for (i = 0; i < 4; ++i) {
+            uint32_t a, b;
+            memcpy(&a, op1 + i * 4, 4);
+            memcpy(&b, op2 + i * 4, 4);
+            a -= b;
+            memcpy(res + i * 4, &a, 4);
+        }
+        break;
+    case CDISASM_X86_NAME_PSUBQ:
+    case CDISASM_X86_NAME_VPSUBQ:
+        for (i = 0; i < 2; ++i) {
+            uint64_t a, b;
+            memcpy(&a, op1 + i * 8, 8);
+            memcpy(&b, op2 + i * 8, 8);
+            a -= b;
+            memcpy(res + i * 8, &a, 8);
+        }
+        break;
+    case CDISASM_X86_NAME_PCMPEQB:
+    case CDISASM_X86_NAME_VPCMPEQB:
+        for (i = 0; i < 16; ++i) res[i] = (op1[i] == op2[i]) ? 0xff : 0x00;
+        break;
+    case CDISASM_X86_NAME_PCMPEQW:
+    case CDISASM_X86_NAME_VPCMPEQW:
+        for (i = 0; i < 8; ++i) {
+            uint16_t a, b, r;
+            memcpy(&a, op1 + i * 2, 2);
+            memcpy(&b, op2 + i * 2, 2);
+            r = (a == b) ? 0xffff : 0x0000;
+            memcpy(res + i * 2, &r, 2);
+        }
+        break;
+    case CDISASM_X86_NAME_PCMPEQD:
+    case CDISASM_X86_NAME_VPCMPEQD:
+        for (i = 0; i < 4; ++i) {
+            uint32_t a, b, r;
+            memcpy(&a, op1 + i * 4, 4);
+            memcpy(&b, op2 + i * 4, 4);
+            r = (a == b) ? 0xffffffffu : 0x00000000u;
+            memcpy(res + i * 4, &r, 4);
+        }
+        break;
+    case CDISASM_X86_NAME_PCMPEQQ:
+    case CDISASM_X86_NAME_VPCMPEQQ:
+        for (i = 0; i < 2; ++i) {
+            uint64_t a, b, r;
+            memcpy(&a, op1 + i * 8, 8);
+            memcpy(&b, op2 + i * 8, 8);
+            r = (a == b) ? UINT64_MAX : 0;
+            memcpy(res + i * 8, &r, 8);
+        }
+        break;
+    case CDISASM_X86_NAME_PCMPGTB:
+    case CDISASM_X86_NAME_VPCMPGTB:
+        for (i = 0; i < 16; ++i) res[i] = ((int8_t)op1[i] > (int8_t)op2[i]) ? 0xff : 0x00;
+        break;
+    case CDISASM_X86_NAME_PCMPGTW:
+    case CDISASM_X86_NAME_VPCMPGTW:
+        for (i = 0; i < 8; ++i) {
+            int16_t a, b;
+            uint16_t r;
+            memcpy(&a, op1 + i * 2, 2);
+            memcpy(&b, op2 + i * 2, 2);
+            r = (a > b) ? 0xffff : 0x0000;
+            memcpy(res + i * 2, &r, 2);
+        }
+        break;
+    case CDISASM_X86_NAME_PCMPGTD:
+    case CDISASM_X86_NAME_VPCMPGTD:
+        for (i = 0; i < 4; ++i) {
+            int32_t a, b;
+            uint32_t r;
+            memcpy(&a, op1 + i * 4, 4);
+            memcpy(&b, op2 + i * 4, 4);
+            r = (a > b) ? 0xffffffffu : 0x00000000u;
+            memcpy(res + i * 4, &r, 4);
+        }
+        break;
+    case CDISASM_X86_NAME_PCMPGTQ:
+    case CDISASM_X86_NAME_VPCMPGTQ:
+        for (i = 0; i < 2; ++i) {
+            int64_t a, b;
+            uint64_t r;
+            memcpy(&a, op1 + i * 8, 8);
+            memcpy(&b, op2 + i * 8, 8);
+            r = (a > b) ? UINT64_MAX : 0;
+            memcpy(res + i * 8, &r, 8);
+        }
+        break;
+    case CDISASM_X86_NAME_PUNPCKLBW:
+    case CDISASM_X86_NAME_VPUNPCKLBW:
+        for (i = 0; i < 8; ++i) {
+            res[i * 2] = op1[i];
+            res[i * 2 + 1] = op2[i];
+        }
+        break;
+    case CDISASM_X86_NAME_PUNPCKHBW:
+    case CDISASM_X86_NAME_VPUNPCKHBW:
+        for (i = 0; i < 8; ++i) {
+            res[i * 2] = op1[8 + i];
+            res[i * 2 + 1] = op2[8 + i];
+        }
+        break;
+    case CDISASM_X86_NAME_PUNPCKLWD:
+    case CDISASM_X86_NAME_VPUNPCKLWD:
+        for (i = 0; i < 4; ++i) {
+            memcpy(res + i * 4, op1 + i * 2, 2);
+            memcpy(res + i * 4 + 2, op2 + i * 2, 2);
+        }
+        break;
+    case CDISASM_X86_NAME_PUNPCKHWD:
+    case CDISASM_X86_NAME_VPUNPCKHWD:
+        for (i = 0; i < 4; ++i) {
+            memcpy(res + i * 4, op1 + 8 + i * 2, 2);
+            memcpy(res + i * 4 + 2, op2 + 8 + i * 2, 2);
+        }
+        break;
+    case CDISASM_X86_NAME_PUNPCKLDQ:
+    case CDISASM_X86_NAME_VPUNPCKLDQ:
+        memcpy(res, op1, 4);
+        memcpy(res + 4, op2, 4);
+        memcpy(res + 8, op1 + 4, 4);
+        memcpy(res + 12, op2 + 4, 4);
+        break;
+    case CDISASM_X86_NAME_PUNPCKHDQ:
+    case CDISASM_X86_NAME_VPUNPCKHDQ:
+        memcpy(res, op1 + 8, 4);
+        memcpy(res + 4, op2 + 8, 4);
+        memcpy(res + 8, op1 + 12, 4);
+        memcpy(res + 12, op2 + 12, 4);
+        break;
+    case CDISASM_X86_NAME_PUNPCKLQDQ:
+    case CDISASM_X86_NAME_VPUNPCKLQDQ:
+        memcpy(res, op1, 8);
+        memcpy(res + 8, op2, 8);
+        break;
+    case CDISASM_X86_NAME_PUNPCKHQDQ:
+    case CDISASM_X86_NAME_VPUNPCKHQDQ:
+        memcpy(res, op1 + 8, 8);
+        memcpy(res + 8, op2 + 8, 8);
+        break;
+    default:
+        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    }
+
+    return xxemul_x86_write_xmm_operand(emulator, instruction, dest_op, next_ip, res);
+}
+
+
 xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
 {
     cdisasm_x86_instruction instruction;
@@ -2585,6 +2844,54 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             }
         }
         break;
+    case CDISASM_X86_NAME_MOVHLPS:
+    case CDISASM_X86_NAME_MOVLHPS:
+    case CDISASM_X86_NAME_VMOVHLPS:
+    case CDISASM_X86_NAME_VMOVLHPS:
+        if (instruction.operand_count == 2u) {
+            if (instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
+                || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
+                || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
+                || instruction.opcode[1].type != CDISASM_OPERAND_REGISTER
+                || instruction.opcode[1].reg < CDISASM_X86_REG_XMM0
+                || instruction.opcode[1].reg > CDISASM_X86_REG_XMM15)
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            uint8_t *dest = emulator->x86.xmm[instruction.opcode[0].reg - CDISASM_X86_REG_XMM0];
+            const uint8_t *src = emulator->x86.xmm[instruction.opcode[1].reg - CDISASM_X86_REG_XMM0];
+            if (instruction.name_id == CDISASM_X86_NAME_MOVHLPS) {
+                memcpy(dest, src + 8, 8);
+            } else {
+                memcpy(dest + 8, src, 8);
+            }
+            status = XXEMUL_STATUS_OK;
+        } else if (instruction.operand_count == 3u) {
+            if (instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
+                || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
+                || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
+                || instruction.opcode[1].type != CDISASM_OPERAND_REGISTER
+                || instruction.opcode[1].reg < CDISASM_X86_REG_XMM0
+                || instruction.opcode[1].reg > CDISASM_X86_REG_XMM15
+                || instruction.opcode[2].type != CDISASM_OPERAND_REGISTER
+                || instruction.opcode[2].reg < CDISASM_X86_REG_XMM0
+                || instruction.opcode[2].reg > CDISASM_X86_REG_XMM15)
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            uint8_t *dest = emulator->x86.xmm[instruction.opcode[0].reg - CDISASM_X86_REG_XMM0];
+            const uint8_t *s1 = emulator->x86.xmm[instruction.opcode[1].reg - CDISASM_X86_REG_XMM0];
+            const uint8_t *s2 = emulator->x86.xmm[instruction.opcode[2].reg - CDISASM_X86_REG_XMM0];
+            uint8_t tmp[16];
+            if (instruction.name_id == CDISASM_X86_NAME_VMOVHLPS) {
+                memcpy(tmp, s2 + 8, 8);
+                memcpy(tmp + 8, s1 + 8, 8);
+            } else {
+                memcpy(tmp, s1, 8);
+                memcpy(tmp + 8, s2, 8);
+            }
+            memcpy(dest, tmp, 16);
+            status = XXEMUL_STATUS_OK;
+        } else {
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        }
+        break;
     case CDISASM_X86_NAME_BSF:
     case CDISASM_X86_NAME_TZCNT:
     case CDISASM_X86_NAME_BSR:
@@ -2680,6 +2987,99 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             if (status == XXEMUL_STATUS_OK)
                 status = xxemul_x86_write_xmm_operand(emulator, &instruction,
                     &instruction.opcode[0], next_ip, bytes);
+        }
+        break;
+    case CDISASM_X86_NAME_PXOR:
+    case CDISASM_X86_NAME_VPXOR:
+    case CDISASM_X86_NAME_XORPS:
+    case CDISASM_X86_NAME_VXORPS:
+    case CDISASM_X86_NAME_XORPD:
+    case CDISASM_X86_NAME_VXORPD:
+    case CDISASM_X86_NAME_POR:
+    case CDISASM_X86_NAME_VPOR:
+    case CDISASM_X86_NAME_ORPS:
+    case CDISASM_X86_NAME_VORPS:
+    case CDISASM_X86_NAME_ORPD:
+    case CDISASM_X86_NAME_VORPD:
+    case CDISASM_X86_NAME_PAND:
+    case CDISASM_X86_NAME_VPAND:
+    case CDISASM_X86_NAME_ANDPS:
+    case CDISASM_X86_NAME_VANDPS:
+    case CDISASM_X86_NAME_ANDPD:
+    case CDISASM_X86_NAME_VANDPD:
+    case CDISASM_X86_NAME_PANDN:
+    case CDISASM_X86_NAME_VPANDN:
+    case CDISASM_X86_NAME_ANDNPS:
+    case CDISASM_X86_NAME_VANDNPS:
+    case CDISASM_X86_NAME_ANDNPD:
+    case CDISASM_X86_NAME_VANDNPD:
+    case CDISASM_X86_NAME_PADDB:
+    case CDISASM_X86_NAME_VPADDB:
+    case CDISASM_X86_NAME_PADDW:
+    case CDISASM_X86_NAME_VPADDW:
+    case CDISASM_X86_NAME_PADDD:
+    case CDISASM_X86_NAME_VPADDD:
+    case CDISASM_X86_NAME_PADDQ:
+    case CDISASM_X86_NAME_VPADDQ:
+    case CDISASM_X86_NAME_PSUBB:
+    case CDISASM_X86_NAME_VPSUBB:
+    case CDISASM_X86_NAME_PSUBW:
+    case CDISASM_X86_NAME_VPSUBW:
+    case CDISASM_X86_NAME_PSUBD:
+    case CDISASM_X86_NAME_VPSUBD:
+    case CDISASM_X86_NAME_PSUBQ:
+    case CDISASM_X86_NAME_VPSUBQ:
+    case CDISASM_X86_NAME_PCMPEQB:
+    case CDISASM_X86_NAME_VPCMPEQB:
+    case CDISASM_X86_NAME_PCMPEQW:
+    case CDISASM_X86_NAME_VPCMPEQW:
+    case CDISASM_X86_NAME_PCMPEQD:
+    case CDISASM_X86_NAME_VPCMPEQD:
+    case CDISASM_X86_NAME_PCMPEQQ:
+    case CDISASM_X86_NAME_VPCMPEQQ:
+    case CDISASM_X86_NAME_PCMPGTB:
+    case CDISASM_X86_NAME_VPCMPGTB:
+    case CDISASM_X86_NAME_PCMPGTW:
+    case CDISASM_X86_NAME_VPCMPGTW:
+    case CDISASM_X86_NAME_PCMPGTD:
+    case CDISASM_X86_NAME_VPCMPGTD:
+    case CDISASM_X86_NAME_PCMPGTQ:
+    case CDISASM_X86_NAME_VPCMPGTQ:
+    case CDISASM_X86_NAME_PUNPCKLBW:
+    case CDISASM_X86_NAME_VPUNPCKLBW:
+    case CDISASM_X86_NAME_PUNPCKHBW:
+    case CDISASM_X86_NAME_VPUNPCKHBW:
+    case CDISASM_X86_NAME_PUNPCKLWD:
+    case CDISASM_X86_NAME_VPUNPCKLWD:
+    case CDISASM_X86_NAME_PUNPCKHWD:
+    case CDISASM_X86_NAME_VPUNPCKHWD:
+    case CDISASM_X86_NAME_PUNPCKLDQ:
+    case CDISASM_X86_NAME_VPUNPCKLDQ:
+    case CDISASM_X86_NAME_PUNPCKHDQ:
+    case CDISASM_X86_NAME_VPUNPCKHDQ:
+    case CDISASM_X86_NAME_PUNPCKLQDQ:
+    case CDISASM_X86_NAME_VPUNPCKLQDQ:
+    case CDISASM_X86_NAME_PUNPCKHQDQ:
+    case CDISASM_X86_NAME_VPUNPCKHQDQ:
+        status = xxemul_x86_simd_binary(emulator, &instruction, next_ip);
+        break;
+    case CDISASM_X86_NAME_PTEST:
+    case CDISASM_X86_NAME_VPTEST:
+        {
+            uint8_t op1[16], op2[16];
+            int zf = 1, cf = 1;
+            size_t idx;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction, &instruction.opcode[0], next_ip, op1);
+            if (status != XXEMUL_STATUS_OK) return status;
+            status = xxemul_x86_read_xmm_operand(emulator, &instruction, &instruction.opcode[1], next_ip, op2);
+            if (status != XXEMUL_STATUS_OK) return status;
+            for (idx = 0; idx < 16; ++idx) {
+                if ((op1[idx] & op2[idx]) != 0) zf = 0;
+                if (((~op1[idx]) & op2[idx]) != 0) cf = 0;
+            }
+            emulator->x86.flags &= ~(XXEMUL_X86_FLAG_OF | XXEMUL_X86_FLAG_SF | XXEMUL_X86_FLAG_AF | XXEMUL_X86_FLAG_PF | XXEMUL_X86_FLAG_CF | XXEMUL_X86_FLAG_ZF);
+            if (zf) emulator->x86.flags |= XXEMUL_X86_FLAG_ZF;
+            if (cf) emulator->x86.flags |= XXEMUL_X86_FLAG_CF;
         }
         break;
     case CDISASM_X86_NAME_PMOVMSKB:
@@ -3137,197 +3537,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                     | XXEMUL_X86_FLAG_CF)) | UINT64_C(2);
         status = XXEMUL_STATUS_OK;
         break;
-    case CDISASM_X86_NAME_PCMPEQB:
-    case CDISASM_X86_NAME_PCMPEQW:
-    case CDISASM_X86_NAME_PCMPEQD:
-    case CDISASM_X86_NAME_PCMPEQQ:
-        if (instruction.operand_count != 2u
-            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
-            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
-            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15)
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        {
-            uint8_t source[16];
-            uint8_t *destination = emulator->x86.xmm[
-                instruction.opcode[0].reg - CDISASM_X86_REG_XMM0];
-            size_t lane = instruction.name_id == CDISASM_X86_NAME_PCMPEQB
-                ? 1u : instruction.name_id == CDISASM_X86_NAME_PCMPEQW
-                    ? 2u : instruction.name_id == CDISASM_X86_NAME_PCMPEQD
-                        ? 4u : 8u;
-            size_t offset;
-            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
-                &instruction.opcode[1], next_ip, source);
-            if (status != XXEMUL_STATUS_OK) return status;
-            for (offset = 0u; offset < 16u; offset += lane) {
-                int equal = memcmp(destination + offset,
-                    source + offset, lane) == 0;
-                memset(destination + offset, equal ? 0xff : 0, lane);
-            }
-        }
-        break;
-    case CDISASM_X86_NAME_PUNPCKLBW:
-    case CDISASM_X86_NAME_PUNPCKHBW:
-    case CDISASM_X86_NAME_PUNPCKLWD:
-    case CDISASM_X86_NAME_PUNPCKHWD:
-    case CDISASM_X86_NAME_PUNPCKLDQ:
-    case CDISASM_X86_NAME_PUNPCKHDQ:
-    case CDISASM_X86_NAME_PUNPCKLQDQ:
-    case CDISASM_X86_NAME_PUNPCKHQDQ:
-    case CDISASM_X86_NAME_VPUNPCKLBW:
-    case CDISASM_X86_NAME_VPUNPCKHBW:
-    case CDISASM_X86_NAME_VPUNPCKLWD:
-    case CDISASM_X86_NAME_VPUNPCKHWD:
-    case CDISASM_X86_NAME_VPUNPCKLDQ:
-    case CDISASM_X86_NAME_VPUNPCKHDQ:
-    case CDISASM_X86_NAME_VPUNPCKLQDQ:
-    case CDISASM_X86_NAME_VPUNPCKHQDQ:
-        if (instruction.operand_count != 2u
-            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
-            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
-            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
-            || instruction.opcode[0].size != 16u)
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        {
-            uint8_t source[16];
-            uint8_t dest[16];
-            uint8_t *destination = emulator->x86.xmm[
-                instruction.opcode[0].reg - CDISASM_X86_REG_XMM0];
-            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
-                &instruction.opcode[1], next_ip, source);
-            if (status != XXEMUL_STATUS_OK) return status;
-            size_t elem_size = 1u;
-            int is_high = 0;
-            switch (instruction.name_id) {
-            case CDISASM_X86_NAME_PUNPCKHBW:
-            case CDISASM_X86_NAME_VPUNPCKHBW:
-                elem_size = 1u; is_high = 1; break;
-            case CDISASM_X86_NAME_PUNPCKLWD:
-            case CDISASM_X86_NAME_VPUNPCKLWD:
-                elem_size = 2u; is_high = 0; break;
-            case CDISASM_X86_NAME_PUNPCKHWD:
-            case CDISASM_X86_NAME_VPUNPCKHWD:
-                elem_size = 2u; is_high = 1; break;
-            case CDISASM_X86_NAME_PUNPCKLDQ:
-            case CDISASM_X86_NAME_VPUNPCKLDQ:
-                elem_size = 4u; is_high = 0; break;
-            case CDISASM_X86_NAME_PUNPCKHDQ:
-            case CDISASM_X86_NAME_VPUNPCKHDQ:
-                elem_size = 4u; is_high = 1; break;
-            case CDISASM_X86_NAME_PUNPCKLQDQ:
-            case CDISASM_X86_NAME_VPUNPCKLQDQ:
-                elem_size = 8u; is_high = 0; break;
-            case CDISASM_X86_NAME_PUNPCKHQDQ:
-            case CDISASM_X86_NAME_VPUNPCKHQDQ:
-                elem_size = 8u; is_high = 1; break;
-            default:
-                elem_size = 1u; is_high = 0; break;
-            }
-            size_t base = is_high ? 8u : 0u;
-            size_t i;
-            for (i = 0u; i < 8u / elem_size; ++i) {
-                memcpy(dest + (2u * i) * elem_size, destination + base + i * elem_size, elem_size);
-                memcpy(dest + (2u * i + 1u) * elem_size, source + base + i * elem_size, elem_size);
-            }
-            memcpy(destination, dest, 16u);
-        }
-        break;
-    case CDISASM_X86_NAME_PXOR:
-    case CDISASM_X86_NAME_XORPS:
-    case CDISASM_X86_NAME_XORPD:
-    case CDISASM_X86_NAME_VXORPS:
-    case CDISASM_X86_NAME_VXORPD:
-    case CDISASM_X86_NAME_VPXOR:
-        if (instruction.operand_count != 2u
-            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
-            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
-            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
-            || instruction.opcode[0].size != 16u)
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        {
-            uint8_t source[16];
-            size_t destination = (size_t)(instruction.opcode[0].reg
-                - CDISASM_X86_REG_XMM0);
-            size_t index;
-            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
-                &instruction.opcode[1], next_ip, source);
-            if (status != XXEMUL_STATUS_OK) return status;
-            for (index = 0u; index < sizeof(source); ++index)
-                emulator->x86.xmm[destination][index] ^= source[index];
-        }
-        status = XXEMUL_STATUS_OK;
-        break;
-    case CDISASM_X86_NAME_PAND:
-    case CDISASM_X86_NAME_ANDPS:
-    case CDISASM_X86_NAME_ANDPD:
-    case CDISASM_X86_NAME_VPAND:
-    case CDISASM_X86_NAME_VANDPS:
-    case CDISASM_X86_NAME_VANDPD:
-        if (instruction.operand_count != 2u
-            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
-            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
-            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
-            || instruction.opcode[0].size != 16u)
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        {
-            uint8_t source[16];
-            size_t destination = (size_t)(instruction.opcode[0].reg
-                - CDISASM_X86_REG_XMM0);
-            size_t index;
-            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
-                &instruction.opcode[1], next_ip, source);
-            if (status != XXEMUL_STATUS_OK) return status;
-            for (index = 0u; index < sizeof(source); ++index)
-                emulator->x86.xmm[destination][index] &= source[index];
-        }
-        status = XXEMUL_STATUS_OK;
-        break;
-    case CDISASM_X86_NAME_PANDN:
-    case CDISASM_X86_NAME_VPANDN:
-        if (instruction.operand_count != 2u
-            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
-            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
-            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
-            || instruction.opcode[0].size != 16u)
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        {
-            uint8_t source[16];
-            size_t destination = (size_t)(instruction.opcode[0].reg
-                - CDISASM_X86_REG_XMM0);
-            size_t index;
-            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
-                &instruction.opcode[1], next_ip, source);
-            if (status != XXEMUL_STATUS_OK) return status;
-            for (index = 0u; index < sizeof(source); ++index)
-                emulator->x86.xmm[destination][index] =
-                    (~emulator->x86.xmm[destination][index]) & source[index];
-        }
-        status = XXEMUL_STATUS_OK;
-        break;
-    case CDISASM_X86_NAME_POR:
-    case CDISASM_X86_NAME_ORPS:
-    case CDISASM_X86_NAME_ORPD:
-    case CDISASM_X86_NAME_VPOR:
-    case CDISASM_X86_NAME_VORPS:
-    case CDISASM_X86_NAME_VORPD:
-        if (instruction.operand_count != 2u
-            || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
-            || instruction.opcode[0].reg < CDISASM_X86_REG_XMM0
-            || instruction.opcode[0].reg > CDISASM_X86_REG_XMM15
-            || instruction.opcode[0].size != 16u)
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        {
-            uint8_t source[16];
-            size_t destination = (size_t)(instruction.opcode[0].reg
-                - CDISASM_X86_REG_XMM0);
-            size_t index;
-            status = xxemul_x86_read_xmm_operand(emulator, &instruction,
-                &instruction.opcode[1], next_ip, source);
-            if (status != XXEMUL_STATUS_OK) return status;
-            for (index = 0u; index < sizeof(source); ++index)
-                emulator->x86.xmm[destination][index] |= source[index];
-        }
-        status = XXEMUL_STATUS_OK;
-        break;
+
     case CDISASM_X86_NAME_FXCH:
         if (instruction.operand_count != 1u
             || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER
