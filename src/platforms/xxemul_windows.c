@@ -2198,17 +2198,121 @@ static int win_utf8_scalar(const uint8_t *bytes, size_t available,
     return 1;
 }
 
+#if defined(_WIN32)
 static xxemul_status win_multi_byte_to_wide(xxemul_windows *process,
     const uint64_t *arg, uint64_t *result)
 {
-    fprintf(stderr, "[MultiByteToWideChar cp=%llu flags=0x%llx src=0x%llx srclen=%lld dst=0x%llx dstlen=%lld]\n",
-        (unsigned long long)arg[0], (unsigned long long)arg[1], (unsigned long long)arg[2],
-        (long long)(int32_t)arg[3], (unsigned long long)arg[4], (long long)(int32_t)arg[5]);
+    UINT code_page = (UINT)arg[0];
+    DWORD flags = (DWORD)arg[1];
+    int cb_multi = (int)(int32_t)arg[3];
+    int cch_wide = (int)(int32_t)arg[5];
+    uint8_t *input = NULL;
+    size_t units = 0u;
+    xxemul_status status;
+
+    if (cch_wide < 0 || (cch_wide != 0 && arg[4] == 0u)) {
+        process->last_error = 1004u;
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    status = win_conversion_input(process, arg[2], cb_multi, 1u, &input, &units);
+    if (status != XXEMUL_STATUS_OK || input == NULL) return status;
+
+    if (cch_wide == 0) {
+        int needed = MultiByteToWideChar(code_page, flags, (const char *)input, (int)units, NULL, 0);
+        if (needed <= 0) {
+            process->last_error = GetLastError();
+            *result = 0u;
+        } else {
+            *result = (uint64_t)needed;
+        }
+    } else {
+        wchar_t *wbuf = (wchar_t *)malloc((size_t)cch_wide * sizeof(wchar_t));
+        if (wbuf == NULL) {
+            free(input);
+            process->last_error = 8u;
+            *result = 0u;
+            return XXEMUL_STATUS_OK;
+        }
+        int converted = MultiByteToWideChar(code_page, flags, (const char *)input, (int)units, wbuf, cch_wide);
+        if (converted <= 0) {
+            process->last_error = GetLastError();
+            *result = 0u;
+        } else {
+            if (!win_write(process, arg[4], (const uint8_t *)wbuf, (size_t)converted * sizeof(wchar_t))) {
+                status = XXEMUL_STATUS_ADDRESS_FAULT;
+            } else {
+                *result = (uint64_t)converted;
+            }
+        }
+        free(wbuf);
+    }
+    free(input);
+    return status;
+}
+
+static xxemul_status win_wide_to_multi_byte(xxemul_windows *process,
+    const uint64_t *arg, uint64_t *result)
+{
+    UINT code_page = (UINT)arg[0];
+    DWORD flags = (DWORD)arg[1];
+    int cch_wide = (int)(int32_t)arg[3];
+    int cb_multi = (int)(int32_t)arg[5];
+    uint8_t *input = NULL;
+    size_t units = 0u;
+    xxemul_status status;
+
+    if (cb_multi < 0 || (cb_multi != 0 && arg[4] == 0u)) {
+        process->last_error = 1004u;
+        *result = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    status = win_conversion_input(process, arg[2], cch_wide, 2u, &input, &units);
+    if (status != XXEMUL_STATUS_OK || input == NULL) return status;
+
+    if (cb_multi == 0) {
+        int needed = WideCharToMultiByte(code_page, flags, (const wchar_t *)input, (int)units, NULL, 0, NULL, NULL);
+        if (needed <= 0) {
+            process->last_error = GetLastError();
+            *result = 0u;
+        } else {
+            *result = (uint64_t)needed;
+        }
+    } else {
+        char *mb_buf = (char *)malloc((size_t)cb_multi);
+        if (mb_buf == NULL) {
+            free(input);
+            process->last_error = 8u;
+            *result = 0u;
+            return XXEMUL_STATUS_OK;
+        }
+        BOOL used_default = FALSE;
+        int converted = WideCharToMultiByte(code_page, flags, (const wchar_t *)input, (int)units, mb_buf, cb_multi, NULL, arg[7] != 0 ? &used_default : NULL);
+        if (converted <= 0) {
+            process->last_error = GetLastError();
+            *result = 0u;
+        } else {
+            if (!win_write(process, arg[4], (const uint8_t *)mb_buf, (size_t)converted)) {
+                status = XXEMUL_STATUS_ADDRESS_FAULT;
+            } else {
+                *result = (uint64_t)converted;
+                if (arg[7] != 0) win_store(process, arg[7], 4u, (uint32_t)used_default);
+            }
+        }
+        free(mb_buf);
+    }
+    free(input);
+    return status;
+}
+#else
+static xxemul_status win_multi_byte_to_wide(xxemul_windows *process,
+    const uint64_t *arg, uint64_t *result)
+{
     uint32_t code_page = win_code_page((uint32_t)arg[0]);
     uint32_t flags = (uint32_t)arg[1];
     uint8_t *input = NULL, *output;
     size_t units = 0u, used = 0u, index;
-    xxemul_status status;
+    xxemul_status status = XXEMUL_STATUS_OK;
     if (code_page != 1252u && code_page != 65001u)
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     if ((flags & ~(code_page == 65001u ? 8u : 11u)) != 0u
@@ -2256,7 +2360,7 @@ static xxemul_status win_multi_byte_to_wide(xxemul_windows *process,
         }
     }
     if (index == units) {
-        if (arg[5] == 0u) *result = used / 2u;
+        if ((int32_t)arg[5] == 0) *result = used / 2u;
         else if (used / 2u > (size_t)(int32_t)arg[5])
             process->last_error = 122u;
         else if (!win_write(process, arg[4], output, used))
@@ -2301,7 +2405,7 @@ static xxemul_status win_wide_to_multi_byte(xxemul_windows *process,
     size_t units = 0u, used = 0u, index;
     uint64_t default_character;
     int substituted = 0;
-    xxemul_status status;
+    xxemul_status status = XXEMUL_STATUS_OK;
     if (code_page != 1252u && code_page != 65001u)
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     if ((flags & ~(code_page == 65001u ? 0x80u : 0x400u)) != 0u
@@ -2363,7 +2467,7 @@ static xxemul_status win_wide_to_multi_byte(xxemul_windows *process,
         }
     }
     if (index == units) {
-        if (arg[5] == 0u) *result = used;
+        if ((int32_t)arg[5] == 0) *result = used;
         else if (used > (size_t)(int32_t)arg[5])
             process->last_error = 122u;
         else if (!win_write(process, arg[4], output, used))
@@ -2377,6 +2481,7 @@ static xxemul_status win_wide_to_multi_byte(xxemul_windows *process,
     free(input);
     return status;
 }
+#endif
 
 static xxemul_status win_console_transfer(xxemul_windows *process,
     const uint64_t *arg, uint64_t *result, int read_output)
@@ -3020,7 +3125,6 @@ static xxemul_status win_call(xxemul_windows *process,
     const win_api *api, const uint64_t *arg, uint64_t *result)
 {
     const char *name = api->name;
-    fprintf(stderr, "[CALL] %s::%s\n", api->module, name);
     uint8_t word_size = process->emulator->mode == XXEMUL_MODE_X86_64
         ? 8u : 4u;
     char text[1024];
@@ -3167,6 +3271,15 @@ static xxemul_status win_call(xxemul_windows *process,
             fprintf(stderr, "%s: error\n", msg);
             free(msg);
         }
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "strerror") == 0) {
+        char *err_msg = strerror((int)arg[0]);
+        if (err_msg == NULL) err_msg = "Unknown error";
+        size_t elen = strlen(err_msg);
+        uint64_t err_buf = process->runtime_base + WIN_CRT_DATA_OFFSET + 128u;
+        win_write(process, err_buf, err_msg, elen + 1);
+        *result = err_buf;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "fopen") == 0 || strcmp(name, "_wfopen") == 0) {
