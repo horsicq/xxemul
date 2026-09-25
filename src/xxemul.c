@@ -7,6 +7,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+static void xxemul_linux_output_bridge(
+    void *context, int descriptor, const void *bytes, size_t size)
+{
+    xxemul_emit_output((xxemul *)context, descriptor, bytes, size);
+}
+
+int xxemul_emit_output(xxemul *emulator, int stream,
+    const void *bytes, size_t size)
+{
+    if (emulator == NULL || emulator->stream_output == NULL) return 0;
+    emulator->stream_output(emulator->stream_output_context,
+        stream, bytes, size);
+    return 1;
+}
+
 static int xxemul_mode_matches_arch(xxemul_arch arch, xxemul_mode mode)
 {
     if (arch == XXEMUL_ARCH_X86) {
@@ -206,8 +221,11 @@ xxemul_status xxemul_start_process(
     if (format == XXEMUL_IMAGE_ELF32 || format == XXEMUL_IMAGE_ELF64) {
         emulator->linux_process = xxemul_linux_create(
             emulator, program_path, working_directory, argc, argv);
-        return emulator->linux_process == NULL
-            ? XXEMUL_STATUS_INVALID_IMAGE : XXEMUL_STATUS_OK;
+        if (emulator->linux_process == NULL)
+            return XXEMUL_STATUS_INVALID_IMAGE;
+        xxemul_linux_set_output(emulator->linux_process,
+            xxemul_linux_output_bridge, emulator);
+        return XXEMUL_STATUS_OK;
     }
     if (format == XXEMUL_IMAGE_COM || format == XXEMUL_IMAGE_MZ) {
         const char *basename = program_path;
@@ -293,6 +311,15 @@ xxemul *xxemul_create_exec_successor(
         successor, image, image_size, path,
         xxemul_linux_working_directory(previous),
         (int)argc, argv, (int)envc, envp);
+    if (successor->linux_process != NULL) {
+        successor->stream_output = emulator->stream_output;
+        successor->stream_output_context = emulator->stream_output_context;
+        successor->memory_hook = emulator->memory_hook;
+        successor->memory_hook_context = emulator->memory_hook_context;
+        successor->debug_traps = emulator->debug_traps;
+        xxemul_linux_set_output(successor->linux_process,
+            xxemul_linux_output_bridge, successor);
+    }
     if (successor->linux_process == NULL) {
         xxemul_destroy(successor);
         successor = NULL;
@@ -495,7 +522,25 @@ xxemul_status xxemul_set_arm_state(
     return XXEMUL_STATUS_OK;
 }
 
+static xxemul_status xxemul_step_inner(
+    xxemul *emulator, xxemul_step_info *info);
+
 xxemul_status xxemul_step(xxemul *emulator, xxemul_step_info *info)
+{
+    xxemul_status status;
+
+    if (emulator == NULL) {
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    }
+    emulator->in_step = 1;
+    status = xxemul_step_inner(emulator, info);
+    emulator->in_step = 0;
+    emulator->x86_fetching = 0;
+    return status;
+}
+
+static xxemul_status xxemul_step_inner(
+    xxemul *emulator, xxemul_step_info *info)
 {
     xxemul_status status;
     if (emulator == NULL) {
@@ -600,7 +645,82 @@ const char *xxemul_status_string(xxemul_status status)
         return "keyboard input required";
     case XXEMUL_STATUS_UNSUPPORTED_IMAGE:
         return "unsupported executable image";
+    case XXEMUL_STATUS_BREAKPOINT:
+        return "breakpoint";
     default:
         return "unknown status";
     }
+}
+
+xxemul_status xxemul_set_output_callback(
+    xxemul *emulator, xxemul_output_callback callback, void *context)
+{
+    if (emulator == NULL) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    emulator->stream_output = callback;
+    emulator->stream_output_context = context;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_set_memory_hook(
+    xxemul *emulator, xxemul_memory_hook hook, void *context)
+{
+    if (emulator == NULL) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    emulator->memory_hook = hook;
+    emulator->memory_hook_context = context;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_set_debug_traps(xxemul *emulator, int enabled)
+{
+    if (emulator == NULL) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    emulator->debug_traps = enabled != 0;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_x86_linear_address(
+    const xxemul *emulator, unsigned segment_index, uint64_t offset,
+    uint64_t *address)
+{
+    if (emulator == NULL || address == NULL
+        || emulator->arch != XXEMUL_ARCH_X86
+        || segment_index >= XXEMUL_X86_SEGMENT_COUNT) {
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    }
+    if (emulator->dos_mode) {
+        if (emulator->dos_segments[segment_index].valid) {
+            *address = (uint64_t)emulator->dos_segments[segment_index].base
+                + (offset & UINT32_MAX);
+        } else {
+            *address = xxemul_dos_physical(emulator,
+                emulator->x86.segment[segment_index], (uint16_t)offset);
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    *address = offset;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_get_current_address(
+    const xxemul *emulator, uint64_t *address)
+{
+    if (emulator == NULL || address == NULL) {
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    }
+    if (emulator->arch == XXEMUL_ARCH_ARM) {
+        *address = emulator->arm.pc;
+        return XXEMUL_STATUS_OK;
+    }
+    return xxemul_x86_linear_address(
+        emulator, XXEMUL_X86_CS, emulator->x86.ip, address);
+}
+
+int xxemul_is_halted(const xxemul *emulator)
+{
+    return emulator == NULL || emulator->halted;
+}
+
+const char *xxemul_symbol_name(const xxemul *emulator, uint64_t address)
+{
+    if (emulator == NULL || emulator->windows == NULL) return NULL;
+    return xxemul_windows_thunk_name(emulator, address);
 }

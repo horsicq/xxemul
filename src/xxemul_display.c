@@ -158,7 +158,9 @@ void xxemul_video_putc(xxemul *emulator, uint8_t character)
     size_t cell;
     size_t column;
 
-    if (emulator->output_callback != NULL) {
+    if (xxemul_emit_output(emulator, 1, &character, 1u)) {
+        /* delivered to the stream callback */
+    } else if (emulator->output_callback != NULL) {
         emulator->output_callback(emulator->output_context, character);
     }
     if (character == '\r') {

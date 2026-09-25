@@ -91,3 +91,18 @@ using `xxemul_dos_push_key`, and fill a caller-owned 640x480 ARGB buffer with
 CPU memory accesses also honor the emulated A20 gate.
 Use `xxemul_create_image` or `xxemul_create_image_file` for all eight explicit
 formats.
+
+## Debugger support
+
+These hooks are used by the xxcdebug emulator backend:
+
+- `xxemul_set_debug_traps`: a guest `INT3` (or `INT 3` outside DOS)
+  returns `XXEMUL_STATUS_BREAKPOINT` with IP past the instruction, instead
+  of halting.
+- `xxemul_set_memory_hook`: reports guest data reads and writes during
+  `xxemul_step`. Instruction fetches are not reported.
+- `xxemul_set_output_callback`: one stdout/stderr stream for the DOS,
+  Windows and Linux layers.
+- `xxemul_get_current_address`, `xxemul_x86_linear_address`: linear
+  addresses through real-mode/DPMI segment state.
+- `xxemul_is_halted`, `xxemul_symbol_name` (PE import thunk names).

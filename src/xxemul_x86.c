@@ -190,6 +190,11 @@ static xxemul_status xxemul_x86_guest_memory_tracked(
     size_t done = 0u;
 
     if (page_fault_error != NULL) *page_fault_error = UINT32_MAX;
+    if (emulator->memory_hook != NULL && emulator->in_step
+        && !emulator->x86_fetching && size != 0u) {
+        emulator->memory_hook(emulator->memory_hook_context,
+            address, size, writing);
+    }
     if (!emulator->dos_mode) {
         return writing
             ? xxemul_write_memory(emulator, address, buffer, size)
@@ -1425,12 +1430,14 @@ static xxemul_status xxemul_x86_decode_current_tracked(
     } else {
         fetch_address = emulator->x86.ip;
     }
+    emulator->x86_fetching = 1;
     for (available = sizeof(code); available != 0u; --available) {
         status = xxemul_x86_guest_memory_tracked(
             emulator, fetch_address, code, available, 0,
             page_fault_error);
         if (status == XXEMUL_STATUS_OK) break;
     }
+    emulator->x86_fetching = 0;
     if (available == 0u) return XXEMUL_STATUS_ADDRESS_FAULT;
     if (emulator->x86_decode_cache == NULL) {
         emulator->x86_decode_cache = (xxemul_x86_decode_cache_entry *)
@@ -4464,6 +4471,10 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
         if (status != XXEMUL_STATUS_OK) {
             return status;
         }
+        if (right == 3u && emulator->debug_traps && !emulator->dos_mode) {
+            status = XXEMUL_STATUS_BREAKPOINT;
+            break;
+        }
         if (emulator->dos_mode && (emulator->dos_cr0 & 1u) != 0u) {
             if (right > 0xffu)
                 return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
@@ -4822,8 +4833,13 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             : size == 4u ? CDISASM_X86_REG_EDX
             : CDISASM_X86_REG_RDX, right);
         break;
-    case CDISASM_X86_NAME_HLT:
     case CDISASM_X86_NAME_INT3:
+        if (emulator->debug_traps) {
+            status = XXEMUL_STATUS_BREAKPOINT;
+            break;
+        }
+        /* fall through */
+    case CDISASM_X86_NAME_HLT:
         emulator->halted = 1;
         status = XXEMUL_STATUS_HALTED;
         break;
@@ -5248,7 +5264,8 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
         break;
     }
 
-    if (status == XXEMUL_STATUS_OK || status == XXEMUL_STATUS_HALTED) {
+    if (status == XXEMUL_STATUS_OK || status == XXEMUL_STATUS_HALTED
+        || status == XXEMUL_STATUS_BREAKPOINT) {
         emulator->x86.ip = next_ip;
         emulator->x86.flags |= UINT64_C(2);
         if (info != NULL) {

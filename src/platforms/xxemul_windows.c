@@ -1905,7 +1905,10 @@ static uint64_t win_file_write(xxemul_windows *process,
         return 0;
     }
     if (handle == 0x11u || handle == 0x12u) {
-        if (process->emulator->output_callback != NULL) {
+        if (xxemul_emit_output(process->emulator,
+                handle == 0x11u ? 1 : 2, bytes, (size_t)count)) {
+            result = (ssize_t)count;
+        } else if (process->emulator->output_callback != NULL) {
             for (i = 0; i < (size_t)count; ++i) {
                 process->emulator->output_callback(
                     process->emulator->output_context, bytes[i]);
@@ -3937,7 +3940,10 @@ static xxemul_status win_call(xxemul_windows *process,
             return XXEMUL_STATUS_ADDRESS_FAULT;
         }
         if (arg[0] == 1u || arg[0] == 2u) {
-            if (process->emulator->output_callback != NULL) {
+            if (xxemul_emit_output(process->emulator, (int)arg[0],
+                    bytes, (size_t)arg[2])) {
+                count = (ssize_t)arg[2];
+            } else if (process->emulator->output_callback != NULL) {
                 for (index = 0u; index < (size_t)arg[2]; ++index)
                     process->emulator->output_callback(
                         process->emulator->output_context, bytes[index]);

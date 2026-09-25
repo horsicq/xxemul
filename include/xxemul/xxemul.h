@@ -47,6 +47,9 @@ typedef uint32_t xxemul_status;
 #define XXEMUL_STATUS_INVALID_IMAGE UINT32_C(9)
 #define XXEMUL_STATUS_INPUT_REQUIRED UINT32_C(10)
 #define XXEMUL_STATUS_UNSUPPORTED_IMAGE UINT32_C(11)
+/** A guest INT3 executed while debug traps are enabled. IP is already past
+ * the trapping instruction, as on hardware. */
+#define XXEMUL_STATUS_BREAKPOINT UINT32_C(12)
 
 #define XXEMUL_DISPLAY_WIDTH 640u
 #define XXEMUL_DISPLAY_HEIGHT 480u
@@ -239,6 +242,43 @@ XXEMUL_API size_t xxemul_format_current(
     size_t buffer_size);
 
 XXEMUL_API const char *xxemul_status_string(xxemul_status status);
+
+/* ------------------------------------------------------------------------ */
+/*  Debugger support                                                        */
+/* ------------------------------------------------------------------------ */
+
+/** Guest stdout/stderr bytes from any platform layer (DOS, Windows, Linux).
+ * stream is 1 for stdout and 2 for stderr. When set, it takes precedence over
+ * the per-byte DOS output callback and over writing to the host streams. */
+typedef void (*xxemul_output_callback)(
+    void *context, int stream, const void *bytes, size_t size);
+
+/** Observes guest data accesses made by xxemul_step (instruction fetches
+ * and debugger-originated xxemul_read_memory/xxemul_write_memory calls are
+ * not reported). is_write is nonzero for stores. */
+typedef void (*xxemul_memory_hook)(
+    void *context, uint64_t address, size_t size, int is_write);
+
+XXEMUL_API xxemul_status xxemul_set_output_callback(
+    xxemul *emulator, xxemul_output_callback callback, void *context);
+XXEMUL_API xxemul_status xxemul_set_memory_hook(
+    xxemul *emulator, xxemul_memory_hook hook, void *context);
+/** When enabled, a guest INT3 (and INT 3 outside DOS) returns
+ * XXEMUL_STATUS_BREAKPOINT instead of halting the emulator. */
+XXEMUL_API xxemul_status xxemul_set_debug_traps(
+    xxemul *emulator, int enabled);
+/** Linear address of the next instruction (CS base applied in DOS modes). */
+XXEMUL_API xxemul_status xxemul_get_current_address(
+    const xxemul *emulator, uint64_t *address);
+/** Linear address of segment:offset using the current segment state. */
+XXEMUL_API xxemul_status xxemul_x86_linear_address(
+    const xxemul *emulator, unsigned segment_index, uint64_t offset,
+    uint64_t *address);
+XXEMUL_API int xxemul_is_halted(const xxemul *emulator);
+/** Name of a synthetic OS entry point (for example a PE import thunk), or
+ * NULL. The string is borrowed from the emulator. */
+XXEMUL_API const char *xxemul_symbol_name(
+    const xxemul *emulator, uint64_t address);
 
 #ifdef __cplusplus
 }

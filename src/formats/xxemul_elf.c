@@ -80,10 +80,13 @@ xxemul *xxemul_load_elf(
         }
         if (program->file_size > program->memory_size
             || program->offset > image_size
-            || program->file_size > image_size - program->offset
             || program->virtual_address > UINT64_MAX - program->memory_size) {
             goto done;
         }
+        /* UPX-packed ELFs give the first PT_LOAD a file_size rounded up to a
+         * page, which can run a few bytes past the physical end of the file;
+         * the kernel simply zero-fills the tail. Tolerate that here rather
+         * than rejecting the image - the copy below clamps to what exists. */
         program_end = program->virtual_address + program->memory_size;
         if (program->virtual_address < base) {
             base = program->virtual_address;
@@ -112,10 +115,13 @@ xxemul *xxemul_load_elf(
 
         if (program->type == XX_ELF_PROGRAM_LOAD
             && program->file_size != 0u) {
+            uint64_t copy = program->file_size;
+            if (copy > image_size - program->offset)
+                copy = image_size - program->offset;   /* clamp to the file */
             xx_mem_copy(emulator->region_data
                     + (size_t)(program->virtual_address - base),
                 image + (size_t)program->offset,
-                (size_t)program->file_size);
+                (size_t)copy);
         }
     }
 done:

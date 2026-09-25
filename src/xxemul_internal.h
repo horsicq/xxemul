@@ -48,6 +48,13 @@ struct xxemul {
     uint8_t key_count;
     xxemul_dos_output_callback output_callback;
     void *output_context;
+    xxemul_output_callback stream_output;
+    void *stream_output_context;
+    xxemul_memory_hook memory_hook;
+    void *memory_hook_context;
+    int in_step;
+    int x86_fetching;
+    int debug_traps;
     xxemul_x86_state x86;
     double x87_stack[8];
     uint64_t x87_int_val[8];
@@ -125,6 +132,9 @@ uint32_t xxemul_dos_physical(const xxemul *emulator,
     uint16_t segment, uint16_t offset);
 void xxemul_video_clear(xxemul *emulator);
 void xxemul_video_putc(xxemul *emulator, uint8_t character);
+/* Deliver guest console bytes to the stream callback; returns 0 when none. */
+int xxemul_emit_output(xxemul *emulator, int stream,
+    const void *bytes, size_t size);
 
 uint64_t xxemul_mask_for_size(uint8_t size);
 uint64_t xxemul_sign_extend(uint64_t value, uint8_t size);
