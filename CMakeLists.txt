@@ -7,12 +7,33 @@ project(xxemul
 )
 
 include(GNUInstallDirs)
-include(CTest)
+
+# Tests and command-line applications are development support trees. Release
+# exports may contain only the library headers and sources.
+set(_xxemul_has_tests OFF)
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    set(_xxemul_has_tests ON)
+    include(CTest)
+endif()
+
+set(_xxemul_has_tools OFF)
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tools")
+    set(_xxemul_has_tools ON)
+endif()
 
 option(BUILD_SHARED_LIBS "Build xxemul as a shared library" OFF)
-option(XXEMUL_BUILD_CLI "Build the flat-region command-line runner" ON)
-option(XXEMUL_BUILD_VIEWER "Build the DOS display viewer" ON)
-option(XXEMUL_BUILD_TESTS "Build xxemul tests" ${PROJECT_IS_TOP_LEVEL})
+if(_xxemul_has_tools)
+    option(XXEMUL_BUILD_CLI "Build the flat-region command-line runner" ON)
+    option(XXEMUL_BUILD_VIEWER "Build the DOS display viewer" ON)
+else()
+    set(XXEMUL_BUILD_CLI OFF)
+    set(XXEMUL_BUILD_VIEWER OFF)
+endif()
+if(_xxemul_has_tests)
+    option(XXEMUL_BUILD_TESTS "Build xxemul tests" ${PROJECT_IS_TOP_LEVEL})
+else()
+    set(XXEMUL_BUILD_TESTS OFF)
+endif()
 option(XXEMUL_USE_SYSTEM_CDISASM "Use an installed cdisasm package" OFF)
 option(XXEMUL_CDISASM_EXTRA_OPCODES "Enable cdisasm's generated extra opcode catalog" ON)
 set(XXEMUL_VIEWER_BACKEND "auto" CACHE STRING "Viewer backend: auto, win32, or sdl2")
@@ -178,7 +199,7 @@ if(XXEMUL_BUILD_VIEWER)
     endif()
 endif()
 
-if(XXEMUL_BUILD_TESTS AND BUILD_TESTING)
+if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
     if(XXEMUL_CDISASM_EXTRA_OPCODES)
         add_executable(xxemul_cdisasm_x87_tests tests/test_cdisasm_x87.c)
         target_link_libraries(xxemul_cdisasm_x87_tests PRIVATE cdisasm::cdisasm)
@@ -260,7 +281,7 @@ install(TARGETS xxemul
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-if(XXEMUL_BUILD_VIEWER)
+if(TARGET xxemul_viewer)
     install(TARGETS xxemul_viewer RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 install(DIRECTORY include/xxemul DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

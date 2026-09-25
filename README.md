@@ -25,8 +25,7 @@ the sibling `xxfclib`.
 - 16-bit segment registers, segment overrides, and a minimal DOS/BIOS layer
 - Experimental DOS file calls, PE import/API thunks, and Linux syscall/process
   setup for running executable images
-- 640x480 headless pixel renderer and a desktop viewer for Windows, Linux,
-  FreeBSD, and macOS
+- 640x480 headless pixel renderer
 
 The DOS layer implements selected INT 20h/21h/29h filesystem, console, and
 process services, plus selected BIOS INT 10h/11h/12h/16h services.
@@ -75,61 +74,14 @@ file I/O.
 ```text
 cmake -S . -B build
 cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
+cmake --install build --config Release --prefix /path/to/xxemul
 ```
-
-The viewer uses Win32 on Windows and SDL2 on Linux, FreeBSD, and macOS.
-Install the SDL2 development package before configuring on those systems;
-CMake accepts either an SDL2 package config or `pkg-config` metadata. Build
-the library without a windowing dependency with `-DXXEMUL_BUILD_VIEWER=OFF`.
-`-DXXEMUL_VIEWER_BACKEND=sdl2` also selects SDL2 on Windows when it is
-installed.
 
 `XXEMUL_CDISASM_EXTRA_OPCODES` defaults to ON. The UPX experiments require
 non-base decode families such as x87; an OFF build retains the smaller scalar
 instruction set.
 
-The CLI consumes bytes directly:
-
-```text
-xxemul_cli x86-64 0x1000 b8 05 00 00 00 83 c0 03 cc
-xxemul_cli --image pe64 example.exe 100
-xxemul_cli --image elf64 example.elf 100
-xxemul_cli --image macho64 example.macho 100
-xxemul_cli --dos mz example.exe 1000000
-xxemul_cli --run mz FASM.EXE 1000000 --workdir work -- COMDEMO.ASM COMDEMO.COM
-xxemul_cli --run mz upx.exe 150000000 --workdir work -- -1 -o FASMUPX.EXE FASM.EXE
-xxemul_cli --run pe32 upx.exe 50000000 --workdir work -- -o PACKED.EXE FASM.EXE
-xxemul_cli --run pe64 upx.exe 150000000 --workdir work --env UPX_DEBUG_DOCTEST_DISABLE=1 -- -1 -o PACKED.EXE FASM.EXE
-xxemul_cli --run elf32 upx 50000000 --workdir work -- -o PACKED.EXE FASM.EXE
-```
-
-`--dos` runs a COM or MZ image without an instruction trace and streams DOS
-teletype output to stdout. Decode errors, unsupported instructions, and the
-instruction limit are reported on stderr. Library callers can receive the
-same bytes with `xxemul_dos_set_output_callback`.
-
-`--run` sets up an executable process, maps guest file paths beneath the
-working directory, accepts repeated guest `--env NAME=VALUE` assignments,
-and reports the instruction count, stopping PC, and guest exit code. It is
-an experimental compatibility path, not a guarantee that arbitrary UPX
-executables can complete a packing run. The tested UPX 5.2.1 Win64 guest
-requires `UPX_DEBUG_DOCTEST_DISABLE=1` because Windows SEH/C++ unwinding for
-its startup self-test is not modeled. The flag bypasses that self-test; it
-does not bypass the packing operation.
-The tested UPX 5.2.1 DOS guest uses the CWSDPMI protected-mode bootstrap;
-use an 8.3 output filename in its workdir.
-
-The viewer accepts a COM or MZ file, or runs a built-in demo:
-
-```text
-build\xxemul_viewer.exe demo
-build\xxemul_viewer.exe com example.com
-build\xxemul_viewer.exe mz example.exe
-```
-
-On Linux, FreeBSD, and macOS, use `./build/xxemul_viewer` with the same
-arguments. The library and headless display API do not depend on SDL2.
+## Library API
 
 Library callers can load bytes with `xxemul_create_dos`, load a path via
 `xxemul_create_dos_file`, execute with `xxemul_step`/`xxemul_run`, queue input
