@@ -77,6 +77,8 @@ struct xxemul {
     uint8_t dos_pic_slave_icw4;
     uint8_t dos_pic_master_offset;
     uint8_t dos_pic_slave_offset;
+    uint8_t dos_vga_retrace;
+    uint8_t dos_pit_counter;
     uint32_t dos_cr0;
     uint32_t dos_cr2;
     uint32_t dos_pending_page_fault_error;

@@ -686,11 +686,51 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
     case 0x62u:
         emulator->x86.gpr[XXEMUL_X86_RBX] = emulator->psp_segment;
         break;
+    case 0x0au: {
+        /* Buffered keyboard input - read into DS:DX buffer */
+        uint32_t buf_addr = xxemul_dos_linear(
+            emulator->x86.segment[XXEMUL_X86_DS],
+            (uint16_t)emulator->x86.gpr[XXEMUL_X86_RDX]);
+        uint64_t val = 0;
+        uint8_t max_chars;
+        if (xxemul_load_integer(emulator, buf_addr, 1u, &val)
+            != XXEMUL_STATUS_OK || (max_chars = (uint8_t)val) == 0u) {
+            xxemul_dos_result(emulator, 1u, 1);
+            return XXEMUL_STATUS_OK;
+        }
+        /* Return empty line (just CR) */
+        xxemul_write_memory(emulator, buf_addr + 1u,
+            (const uint8_t *)"\x00\x0d", 2u);
+        break;
+    }
+    case 0x31u:
+        /* Terminate and stay resident */
+        emulator->exit_code = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX];
+        emulator->halted = 1;
+        return XXEMUL_STATUS_HALTED;
+    case 0x3bu:
+        /* Change directory: succeed silently */
+        emulator->x86.flags &= ~XXEMUL_DOS_CF;
+        return XXEMUL_STATUS_OK;
+    case 0x4du:
+        /* Get return code of subprogram */
+        xxemul_dos_set_ax(emulator, 0u);
+        emulator->x86.flags &= ~XXEMUL_DOS_CF;
+        return XXEMUL_STATUS_OK;
+    case 0x54u:
+        /* Get verify flag */
+        emulator->x86.gpr[XXEMUL_X86_RAX] &= ~UINT64_C(0xff);
+        break;
+    case 0x56u:
+        /* Rename file */
+        return xxemul_dos_files_interrupt(emulator, function);
     case 0x71u:
         xxemul_dos_result(emulator, 0x7100u, 1);
         return XXEMUL_STATUS_OK;
     default:
-        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        /* Unknown DOS function: return CF=1, AX=1 (invalid function). */
+        xxemul_dos_result(emulator, 1u, 1);
+        return XXEMUL_STATUS_OK;
     }
     emulator->x86.flags &= ~XXEMUL_DOS_CF;
     return XXEMUL_STATUS_OK;

@@ -108,10 +108,10 @@ static xxemul_status xxemul_bios_video(xxemul *emulator)
         emulator->x86.gpr[XXEMUL_X86_RBX] &= 0x00ffu;
         return XXEMUL_STATUS_OK;
     default:
-        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        /* Unknown video sub-function: ignore silently. */
+        return XXEMUL_STATUS_OK;
     }
 }
-
 static xxemul_status xxemul_bios_keyboard(xxemul *emulator)
 {
     uint8_t function = xxemul_bios_ah(emulator);
@@ -140,7 +140,8 @@ static xxemul_status xxemul_bios_keyboard(xxemul *emulator)
         xxemul_bios_set_ax(emulator, 0u);
         return XXEMUL_STATUS_OK;
     default:
-        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        /* Unknown keyboard sub-function: ignore. */
+        return XXEMUL_STATUS_OK;
     }
 }
 
@@ -221,7 +222,11 @@ xxemul_status xxemul_bios_interrupt(xxemul *emulator, uint8_t vector)
             return XXEMUL_STATUS_OK;
         }
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    case 0x04u:
+        /* INT 4: overflow (triggered by INTO). Treat as NOP. */
+        return XXEMUL_STATUS_OK;
     default:
-        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        /* Unknown BIOS interrupt vector: silently ignore in DOS real mode. */
+        return XXEMUL_STATUS_OK;
     }
 }
