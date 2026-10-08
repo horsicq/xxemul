@@ -1,3 +1,14 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+#if !defined(_WIN32) && !defined(_XOPEN_SOURCE)
+/* glibc declares realpath() only for X/Open, not plain POSIX. */
+#define _XOPEN_SOURCE 700
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+
 #include "xxemul_windows.h"
 #include "xxemul_internal.h"
 
@@ -15,6 +26,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <unistd.h>
 #include <utime.h>
 #endif
 
@@ -1930,6 +1942,32 @@ static uint64_t win_file_write(xxemul_windows *process,
     return result < 0 ? 0u : 1u;
 }
 
+#if !defined(_WIN32)
+static size_t win_encode_utf8(uint32_t scalar, uint8_t *output)
+{
+    if (scalar < 0x80u) {
+        output[0] = (uint8_t)scalar;
+        return 1u;
+    }
+    if (scalar < 0x800u) {
+        output[0] = (uint8_t)(0xc0u | (scalar >> 6u));
+        output[1] = (uint8_t)(0x80u | (scalar & 0x3fu));
+        return 2u;
+    }
+    if (scalar < 0x10000u) {
+        output[0] = (uint8_t)(0xe0u | (scalar >> 12u));
+        output[1] = (uint8_t)(0x80u | ((scalar >> 6u) & 0x3fu));
+        output[2] = (uint8_t)(0x80u | (scalar & 0x3fu));
+        return 3u;
+    }
+    output[0] = (uint8_t)(0xf0u | (scalar >> 18u));
+    output[1] = (uint8_t)(0x80u | ((scalar >> 12u) & 0x3fu));
+    output[2] = (uint8_t)(0x80u | ((scalar >> 6u) & 0x3fu));
+    output[3] = (uint8_t)(0x80u | (scalar & 0x3fu));
+    return 4u;
+}
+#endif
+
 static uint64_t win_console_write_w(xxemul_windows *process,
     uint64_t handle, uint64_t buffer, uint64_t count,
     uint64_t chars_written)
@@ -1959,9 +1997,16 @@ static uint64_t win_console_write_w(xxemul_windows *process,
                 process->emulator->output_callback(
                     process->emulator->output_context, (uint8_t)ch);
             } else {
+#if defined(_WIN32)
                 char utf8[4];
                 int len = WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)&ch, 1,
                     utf8, sizeof(utf8), NULL, NULL);
+#else
+                /* Same as CP_UTF8: a lone surrogate becomes U+FFFD. */
+                uint8_t utf8[4];
+                int len = (int)win_encode_utf8(
+                    ch >= 0xd800u && ch <= 0xdfffu ? 0xfffdu : ch, utf8);
+#endif
                 int k;
                 for (k = 0; k < len; ++k) {
                     process->emulator->output_callback(
@@ -2379,30 +2424,6 @@ static xxemul_status win_multi_byte_to_wide(xxemul_windows *process,
     free(output);
     free(input);
     return status;
-}
-
-static size_t win_encode_utf8(uint32_t scalar, uint8_t *output)
-{
-    if (scalar < 0x80u) {
-        output[0] = (uint8_t)scalar;
-        return 1u;
-    }
-    if (scalar < 0x800u) {
-        output[0] = (uint8_t)(0xc0u | (scalar >> 6u));
-        output[1] = (uint8_t)(0x80u | (scalar & 0x3fu));
-        return 2u;
-    }
-    if (scalar < 0x10000u) {
-        output[0] = (uint8_t)(0xe0u | (scalar >> 12u));
-        output[1] = (uint8_t)(0x80u | ((scalar >> 6u) & 0x3fu));
-        output[2] = (uint8_t)(0x80u | (scalar & 0x3fu));
-        return 3u;
-    }
-    output[0] = (uint8_t)(0xf0u | (scalar >> 18u));
-    output[1] = (uint8_t)(0x80u | ((scalar >> 12u) & 0x3fu));
-    output[2] = (uint8_t)(0x80u | ((scalar >> 6u) & 0x3fu));
-    output[3] = (uint8_t)(0x80u | (scalar & 0x3fu));
-    return 4u;
 }
 
 static xxemul_status win_wide_to_multi_byte(xxemul_windows *process,
