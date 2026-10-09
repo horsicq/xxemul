@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(xxemul
     VERSION 0.1.0
-    DESCRIPTION "Pure C x86 and ARM instruction emulator"
+    DESCRIPTION "Pure C x86, ARM, Dalvik and .NET CIL instruction emulator"
     LANGUAGES C
 )
 
@@ -35,6 +35,8 @@ else()
     set(XXEMUL_BUILD_TESTS OFF)
 endif()
 option(XXEMUL_USE_SYSTEM_CDISASM "Use an installed cdisasm package" OFF)
+option(XXEMUL_ENABLE_DEX "Build the APK loader and Dalvik interpreter" ON)
+option(XXEMUL_ENABLE_DOTNET "Build the managed PE loader and CIL interpreter" OFF)
 option(XXEMUL_CDISASM_EXTRA_OPCODES "Enable cdisasm's generated extra opcode catalog" ON)
 set(XXEMUL_VIEWER_BACKEND "auto" CACHE STRING "Viewer backend: auto, win32, or sdl2")
 set_property(CACHE XXEMUL_VIEWER_BACKEND PROPERTY STRINGS auto win32 sdl2)
@@ -45,6 +47,9 @@ set(XXEMUL_CDISASM_SOURCE_DIR
 set(XXEMUL_XXFCLIB_SOURCE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../xxfclib"
     CACHE PATH "Path to the xxfclib source tree")
+set(XXEMUL_XXBYTE_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xxbyte"
+    CACHE PATH "Path to the xxbyte source tree")
 set(XXEMUL_UPX_FIXTURE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/build-upx-fixtures"
     CACHE PATH "Optional UPX executable fixtures for integration tests")
@@ -88,10 +93,29 @@ if(NOT TARGET xxfclib::xxfclib)
         EXCLUDE_FROM_ALL)
 endif()
 
+if((XXEMUL_ENABLE_DEX OR XXEMUL_ENABLE_DOTNET) AND NOT TARGET xxbyte::xxbyte)
+    if(NOT EXISTS "${XXEMUL_XXBYTE_SOURCE_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR "xxbyte was not found at ${XXEMUL_XXBYTE_SOURCE_DIR}")
+    endif()
+    set(XXBYTE_BUILD_CLI OFF CACHE BOOL "" FORCE)
+    set(XXBYTE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(XXBYTE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(XXBYTE_FAMILIES "")
+    if(XXEMUL_ENABLE_DEX)
+        list(APPEND XXBYTE_FAMILIES DEX)
+    endif()
+    if(XXEMUL_ENABLE_DOTNET)
+        list(APPEND XXBYTE_FAMILIES DOTNET)
+    endif()
+    add_subdirectory("${XXEMUL_XXBYTE_SOURCE_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}/_deps/xxbyte" EXCLUDE_FROM_ALL)
+endif()
+
 add_library(xxemul
     include/xxemul/xxemul.h
     src/xxemul_internal.h
     src/xxemul.c
+    src/xxemul_status.c
     src/xxemul_x86.c
     src/xxemul_arm.c
     src/xxemul_display.c
@@ -110,6 +134,39 @@ add_library(xxemul
     src/platforms/xxemul_linux.c
 )
 add_library(xxemul::xxemul ALIAS xxemul)
+
+if(XXEMUL_ENABLE_DEX)
+    target_sources(xxemul PRIVATE
+        include/xxemul/xxemul_dex.h
+        include/xxemul/xxemul_dex_runtime.h
+        src/xxemul_dex_internal.h
+        src/formats/xxemul_dex.c
+        src/formats/xxemul_apk.c
+        src/xxemul_dex_runtime.c)
+    target_link_libraries(xxemul PRIVATE xxbyte::xxbyte)
+    if(UNIX)
+        target_link_libraries(xxemul PRIVATE m)
+    endif()
+    target_compile_definitions(xxemul PUBLIC XXEMUL_ENABLE_DEX=1)
+else()
+    target_compile_definitions(xxemul PUBLIC XXEMUL_ENABLE_DEX=0)
+endif()
+
+if(XXEMUL_ENABLE_DOTNET)
+    target_sources(xxemul PRIVATE
+        include/xxemul/xxemul_dotnet.h
+        include/xxemul/xxemul_dotnet_runtime.h
+        src/xxemul_dotnet_internal.h
+        src/formats/xxemul_dotnet.c
+        src/xxemul_dotnet_runtime.c)
+    target_link_libraries(xxemul PRIVATE xxbyte::xxbyte)
+    if(UNIX)
+        target_link_libraries(xxemul PRIVATE m)
+    endif()
+    target_compile_definitions(xxemul PUBLIC XXEMUL_ENABLE_DOTNET=1)
+else()
+    target_compile_definitions(xxemul PUBLIC XXEMUL_ENABLE_DOTNET=0)
+endif()
 
 target_compile_features(xxemul PUBLIC c_std_11)
 set_target_properties(xxemul PROPERTIES

@@ -1,9 +1,43 @@
 # xxemul
 
-`xxemul` is a pure C11 instruction emulator for x86 and ARM. It accepts a
+`xxemul` is a pure C11 instruction emulator for x86, ARM and Dalvik. It accepts a
 caller-supplied flat region, or explicitly loads COM, MZ, PE32, PE64, ELF32,
 ELF64, Mach-O 32, and Mach-O 64 images. The loaders use format parsers from
 the sibling `xxfclib`.
+
+APK and standalone DEX loading are available through `xxemul/xxemul_dex.h`.
+The bounded Dalvik interpreter is in `xxemul/xxemul_dex_runtime.h`, using
+the sibling `xxbyte` decoder. APK inventory, manifest metadata, extraction and
+bounded DEX structure readers come from `xxfclib`. The loader supports
+multidex APKs and standard little-endian DEX
+035 and 037-040; DEX 041 containers and optimized ODEX are rejected.
+Android and Java services require an explicit host callback. This extension
+does not supply a full Android runtime or UI. See the sibling
+`../../XAPKEmul/README.md` for console usage and the APK integration fixture.
+Set `XXEMUL_ENABLE_DEX=OFF` to build only the native CPU emulators, or set
+`XXEMUL_XXBYTE_SOURCE_DIR` to select a different xxbyte source tree.
+
+DEX VM host services can use `xxemul_dex_vm_new_byte_array`, range-checked
+byte-array length/read/write helpers and `xxemul_dex_vm_is_instance`.
+Optional `xxemul_dex_intercept_callback` runs after receiver/argument checks
+and class initialization, allowing an explicit host model to handle selected
+methods that also have DEX bodies. An unhandled call continues normally;
+handled return kinds/references are validated like external calls. XAPKEmul's
+`--android-host` uses this for headless Activity setup with File/Base64/stream
+services. Its Oxygen regression executes actual app bytecode and checks the
+721-byte generated file and the existing-file branch. The host model also
+loads APK native libraries with the ELF shared-object API below and executes
+bounded JNI exports on all four Android ABIs. It supplies a small JNI subset;
+UI, exception dispatch and general Android JNI services remain unsupported.
+
+Managed PE assemblies can be loaded and inspected through
+`xxemul/xxemul_dotnet.h`, and executed through the bounded typed CIL interpreter
+in `xxemul/xxemul_dotnet_runtime.h`. Enable `XXEMUL_ENABLE_DOTNET=ON` to build
+this optional backend; `xxbyte` then includes the DOTNET decoder, alongside
+DEX if both are enabled. See `../../XDotNetEmul/README.md` for console usage,
+test assemblies, host callbacks and runtime limitations. The application uses
+the focused xxfclib `dotnet_emul` profile; general native emulator consumers
+can continue using the default full xxfclib profile.
 
 ## Current scope
 
@@ -21,6 +55,9 @@ the sibling `xxfclib`.
   creation, and MZ relocations
 - PE32/PE64 preferred-base section mapping; ELF32/ELF64 `ET_EXEC` segment
   mapping, including zero-filled BSS and a minimal empty stack
+- Separate bounded ELF32/ELF64 `ET_DYN` API with shared-object relocations,
+  explicit version-aware guest import resolution and constructor inventory
+- ARM BX/BLX interworking and Thumb call/return address handling
 - Thin Mach-O 32/64 executable segment mapping with `LC_MAIN` entry points
 - 16-bit segment registers, segment overrides, and a minimal DOS/BIOS layer
 - Experimental DOS file calls, PE import/API thunks, and Linux syscall/process
@@ -61,13 +98,36 @@ ARM64 in little-endian `ET_EXEC` images. PE images use their preferred base;
 ELF images use `PT_LOAD` virtual addresses. Image regions and file inputs are
 currently capped at 128 MiB. PE import thunks and a subset of Windows API
 calls are emulated, along with selected Linux syscalls and an executable
-handoff. Shared libraries, dynamic relocation, memory permissions, and full
-process ABIs are not implemented. Mach-O supports little-endian thin executables with
+handoff. The separate shared ELF API supports the bounded dynamic-loading
+subset described below. Memory permissions and full process ABIs are not
+implemented. Mach-O supports little-endian thin executables with
 `LC_MAIN`; fat binaries, `LC_UNIXTHREAD` entry points, dyld, and macOS system
 services are not implemented. COM, MS-DOS EXE, PE, ELF, and Mach-O loaders
 live in separate `src/formats` C files. `src/platforms/xxemul_dos_loader.c`
 owns shared DOS setup, while `src/xxemul_image.c` owns image dispatch and
 file I/O.
+
+## Shared ELF API
+
+`xxemul/xxemul_elf.h` owns a guest CPU and mapped little-endian `ET_DYN` image
+for i386, x86-64, ARM32 or AArch64. `xxemul_elf_shared_create` maps PT_LOAD
+segments/BSS, allocates bounded auxiliary/stack arenas, and applies supported
+REL/RELA relocations. An explicit resolver receives each undefined symbol and
+its ELF version name and returns a guest address. Dependencies are never loaded
+on the host. The result contains relocation/import counts and a diagnostic.
+
+Use `xxemul_elf_shared_find_export` for visible dynamic exports and
+`xxemul_elf_shared_initializer_count`/`initializer_at` for DT_INIT followed by
+relocated DT_INIT_ARRAY entries. The loader inventories constructors; callers
+execute them with a guest ABI and an instruction budget. CPU and layout getters
+remain valid until `xxemul_elf_shared_destroy`. The input bytes need not outlive
+creation. ARM function addresses retain their Thumb bit.
+
+Unsupported relocations, TLS, IFUNC and packed relocations fail explicitly.
+The original ET_EXEC loader and executable process setup remain separate.
+XAPKEmul's native bridge supplies Android import models, executes initialization
+and JNI_OnLoad, and binds DEX native declarations to JNI exports. See its README
+for the implemented JNI subset and actual Oxygen APK integration tests.
 
 ## Build
 

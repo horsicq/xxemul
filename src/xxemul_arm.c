@@ -7,6 +7,7 @@
 #define XXEMUL_ARM_FLAG_Z (UINT32_C(1) << 30)
 #define XXEMUL_ARM_FLAG_C (UINT32_C(1) << 29)
 #define XXEMUL_ARM_FLAG_V (UINT32_C(1) << 28)
+#define XXEMUL_ARM_FLAG_T (UINT32_C(1) << 5)
 
 static cdisasm_arm_mode xxemul_arm_cdisasm_mode(const xxemul *emulator)
 {
@@ -39,6 +40,26 @@ static uint64_t xxemul_arm_align_pc(const xxemul *emulator, uint64_t value)
         return value & ~UINT64_C(1);
     }
     return value & ~UINT64_C(3);
+}
+
+static xxemul_status xxemul_arm_branch_exchange(xxemul *emulator, uint64_t target)
+{
+    target &= UINT32_MAX;
+    /* An ARM destination must be word aligned. Thumb uses bit zero solely
+     * to select its instruction set and permits halfword alignment. */
+    if ((target & UINT64_C(3)) == UINT64_C(2)) {
+        return XXEMUL_STATUS_ADDRESS_FAULT;
+    }
+    if ((target & UINT64_C(1)) != 0u) {
+        emulator->mode = XXEMUL_MODE_ARM_T32;
+        emulator->arm.pstate |= XXEMUL_ARM_FLAG_T;
+        emulator->arm.pc = target & ~UINT64_C(1);
+    } else {
+        emulator->mode = XXEMUL_MODE_ARM_A32;
+        emulator->arm.pstate &= ~XXEMUL_ARM_FLAG_T;
+        emulator->arm.pc = target;
+    }
+    return XXEMUL_STATUS_OK;
 }
 
 static xxemul_status xxemul_arm_read_register(
@@ -813,16 +834,40 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
             emulator, &instruction, current_pc, &target);
         if (status == XXEMUL_STATUS_OK) {
             emulator->arm.gpr[emulator->mode == XXEMUL_MODE_ARM_A64 ? 30u : 14u]
-                = next_pc;
+                = next_pc | (emulator->mode == XXEMUL_MODE_ARM_T32 ? 1u : 0u);
             emulator->arm.pc = xxemul_arm_align_pc(emulator, target);
         }
         break;
     case CDISASM_ARM_NAME_BR:
-    case CDISASM_ARM_NAME_BX:
         status = xxemul_arm_branch_target(
             emulator, &instruction, current_pc, &target);
         if (status == XXEMUL_STATUS_OK) {
             emulator->arm.pc = xxemul_arm_align_pc(emulator, target);
+        }
+        break;
+    case CDISASM_ARM_NAME_BX:
+    case CDISASM_ARM_NAME_BLX:
+        if (emulator->mode == XXEMUL_MODE_ARM_A64) {
+            status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            break;
+        }
+        status = xxemul_arm_branch_target(
+            emulator, &instruction, current_pc, &target);
+        if (status == XXEMUL_STATUS_OK) {
+            uint64_t return_address = next_pc
+                | (emulator->mode == XXEMUL_MODE_ARM_T32 ? 1u : 0u);
+            if (instruction.name_id == CDISASM_ARM_NAME_BLX
+                && (instruction.operand_count == 0u
+                    || instruction.operand[0].type != CDISASM_OPERAND_REGISTER)) {
+                /* Immediate BLX always enters the opposite instruction set. */
+                target = emulator->mode == XXEMUL_MODE_ARM_A32
+                    ? target | UINT64_C(1) : target & ~UINT64_C(1);
+            }
+            status = xxemul_arm_branch_exchange(emulator, target);
+            if (status == XXEMUL_STATUS_OK
+                && instruction.name_id == CDISASM_ARM_NAME_BLX) {
+                emulator->arm.gpr[14] = return_address;
+            }
         }
         break;
     case CDISASM_ARM_NAME_BLR:
