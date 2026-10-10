@@ -100,69 +100,36 @@ struct xxemul {
     uint8_t dos_dpmi_prepared;
 };
 
-xxemul *xxemul_create_empty(
-    xxemul_arch arch, xxemul_mode mode,
-    uint64_t region_address, size_t region_size,
-    xxemul_status *status);
+xxemul *xxemul_create_empty(xxemul_arch arch, xxemul_mode mode, uint64_t region_address, size_t region_size, xxemul_status *status);
 
-xxemul *xxemul_image_allocate(
-    xxemul_arch arch, xxemul_mode mode, uint64_t base,
-    uint64_t image_span, uint64_t entry, int unix_stack,
-    xxemul_status *status);
-xxemul *xxemul_load_pe(
-    xxemul_image_format format, const uint8_t *image,
-    size_t image_size, xx_io_device *io, xxemul_status *status);
-xxemul *xxemul_load_elf(
-    xxemul_image_format format, const uint8_t *image,
-    size_t image_size, xx_io_device *io, xxemul_status *status);
-xxemul *xxemul_load_macho(
-    xxemul_image_format format, const uint8_t *image,
-    size_t image_size, xx_io_device *io, xxemul_status *status);
-int xxemul_load_com(
-    xxemul *emulator, const uint8_t *image,
-    size_t image_size, xx_io_device *io);
-int xxemul_load_msdos_exe(
-    xxemul *emulator, const uint8_t *image,
-    size_t image_size, xx_io_device *io);
+xxemul *xxemul_image_allocate(xxemul_arch arch, xxemul_mode mode, uint64_t base, uint64_t image_span, uint64_t entry, int unix_stack, xxemul_status *status);
+xxemul *xxemul_load_pe(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, xxemul_status *status);
+xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, xxemul_status *status);
+xxemul *xxemul_load_macho(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, xxemul_status *status);
+int xxemul_load_com(xxemul *emulator, const uint8_t *image, size_t image_size, xx_io_device *io);
+int xxemul_load_msdos_exe(xxemul *emulator, const uint8_t *image, size_t image_size, xx_io_device *io);
 
 xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector);
 xxemul_status xxemul_bios_interrupt(xxemul *emulator, uint8_t vector);
 xxemul_status xxemul_dpmi_enter(xxemul *emulator);
 xxemul_status xxemul_dpmi_interrupt(xxemul *emulator);
 int xxemul_dpmi_prepare(xxemul *emulator);
-uint32_t xxemul_dos_physical(const xxemul *emulator,
-    uint16_t segment, uint16_t offset);
+uint32_t xxemul_dos_physical(const xxemul *emulator, uint16_t segment, uint16_t offset);
 void xxemul_video_clear(xxemul *emulator);
 void xxemul_video_putc(xxemul *emulator, uint8_t character);
 /* Deliver guest console bytes to the stream callback; returns 0 when none. */
-int xxemul_emit_output(xxemul *emulator, int stream,
-    const void *bytes, size_t size);
+int xxemul_emit_output(xxemul *emulator, int stream, const void *bytes, size_t size);
 
 uint64_t xxemul_mask_for_size(uint8_t size);
 uint64_t xxemul_sign_extend(uint64_t value, uint8_t size);
-xxemul_status xxemul_load_integer(
-    xxemul *emulator,
-    uint64_t address,
-    uint8_t size,
-    uint64_t *value);
-xxemul_status xxemul_store_integer(
-    xxemul *emulator,
-    uint64_t address,
-    uint8_t size,
-    uint64_t value);
+xxemul_status xxemul_load_integer(xxemul *emulator, uint64_t address, uint8_t size, uint64_t *value);
+xxemul_status xxemul_store_integer(xxemul *emulator, uint64_t address, uint8_t size, uint64_t value);
 
 xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info);
-xxemul_status xxemul_x86_dispatch_pending_page_fault(
-    xxemul *emulator, xxemul_step_info *info, uint64_t fault_ip);
-size_t xxemul_x86_format_current(
-    xxemul *emulator,
-    char *buffer,
-    size_t buffer_size);
+xxemul_status xxemul_x86_dispatch_pending_page_fault(xxemul *emulator, xxemul_step_info *info, uint64_t fault_ip);
+size_t xxemul_x86_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
 
 xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info);
-size_t xxemul_arm_format_current(
-    xxemul *emulator,
-    char *buffer,
-    size_t buffer_size);
+size_t xxemul_arm_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
 
 #endif

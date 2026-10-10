@@ -14,22 +14,17 @@ uint32_t xxemul_dos_linear(uint16_t segment, uint16_t offset)
     return (((uint32_t)segment << 4) + offset) & 0xfffffu;
 }
 
-uint32_t xxemul_dos_physical(const xxemul *emulator,
-    uint16_t segment, uint16_t offset)
+uint32_t xxemul_dos_physical(const xxemul *emulator, uint16_t segment, uint16_t offset)
 {
     uint32_t address = ((uint32_t)segment << 4) + offset;
-    return (emulator->dos_port_92 & 2u) != 0u
-        ? address : address & 0xfffffu;
+    return (emulator->dos_port_92 & 2u) != 0u ? address : address & 0xfffffu;
 }
 
 static void xxemul_dos_make_psp(xxemul *emulator)
 {
-    uint8_t *psp = emulator->region_data
-        + xxemul_dos_linear(emulator->psp_segment, 0u);
-    uint8_t *mcb = emulator->region_data
-        + xxemul_dos_linear((uint16_t)(emulator->psp_segment - 1u), 0u);
-    uint16_t block_size = (uint16_t)(
-        XXEMUL_DOS_CONVENTIONAL_END - emulator->psp_segment);
+    uint8_t *psp = emulator->region_data + xxemul_dos_linear(emulator->psp_segment, 0u);
+    uint8_t *mcb = emulator->region_data + xxemul_dos_linear((uint16_t)(emulator->psp_segment - 1u), 0u);
+    uint16_t block_size = (uint16_t)(XXEMUL_DOS_CONVENTIONAL_END - emulator->psp_segment);
 
     mcb[0] = 'Z';
     mcb[1] = (uint8_t)emulator->psp_segment;
@@ -48,9 +43,7 @@ static void xxemul_dos_make_psp(xxemul *emulator)
     psp[0x81] = 0x0du;
 }
 
-xxemul *xxemul_create_dos(
-    xxemul_dos_format format, const void *image,
-    size_t image_size, xxemul_status *status)
+xxemul *xxemul_create_dos(xxemul_dos_format format, const void *image, size_t image_size, xxemul_status *status)
 {
     xx_io_device *io;
     xxemul *emulator;
@@ -59,9 +52,7 @@ xxemul *xxemul_create_dos(
     if (status != NULL) {
         *status = XXEMUL_STATUS_INVALID_ARGUMENT;
     }
-    if ((format != XXEMUL_DOS_COM && format != XXEMUL_DOS_MZ)
-        || image == NULL || image_size == 0u
-        || image_size > (size_t)LONG_MAX) {
+    if ((format != XXEMUL_DOS_COM && format != XXEMUL_DOS_MZ) || image == NULL || image_size == 0u || image_size > (size_t)LONG_MAX) {
         return NULL;
     }
     io = xx_io_mem_open_ro(image, image_size);
@@ -71,9 +62,7 @@ xxemul *xxemul_create_dos(
         }
         return NULL;
     }
-    emulator = xxemul_create_empty(
-        XXEMUL_ARCH_X86, XXEMUL_MODE_X86_16,
-        0u, XXEMUL_DOS_MEMORY_SIZE, status);
+    emulator = xxemul_create_empty(XXEMUL_ARCH_X86, XXEMUL_MODE_X86_16, 0u, XXEMUL_DOS_MEMORY_SIZE, status);
     if (emulator == NULL) {
         xx_io_close(io);
         return NULL;
@@ -100,9 +89,7 @@ xxemul *xxemul_create_dos(
     emulator->region_data[XXEMUL_DOS_INT10_THUNK_PHYSICAL] = 0xcfu;
     emulator->region_data[0x449u] = 3u;
     emulator->region_data[0x44au] = 80u;
-    loaded = format == XXEMUL_DOS_COM
-        ? xxemul_load_com(emulator, image, image_size, io)
-        : xxemul_load_msdos_exe(emulator, image, image_size, io);
+    loaded = format == XXEMUL_DOS_COM ? xxemul_load_com(emulator, image, image_size, io) : xxemul_load_msdos_exe(emulator, image, image_size, io);
     xx_io_close(io);
     if (!loaded) {
         xxemul_destroy(emulator);
@@ -118,8 +105,7 @@ xxemul *xxemul_create_dos(
     return emulator;
 }
 
-xxemul_status xxemul_dos_get_exit_code(
-    const xxemul *emulator, uint8_t *exit_code)
+xxemul_status xxemul_dos_get_exit_code(const xxemul *emulator, uint8_t *exit_code)
 {
     if (emulator == NULL || !emulator->dos_mode || exit_code == NULL) {
         return XXEMUL_STATUS_INVALID_ARGUMENT;
@@ -128,8 +114,7 @@ xxemul_status xxemul_dos_get_exit_code(
     return XXEMUL_STATUS_OK;
 }
 
-xxemul_status xxemul_dos_push_key(
-    xxemul *emulator, uint8_t ascii, uint8_t scan_code)
+xxemul_status xxemul_dos_push_key(xxemul *emulator, uint8_t ascii, uint8_t scan_code)
 {
     uint8_t tail;
 
@@ -145,8 +130,7 @@ xxemul_status xxemul_dos_push_key(
     return XXEMUL_STATUS_OK;
 }
 
-xxemul_status xxemul_dos_set_output_callback(
-    xxemul *emulator, xxemul_dos_output_callback callback, void *context)
+xxemul_status xxemul_dos_set_output_callback(xxemul *emulator, xxemul_dos_output_callback callback, void *context)
 {
     if (emulator == NULL || !emulator->dos_mode) {
         return XXEMUL_STATUS_INVALID_ARGUMENT;
@@ -156,17 +140,13 @@ xxemul_status xxemul_dos_set_output_callback(
     return XXEMUL_STATUS_OK;
 }
 
-xxemul *xxemul_create_dos_file(
-    xxemul_dos_format format, const char *path, xxemul_status *status)
+xxemul *xxemul_create_dos_file(xxemul_dos_format format, const char *path, xxemul_status *status)
 {
     if (status != NULL) {
         *status = XXEMUL_STATUS_INVALID_ARGUMENT;
     }
-    if (path == NULL || (format != XXEMUL_DOS_COM
-        && format != XXEMUL_DOS_MZ)) {
+    if (path == NULL || (format != XXEMUL_DOS_COM && format != XXEMUL_DOS_MZ)) {
         return NULL;
     }
-    return xxemul_create_image_file(
-        format == XXEMUL_DOS_COM ? XXEMUL_IMAGE_COM : XXEMUL_IMAGE_MZ,
-        path, status);
+    return xxemul_create_image_file(format == XXEMUL_DOS_COM ? XXEMUL_IMAGE_COM : XXEMUL_IMAGE_MZ, path, status);
 }

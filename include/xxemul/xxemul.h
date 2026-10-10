@@ -5,15 +5,15 @@
 #include <stdint.h>
 
 #if defined(_WIN32) || defined(__CYGWIN__)
-#  if defined(XXEMUL_STATIC)
-#    define XXEMUL_API
-#  elif defined(XXEMUL_BUILDING_LIBRARY)
-#    define XXEMUL_API __declspec(dllexport)
-#  else
-#    define XXEMUL_API __declspec(dllimport)
-#  endif
+#if defined(XXEMUL_STATIC)
+#define XXEMUL_API
+#elif defined(XXEMUL_BUILDING_LIBRARY)
+#define XXEMUL_API __declspec(dllexport)
 #else
-#  define XXEMUL_API
+#define XXEMUL_API __declspec(dllimport)
+#endif
+#else
+#define XXEMUL_API
 #endif
 
 #ifdef __cplusplus
@@ -143,59 +143,35 @@ typedef struct xxemul_step_info {
 /** Receives bytes written through DOS or BIOS teletype output. */
 typedef void (*xxemul_dos_output_callback)(void *context, uint8_t byte);
 
-XXEMUL_API xxemul *xxemul_create(
-    const xxemul_config *config,
-    xxemul_status *status);
+XXEMUL_API xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status);
 /** Loads an explicitly selected executable format into owned memory. */
-XXEMUL_API xxemul *xxemul_create_image(
-    xxemul_image_format format,
-    const void *image,
-    size_t image_size,
-    xxemul_status *status);
-XXEMUL_API xxemul *xxemul_create_image_file(
-    xxemul_image_format format,
-    const char *path,
-    xxemul_status *status);
+XXEMUL_API xxemul *xxemul_create_image(xxemul_image_format format, const void *image, size_t image_size, xxemul_status *status);
+XXEMUL_API xxemul *xxemul_create_image_file(xxemul_image_format format, const char *path, xxemul_status *status);
 /** Explicit DOS format; COM has no signature and is never auto-detected. */
-XXEMUL_API xxemul *xxemul_create_dos(
-    xxemul_dos_format format,
-    const void *image,
-    size_t image_size,
-    xxemul_status *status);
+XXEMUL_API xxemul *xxemul_create_dos(xxemul_dos_format format, const void *image, size_t image_size, xxemul_status *status);
 /** Reads a COM or MZ file through xxfclib's file device. */
-XXEMUL_API xxemul *xxemul_create_dos_file(
-    xxemul_dos_format format,
-    const char *path,
-    xxemul_status *status);
+XXEMUL_API xxemul *xxemul_create_dos_file(xxemul_dos_format format, const char *path, xxemul_status *status);
 /** Initialize guest OS services for a loaded PE or ELF image.
  * argv includes argv[0]; host file access is confined to working_directory. */
-XXEMUL_API xxemul_status xxemul_start_process(
-    xxemul *emulator, xxemul_image_format format,
-    const char *program_path, const char *working_directory,
-    int argc, const char *const *argv);
+XXEMUL_API xxemul_status xxemul_start_process(xxemul *emulator, xxemul_image_format format, const char *program_path, const char *working_directory, int argc,
+                                              const char *const *argv);
 /** Set one explicit guest variable after process start. The name must be
  * nonempty and contain no '='; an empty value is allowed. Does not read the
  * host environment. Currently supported only for Windows guests. */
-XXEMUL_API xxemul_status xxemul_set_guest_environment(
-    xxemul *emulator, const char *name, const char *value);
+XXEMUL_API xxemul_status xxemul_set_guest_environment(xxemul *emulator, const char *name, const char *value);
 /** Create a replacement emulator after a Linux memfd exec; caller owns both. */
-XXEMUL_API xxemul *xxemul_create_exec_successor(
-    xxemul *emulator, xxemul_status *status);
+XXEMUL_API xxemul *xxemul_create_exec_successor(xxemul *emulator, xxemul_status *status);
 XXEMUL_API int xxemul_process_exit_code(const xxemul *emulator);
 XXEMUL_API void xxemul_destroy(xxemul *emulator);
 
 /** Real-mode segment:offset to 20-bit physical address. */
 XXEMUL_API uint32_t xxemul_dos_linear(uint16_t segment, uint16_t offset);
-XXEMUL_API xxemul_status xxemul_dos_get_exit_code(
-    const xxemul *emulator, uint8_t *exit_code);
+XXEMUL_API xxemul_status xxemul_dos_get_exit_code(const xxemul *emulator, uint8_t *exit_code);
 /** Enqueue an ASCII key for INT 16h; scan code is returned in AH. */
-XXEMUL_API xxemul_status xxemul_dos_push_key(
-    xxemul *emulator, uint8_t ascii, uint8_t scan_code);
-XXEMUL_API xxemul_status xxemul_dos_set_output_callback(
-    xxemul *emulator, xxemul_dos_output_callback callback, void *context);
+XXEMUL_API xxemul_status xxemul_dos_push_key(xxemul *emulator, uint8_t ascii, uint8_t scan_code);
+XXEMUL_API xxemul_status xxemul_dos_set_output_callback(xxemul *emulator, xxemul_dos_output_callback callback, void *context);
 /** Render 0xAARRGGBB pixels into rows of stride_pixels uint32_t values. */
-XXEMUL_API xxemul_status xxemul_display_render(
-    xxemul *emulator, uint32_t *pixels, size_t stride_pixels);
+XXEMUL_API xxemul_status xxemul_display_render(xxemul *emulator, uint32_t *pixels, size_t stride_pixels);
 XXEMUL_API uint8_t xxemul_display_get_mode(const xxemul *emulator);
 
 XXEMUL_API xxemul_arch xxemul_get_arch(const xxemul *emulator);
@@ -203,43 +179,19 @@ XXEMUL_API xxemul_mode xxemul_get_mode(const xxemul *emulator);
 XXEMUL_API uint64_t xxemul_get_region_address(const xxemul *emulator);
 XXEMUL_API size_t xxemul_get_region_size(const xxemul *emulator);
 
-XXEMUL_API xxemul_status xxemul_read_memory(
-    xxemul *emulator,
-    uint64_t address,
-    void *buffer,
-    size_t size);
-XXEMUL_API xxemul_status xxemul_write_memory(
-    xxemul *emulator,
-    uint64_t address,
-    const void *buffer,
-    size_t size);
+XXEMUL_API xxemul_status xxemul_read_memory(xxemul *emulator, uint64_t address, void *buffer, size_t size);
+XXEMUL_API xxemul_status xxemul_write_memory(xxemul *emulator, uint64_t address, const void *buffer, size_t size);
 
-XXEMUL_API xxemul_status xxemul_get_x86_state(
-    const xxemul *emulator,
-    xxemul_x86_state *state);
-XXEMUL_API xxemul_status xxemul_set_x86_state(
-    xxemul *emulator,
-    const xxemul_x86_state *state);
-XXEMUL_API xxemul_status xxemul_get_arm_state(
-    const xxemul *emulator,
-    xxemul_arm_state *state);
-XXEMUL_API xxemul_status xxemul_set_arm_state(
-    xxemul *emulator,
-    const xxemul_arm_state *state);
+XXEMUL_API xxemul_status xxemul_get_x86_state(const xxemul *emulator, xxemul_x86_state *state);
+XXEMUL_API xxemul_status xxemul_set_x86_state(xxemul *emulator, const xxemul_x86_state *state);
+XXEMUL_API xxemul_status xxemul_get_arm_state(const xxemul *emulator, xxemul_arm_state *state);
+XXEMUL_API xxemul_status xxemul_set_arm_state(xxemul *emulator, const xxemul_arm_state *state);
 
-XXEMUL_API xxemul_status xxemul_step(
-    xxemul *emulator,
-    xxemul_step_info *info);
-XXEMUL_API xxemul_status xxemul_run(
-    xxemul *emulator,
-    uint64_t instruction_limit,
-    uint64_t *instructions_executed);
+XXEMUL_API xxemul_status xxemul_step(xxemul *emulator, xxemul_step_info *info);
+XXEMUL_API xxemul_status xxemul_run(xxemul *emulator, uint64_t instruction_limit, uint64_t *instructions_executed);
 
 /** Returns the required character count, excluding the terminating NUL. */
-XXEMUL_API size_t xxemul_format_current(
-    xxemul *emulator,
-    char *buffer,
-    size_t buffer_size);
+XXEMUL_API size_t xxemul_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
 
 XXEMUL_API const char *xxemul_status_string(xxemul_status status);
 
@@ -250,35 +202,26 @@ XXEMUL_API const char *xxemul_status_string(xxemul_status status);
 /** Guest stdout/stderr bytes from any platform layer (DOS, Windows, Linux).
  * stream is 1 for stdout and 2 for stderr. When set, it takes precedence over
  * the per-byte DOS output callback and over writing to the host streams. */
-typedef void (*xxemul_output_callback)(
-    void *context, int stream, const void *bytes, size_t size);
+typedef void (*xxemul_output_callback)(void *context, int stream, const void *bytes, size_t size);
 
 /** Observes guest data accesses made by xxemul_step (instruction fetches
  * and debugger-originated xxemul_read_memory/xxemul_write_memory calls are
  * not reported). is_write is nonzero for stores. */
-typedef void (*xxemul_memory_hook)(
-    void *context, uint64_t address, size_t size, int is_write);
+typedef void (*xxemul_memory_hook)(void *context, uint64_t address, size_t size, int is_write);
 
-XXEMUL_API xxemul_status xxemul_set_output_callback(
-    xxemul *emulator, xxemul_output_callback callback, void *context);
-XXEMUL_API xxemul_status xxemul_set_memory_hook(
-    xxemul *emulator, xxemul_memory_hook hook, void *context);
+XXEMUL_API xxemul_status xxemul_set_output_callback(xxemul *emulator, xxemul_output_callback callback, void *context);
+XXEMUL_API xxemul_status xxemul_set_memory_hook(xxemul *emulator, xxemul_memory_hook hook, void *context);
 /** When enabled, a guest INT3 (and INT 3 outside DOS) returns
  * XXEMUL_STATUS_BREAKPOINT instead of halting the emulator. */
-XXEMUL_API xxemul_status xxemul_set_debug_traps(
-    xxemul *emulator, int enabled);
+XXEMUL_API xxemul_status xxemul_set_debug_traps(xxemul *emulator, int enabled);
 /** Linear address of the next instruction (CS base applied in DOS modes). */
-XXEMUL_API xxemul_status xxemul_get_current_address(
-    const xxemul *emulator, uint64_t *address);
+XXEMUL_API xxemul_status xxemul_get_current_address(const xxemul *emulator, uint64_t *address);
 /** Linear address of segment:offset using the current segment state. */
-XXEMUL_API xxemul_status xxemul_x86_linear_address(
-    const xxemul *emulator, unsigned segment_index, uint64_t offset,
-    uint64_t *address);
+XXEMUL_API xxemul_status xxemul_x86_linear_address(const xxemul *emulator, unsigned segment_index, uint64_t offset, uint64_t *address);
 XXEMUL_API int xxemul_is_halted(const xxemul *emulator);
 /** Name of a synthetic OS entry point (for example a PE import thunk), or
  * NULL. The string is borrowed from the emulator. */
-XXEMUL_API const char *xxemul_symbol_name(
-    const xxemul *emulator, uint64_t address);
+XXEMUL_API const char *xxemul_symbol_name(const xxemul *emulator, uint64_t address);
 
 #ifdef __cplusplus
 }

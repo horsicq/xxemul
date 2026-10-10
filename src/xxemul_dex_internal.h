@@ -36,15 +36,15 @@ struct xxemul_dex_program {
 
 /* Internal append copies input bytes; on failure the program remains safe
  * to destroy (partially appended metadata must not be used). */
-xxemul_status xxemul_dex_append(xxemul_dex_program *program,
-    const void *data, size_t size, const char *name);
+xxemul_status xxemul_dex_append(xxemul_dex_program *program, const void *data, size_t size, const char *name);
 
-static inline uint16_t xxemul_dex_u16(const uint8_t *p) {
+static inline uint16_t xxemul_dex_u16(const uint8_t *p)
+{
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
-static inline uint32_t xxemul_dex_u32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+static inline uint32_t xxemul_dex_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 #endif
