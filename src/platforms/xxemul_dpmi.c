@@ -68,9 +68,31 @@ int xxemul_dpmi_prepare(xxemul *emulator)
     uint8_t *psp;
 
     if (emulator->dos_dpmi_prepared) return 1;
-    if (mcb[0] != 'Z' || dpmi_u16(mcb + 1u) != emulator->psp_segment) return 0;
+    if ((mcb[0] != 'M' && mcb[0] != 'Z') || dpmi_u16(mcb + 1u) != emulator->psp_segment) return 0;
     end = mcb_segment + 1u + dpmi_u16(mcb + 3u);
-    if (end > 0xa000u || end - emulator->psp_segment < 0x120u) return 0;
+    if (end > 0xa000u) return 0;
+    if (mcb[0] == 'M') {
+        uint32_t segment = end;
+
+        /* A normal DOS program shrinks its PSP block before probing DPMI.
+           In that case the following MCB chain already contains memory for
+           the one-paragraph host-private block advertised by INT 2F/1687. */
+        while (segment < 0xa000u) {
+            uint8_t *candidate = emulator->region_data + (segment << 4u);
+            uint16_t size = dpmi_u16(candidate + 3u);
+            uint32_t next = segment + 1u + size;
+
+            if ((candidate[0] != 'M' && candidate[0] != 'Z') || next > 0xa000u || next <= segment) return 0;
+            if (dpmi_u16(candidate + 1u) == 0u && size >= 1u) {
+                emulator->dos_dpmi_prepared = 1u;
+                return 1;
+            }
+            if (candidate[0] == 'Z') return 0;
+            segment = next;
+        }
+        return 0;
+    }
+    if (end - emulator->psp_segment < 0x120u) return 0;
     free_segment = end - 0x11u;
     free_mcb = emulator->region_data + (free_segment << 4u);
     free_mcb[0] = 'Z';

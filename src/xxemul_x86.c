@@ -1507,7 +1507,16 @@ static xxemul_status xxemul_x86_shift(xxemul *emulator, const cdisasm_x86_instru
     if (instruction->name_id == CDISASM_X86_NAME_ROL || instruction->name_id == CDISASM_X86_NAME_ROR) {
         count %= bits;
     }
-    if (count == 0u) return XXEMUL_STATUS_OK;
+    if (count == 0u) {
+        /* A 32-bit register destination still performs the architectural
+         * zero-extension into the full 64-bit register, even when the
+         * masked shift/rotate count is zero.  Flags remain unchanged. */
+        if (emulator->mode == XXEMUL_MODE_X86_64 && instruction->opcode[0].type == CDISASM_OPERAND_REGISTER &&
+            instruction->opcode[0].size == 4u) {
+            return xxemul_x86_write_operand(emulator, instruction, &instruction->opcode[0], next_ip, value & UINT32_MAX);
+        }
+        return XXEMUL_STATUS_OK;
+    }
 
     mask = xxemul_mask_for_size(instruction->opcode[0].size);
     sign = UINT64_C(1) << (bits - 1u);
@@ -1516,7 +1525,13 @@ static xxemul_status xxemul_x86_shift(xxemul *emulator, const cdisasm_x86_instru
     /* For RCL/RCR, count is modulo (bits+1) per x86 spec. */
     if (instruction->name_id == CDISASM_X86_NAME_RCL || instruction->name_id == CDISASM_X86_NAME_RCR) {
         count %= bits + 1u;
-        if (count == 0u) return XXEMUL_STATUS_OK;
+        if (count == 0u) {
+            if (emulator->mode == XXEMUL_MODE_X86_64 && instruction->opcode[0].type == CDISASM_OPERAND_REGISTER &&
+                instruction->opcode[0].size == 4u) {
+                return xxemul_x86_write_operand(emulator, instruction, &instruction->opcode[0], next_ip, value & UINT32_MAX);
+            }
+            return XXEMUL_STATUS_OK;
+        }
     }
     for (index = 0u; index < count; ++index) {
         switch (instruction->name_id) {
@@ -2566,7 +2581,6 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             }
             break;
         case CDISASM_X86_NAME_BSF:
-        case CDISASM_X86_NAME_TZCNT:
         case CDISASM_X86_NAME_BSR:
             if (instruction.operand_count != 2u || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER || instruction.opcode[0].size == 0u ||
                 instruction.opcode[0].size > 8u)
@@ -2589,6 +2603,47 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 }
                 status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, bit);
             }
+            break;
+        case CDISASM_X86_NAME_POPCNT:
+        case CDISASM_X86_NAME_LZCNT:
+        case CDISASM_X86_NAME_TZCNT:
+            if (instruction.operand_count != 2u || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER ||
+                (instruction.opcode[0].size != 2u && instruction.opcode[0].size != 4u && instruction.opcode[0].size != 8u) ||
+                instruction.opcode[1].size != instruction.opcode[0].size)
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            size = instruction.opcode[0].size;
+            status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[1], next_ip, &right);
+            if (status != XXEMUL_STATUS_OK) return status;
+            right &= xxemul_mask_for_size(size);
+            target = 0u;
+            if (instruction.name_id == CDISASM_X86_NAME_POPCNT) {
+                uint64_t value = right;
+                while (value != 0u) {
+                    target += value & 1u;
+                    value >>= 1u;
+                }
+            } else if (instruction.name_id == CDISASM_X86_NAME_LZCNT) {
+                unsigned bit;
+                unsigned bits = (unsigned)size * 8u;
+                for (bit = 0u; bit < bits && (right & (UINT64_C(1) << (bits - bit - 1u))) == 0u; ++bit) {
+                }
+                target = bit;
+            } else {
+                unsigned bit;
+                unsigned bits = (unsigned)size * 8u;
+                for (bit = 0u; bit < bits && (right & (UINT64_C(1) << bit)) == 0u; ++bit) {
+                }
+                target = bit;
+            }
+            emulator->x86.flags &= ~(XXEMUL_X86_FLAG_CF | XXEMUL_X86_FLAG_PF | XXEMUL_X86_FLAG_AF | XXEMUL_X86_FLAG_ZF | XXEMUL_X86_FLAG_SF |
+                                     XXEMUL_X86_FLAG_OF);
+            if (instruction.name_id == CDISASM_X86_NAME_POPCNT) {
+                if (right == 0u) emulator->x86.flags |= XXEMUL_X86_FLAG_ZF;
+            } else {
+                if (right == 0u) emulator->x86.flags |= XXEMUL_X86_FLAG_CF;
+                if (target == 0u) emulator->x86.flags |= XXEMUL_X86_FLAG_ZF;
+            }
+            status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, target);
             break;
         case CDISASM_X86_NAME_MOVD:
         case CDISASM_X86_NAME_MOVQ:
@@ -3379,7 +3434,10 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             if (status != XXEMUL_STATUS_OK) return status;
             status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, right);
             if (status != XXEMUL_STATUS_OK) return status;
-            status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[1], next_ip, left);
+            if (!(instruction.opcode[0].type == CDISASM_OPERAND_REGISTER && instruction.opcode[1].type == CDISASM_OPERAND_REGISTER &&
+                  instruction.opcode[0].reg == instruction.opcode[1].reg)) {
+                status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[1], next_ip, left);
+            }
             break;
         case CDISASM_X86_NAME_CMPXCHG:
             if (instruction.operand_count < 2u || instruction.opcode[0].size == 0u || instruction.opcode[0].size > 8u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
@@ -3413,11 +3471,17 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             if (status != XXEMUL_STATUS_OK) return status;
             target = (left + right) & xxemul_mask_for_size(size);
             xxemul_x86_set_add_flags(emulator, left, right, target, size);
-            status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[1], next_ip, left);
-            if (status != XXEMUL_STATUS_OK) return status;
+            /* The destination address is computed from the pre-instruction
+             * register state.  Write it before replacing the source register;
+             * the source may also be the destination's address register. */
             page_fault_error = UINT32_MAX;
             status = xxemul_x86_write_operand_tracked(emulator, &instruction, &instruction.opcode[0], next_ip, target, &page_fault_error);
             if (status != XXEMUL_STATUS_OK) status = xxemul_x86_dos_page_fault(emulator, status, page_fault_error, current_ip, &next_ip);
+            if (status != XXEMUL_STATUS_OK) break;
+            if (!(instruction.opcode[0].type == CDISASM_OPERAND_REGISTER && instruction.opcode[1].type == CDISASM_OPERAND_REGISTER &&
+                  instruction.opcode[0].reg == instruction.opcode[1].reg)) {
+                status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[1], next_ip, left);
+            }
             break;
         case CDISASM_X86_NAME_IMUL:
             if (instruction.operand_count == 1u) {
@@ -3621,6 +3685,21 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             }
             status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, right);
             break;
+        case CDISASM_X86_NAME_MOVBE:
+            if (instruction.operand_count != 2u || instruction.opcode[0].size != instruction.opcode[1].size ||
+                (instruction.opcode[0].size != 2u && instruction.opcode[0].size != 4u && instruction.opcode[0].size != 8u))
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            size = instruction.opcode[0].size;
+            status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[1], next_ip, &left);
+            if (status != XXEMUL_STATUS_OK) return status;
+            right = 0u;
+            while (size != 0u) {
+                right = (right << 8u) | (left & 0xffu);
+                left >>= 8u;
+                --size;
+            }
+            status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, right);
+            break;
         case CDISASM_X86_NAME_SHL:
         case CDISASM_X86_NAME_SHR:
         case CDISASM_X86_NAME_SAR:
@@ -3640,7 +3719,11 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             if (status != XXEMUL_STATUS_OK) return status;
             target &= size == 8u ? 63u : 31u;
             if (target == 0u) {
-                status = XXEMUL_STATUS_OK;
+                if (emulator->mode == XXEMUL_MODE_X86_64 && instruction.opcode[0].type == CDISASM_OPERAND_REGISTER && size == 4u) {
+                    status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, left & UINT32_MAX);
+                } else {
+                    status = XXEMUL_STATUS_OK;
+                }
                 break;
             }
             if (target > (uint64_t)size * 8u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
@@ -3665,6 +3748,34 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 xxemul_x86_set_szp_flags(emulator, result, size);
                 status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, result);
             }
+            break;
+        case CDISASM_X86_NAME_SARX:
+        case CDISASM_X86_NAME_SHLX:
+        case CDISASM_X86_NAME_SHRX:
+            if (instruction.operand_count != 3u || instruction.opcode[0].type != CDISASM_OPERAND_REGISTER ||
+                (instruction.opcode[0].size != 4u && instruction.opcode[0].size != 8u) || instruction.opcode[1].size != instruction.opcode[0].size)
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            size = instruction.opcode[0].size;
+            status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[1], next_ip, &right);
+            if (status != XXEMUL_STATUS_OK) return status;
+            status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[2], next_ip, &target);
+            if (status != XXEMUL_STATUS_OK) return status;
+            {
+                unsigned bits = (unsigned)size * 8u;
+                unsigned count = (unsigned)target & (bits == 64u ? 63u : 31u);
+                uint64_t mask = xxemul_mask_for_size(size);
+                uint64_t sign = UINT64_C(1) << (bits - 1u);
+                right &= mask;
+                if (instruction.name_id == CDISASM_X86_NAME_SHLX) {
+                    left = (right << count) & mask;
+                } else if (instruction.name_id == CDISASM_X86_NAME_SHRX) {
+                    left = right >> count;
+                } else {
+                    left = right >> count;
+                    if (count != 0u && (right & sign) != 0u) left |= (~UINT64_C(0) << (bits - count)) & mask;
+                }
+            }
+            status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, left);
             break;
         case CDISASM_X86_NAME_NEG:
         case CDISASM_X86_NAME_NOT:

@@ -333,6 +333,13 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
     endif()
 endif()
 
+# Local-only Radare2 corpus. Release source packages may omit private_tests,
+# and embedded consumers should opt in explicitly from their integration tree.
+if(PROJECT_IS_TOP_LEVEL AND BUILD_TESTING AND
+   IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/private_tests")
+    add_subdirectory(private_tests)
+endif()
+
 install(TARGETS xxemul
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

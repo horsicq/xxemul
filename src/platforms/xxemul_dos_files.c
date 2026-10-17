@@ -480,6 +480,8 @@ static void dos_sft_update(xxemul *emulator, const dos_session *session, uint16_
     dos_file_metadata metadata;
     const char *name;
     const char *dot;
+    int have_metadata;
+    int64_t live_size;
     int64_t position;
     size_t index;
 
@@ -502,10 +504,20 @@ static void dos_sft_update(xxemul *emulator, const dos_session *session, uint16_
     xxemul_dos_write_word(entry + 2u, file->access);
     xxemul_dos_write_word(entry + 5u, 2u);
     xxemul_dos_write_word(entry + 0x31u, emulator->psp_segment);
-    if (dos_host_metadata(file->host_path, &metadata)) {
+    have_metadata = dos_host_metadata(file->host_path, &metadata);
+    if (have_metadata) {
         entry[4u] = (uint8_t)metadata.attributes;
         xxemul_dos_write_word(entry + 0x0du, metadata.time);
         xxemul_dos_write_word(entry + 0x0fu, metadata.date);
+    }
+    /* The path metadata can lag writes buffered by an open FILE stream.  The
+       SFT describes the live handle, so prefer its size while it is open. */
+    live_size = xx_io_total_size(file->device);
+    if (live_size >= 0 && live_size <= UINT32_MAX) {
+        metadata.size = (uint32_t)live_size;
+        have_metadata = 1;
+    }
+    if (have_metadata) {
         xxemul_dos_write_word(entry + 0x11u, (uint16_t)metadata.size);
         xxemul_dos_write_word(entry + 0x13u, (uint16_t)(metadata.size >> 16u));
     }
