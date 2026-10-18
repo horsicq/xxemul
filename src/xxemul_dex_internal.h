@@ -2,7 +2,7 @@
 #define XXEMUL_DEX_INTERNAL_H
 
 #include "xxemul/xxemul_dex.h"
-#include <xxfclib/formats/dex/xx_dex.h>
+#include <xxfclib/formats/executable/dex/xx_dex.h>
 
 typedef struct xxemul_dex_file {
     xxemul_dex_file_info info;

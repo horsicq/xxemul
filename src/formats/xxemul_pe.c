@@ -1,6 +1,6 @@
 #include "xxemul_internal.h"
 
-#include <xxfclib/formats/pe/xx_pe.h>
+#include <xxfclib/formats/executable/pe/xx_pe.h>
 
 static int xxemul_pe_machine_mode(uint16_t machine, xxemul_image_format format, uint64_t *entry, xxemul_arch *arch, xxemul_mode *mode)
 {

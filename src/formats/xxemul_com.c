@@ -1,6 +1,6 @@
 #include "xxemul_internal.h"
 
-#include <xxfclib/formats/com/xx_com.h>
+#include <xxfclib/formats/executable/com/xx_com.h>
 
 int xxemul_load_com(xxemul *emulator, const uint8_t *image, size_t image_size, xx_io_device *io)
 {

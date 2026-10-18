@@ -1,7 +1,7 @@
 #include "../xxemul_dotnet_internal.h"
 
-#include <xxfclib/formats/dotnet/xx_dotnet_inspect.h>
-#include <xxfclib/formats/dotnet/xx_dotnet_reader.h>
+#include <xxfclib/formats/executable/dotnet/xx_dotnet_inspect.h>
+#include <xxfclib/formats/executable/dotnet/xx_dotnet_reader.h>
 #include <xxfclib/io/xx_io.h>
 #include <xxfclib/memory/xx_memory.h>
 #include <xxbyte/xxbyte_dotnet.h>

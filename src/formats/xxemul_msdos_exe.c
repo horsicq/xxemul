@@ -1,6 +1,6 @@
 #include "xxemul_internal.h"
 
-#include <xxfclib/formats/msdos/xx_msdos.h>
+#include <xxfclib/formats/executable/msdos/xx_msdos.h>
 
 #define XXEMUL_DOS_CONVENTIONAL_END 0xa0000u
 #define XXEMUL_DOS_CONVENTIONAL_END_SEGMENT 0xa000u

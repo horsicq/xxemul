@@ -1,6 +1,6 @@
 #include "xxemul_internal.h"
 
-#include <xxfclib/formats/elf/xx_elf.h>
+#include <xxfclib/formats/executable/elf/xx_elf.h>
 #include "xxemul/xxemul_elf.h"
 
 #include <limits.h>

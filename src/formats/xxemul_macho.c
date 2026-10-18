@@ -1,6 +1,6 @@
 #include "xxemul_internal.h"
 
-#include <xxfclib/formats/macho/xx_macho.h>
+#include <xxfclib/formats/executable/macho/xx_macho.h>
 
 #include <string.h>
 

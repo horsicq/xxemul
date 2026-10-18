@@ -1,6 +1,6 @@
 #include "../xxemul_dex_internal.h"
 
-#include <xxfclib/formats/apk/xx_apk.h>
+#include <xxfclib/formats/installer/apk/xx_apk.h>
 #include <xxfclib/io/xx_io.h>
 #include <xxfclib/memory/xx_memory.h>
 
