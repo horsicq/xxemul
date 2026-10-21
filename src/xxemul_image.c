@@ -4,7 +4,10 @@
 
 #define XXEMUL_IMAGE_STACK_SIZE (1024u * 1024u)
 #define XXEMUL_PE_ARENA_SIZE (32u * 1024u * 1024u)
-#define XXEMUL_IMAGE_MAX_REGION_SIZE (128u * 1024u * 1024u)
+/* Mapped memory includes runtime arenas and stack as well as file segments.
+ * Packed Darwin ARM64 reserves 16 + 128 + 32 + 1 MiB; retain a separate,
+ * smaller file-input bound so the runtime budget cannot enlarge file reads. */
+#define XXEMUL_IMAGE_MAX_REGION_SIZE (256u * 1024u * 1024u)
 #define XXEMUL_IMAGE_MAX_FILE_SIZE (128u * 1024u * 1024u)
 
 xxemul *xxemul_image_allocate(xxemul_arch arch, xxemul_mode mode, uint64_t base, uint64_t image_span, uint64_t entry, int unix_stack, xxemul_status *status)

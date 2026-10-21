@@ -1,4 +1,6 @@
 #include "xxemul_internal.h"
+#include "xxemul_arm_auth.h"
+#include "platforms/xxemul_darwin.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -272,6 +274,61 @@ static xxemul_status xxemul_arm_read_operand(xxemul *emulator, const cdisasm_arm
     return XXEMUL_STATUS_OK;
 }
 
+static xxemul_status xxemul_arm_read_data_operand(xxemul *emulator, const cdisasm_arm_instruction *instruction,
+                                                   unsigned index, uint64_t current_pc, uint64_t *value,
+                                                   int *carry_valid, int *carry)
+{
+    const cdisasm_arm_operand *operand;
+    cdisasm_arm_shift_type shift_type;
+    uint8_t amount;
+    uint8_t size;
+    xxemul_status status;
+
+    if (carry_valid != NULL) *carry_valid = 0;
+    if (carry != NULL) *carry = 0;
+    if (index >= instruction->operand_count) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    operand = &instruction->operand[index];
+    if (operand->type != CDISASM_OPERAND_REGISTER || operand->extend_type != CDISASM_ARM_EXTEND_NONE) {
+        status = xxemul_arm_read_operand(emulator, operand, current_pc, value);
+        if (status == XXEMUL_STATUS_OK && emulator->mode == XXEMUL_MODE_ARM_A32 &&
+            operand->type == CDISASM_OPERAND_IMMEDIATE && operand->shift_type == CDISASM_ARM_SHIFT_ROR &&
+            operand->shift_amount != 0u) {
+            /* The immediate is already rotated by the decoder. */
+            if (carry_valid != NULL) *carry_valid = 1;
+            if (carry != NULL) *carry = (int)((*value >> 31u) & UINT64_C(1));
+        }
+        return status;
+    }
+    status = xxemul_arm_read_register(emulator, operand->reg, current_pc, value, &size);
+    if (status != XXEMUL_STATUS_OK) return status;
+    if (operand->size != 0u) size = operand->size;
+    if (size == 0u || size > 8u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    shift_type = operand->shift_type;
+    amount = operand->shift_amount;
+    if (emulator->mode == XXEMUL_MODE_ARM_A32 && index + 2u == instruction->operand_count) {
+        const cdisasm_arm_operand *shift = &instruction->operand[index + 1u];
+        if (shift->type == CDISASM_OPERAND_REGISTER && shift->shift_type >= CDISASM_ARM_SHIFT_LSL &&
+            shift->shift_type <= CDISASM_ARM_SHIFT_ROR) {
+            uint64_t count;
+            status = xxemul_arm_read_register(emulator, shift->reg, current_pc, &count, NULL);
+            if (status != XXEMUL_STATUS_OK) return status;
+            shift_type = shift->shift_type;
+            amount = (uint8_t)count;
+        }
+    }
+    *value = xxemul_arm_apply_shift_with_carry(emulator, *value, size, shift_type, amount, carry_valid, carry);
+    return XXEMUL_STATUS_OK;
+}
+
+static int xxemul_arm_literal_operand(const xxemul *emulator, const cdisasm_arm_instruction *instruction,
+                                      const cdisasm_arm_operand *operand)
+{
+    return emulator->mode == XXEMUL_MODE_ARM_A64 && instruction->operand_count == 2u &&
+        operand == &instruction->operand[1] && operand->type == CDISASM_OPERAND_IMMEDIATE &&
+        (operand->flags & CDISASM_OPERAND_FLAG_PC_RELATIVE) != 0u &&
+        (instruction->name_id == CDISASM_ARM_NAME_LDR || instruction->name_id == CDISASM_ARM_NAME_LDRSW);
+}
+
 static xxemul_status xxemul_arm_memory_address(xxemul *emulator, const cdisasm_arm_instruction *instruction, const cdisasm_arm_operand *operand, uint64_t current_pc,
                                                uint64_t *address, uint64_t *writeback, int *has_writeback)
 {
@@ -281,12 +338,19 @@ static xxemul_status xxemul_arm_memory_address(xxemul *emulator, const cdisasm_a
     uint8_t index_size = 0u;
     xxemul_status status;
 
-    if (operand == NULL || address == NULL || operand->type != CDISASM_OPERAND_MEMORY) {
+    if (operand == NULL || address == NULL) {
         return XXEMUL_STATUS_INVALID_ARGUMENT;
     }
     if (has_writeback != NULL) {
         *has_writeback = 0;
     }
+    if (xxemul_arm_literal_operand(emulator, instruction, operand)) {
+        /* The decoder's semantic immediate is already the absolute target;
+         * its address field preserves the encoded signed displacement. */
+        *address = operand->imm;
+        return XXEMUL_STATUS_OK;
+    }
+    if (operand->type != CDISASM_OPERAND_MEMORY) return XXEMUL_STATUS_INVALID_ARGUMENT;
     if ((operand->flags & CDISASM_OPERAND_FLAG_HAS_ADDRESS) != 0u) {
         *address = operand->address & xxemul_arm_address_mask(emulator);
         return XXEMUL_STATUS_OK;
@@ -440,40 +504,18 @@ static xxemul_status xxemul_arm_decode_current(xxemul *emulator, cdisasm_arm_ins
         return status;
     }
     decoded_size = cdisasm_arm_decode(CDISASM_ARM_CPU_ANY, xxemul_arm_cdisasm_mode(emulator), code, available, emulator->arm.pc, NULL, instruction);
-    if (decoded_size == 0u && emulator->mode == XXEMUL_MODE_ARM_A32 && available >= 4u) {
-        uint32_t word = (uint32_t)code[0] | ((uint32_t)code[1] << 8u) | ((uint32_t)code[2] << 16u) | ((uint32_t)code[3] << 24u);
-        unsigned rn = (word >> 16u) & 15u;
-        unsigned rt = (word >> 12u) & 15u;
-        unsigned rm = word & 15u;
-        /* Radare models the deprecated register-offset LDRD with PC as its
-         * base. ARM marks that base combination invalid, so keep this
-         * compatibility decode local to the emulator. */
-        if ((word & UINT32_C(0x0e0000f0)) == UINT32_C(0x000000d0) &&
-            (word & UINT32_C(0x00500000)) == 0u && (word & UINT32_C(0x01000000)) != 0u &&
-            rn == 15u && rm != 15u && (rt & 1u) == 0u && rt < 14u && (word >> 28u) != 15u) {
-            memset(instruction, 0, sizeof(*instruction));
-            instruction->address = emulator->arm.pc;
-            instruction->raw_instruction = word;
-            instruction->opcode_size = 4u;
-            instruction->name_id = CDISASM_ARM_NAME_LDRD;
-            instruction->condition = (cdisasm_arm_condition)(word >> 28u);
-            instruction->operand_count = 3u;
-            instruction->operand[0].type = CDISASM_OPERAND_REGISTER;
-            instruction->operand[0].reg = (cdisasm_arm_reg_id)(CDISASM_ARM_REG_R0 + rt);
-            instruction->operand[0].size = 4u;
-            instruction->operand[0].access = CDISASM_OPERAND_ACCESS_WRITE;
-            instruction->operand[1] = instruction->operand[0];
-            instruction->operand[1].reg = (cdisasm_arm_reg_id)(instruction->operand[0].reg + 1u);
-            instruction->operand[2].type = CDISASM_OPERAND_MEMORY;
-            instruction->operand[2].base_reg = CDISASM_ARM_REG_R15;
-            instruction->operand[2].index_reg = (cdisasm_arm_reg_id)(CDISASM_ARM_REG_R0 + rm);
-            instruction->operand[2].size = 8u;
-            instruction->operand[2].access = CDISASM_OPERAND_ACCESS_READ;
-            if ((word & UINT32_C(0x00800000)) == 0u) instruction->operand[2].flags = CDISASM_OPERAND_FLAG_SIGNED;
-            decoded_size = 4u;
-        }
-    }
     return decoded_size == 0u ? XXEMUL_STATUS_DECODE_ERROR : XXEMUL_STATUS_OK;
+}
+
+static void xxemul_arm_set_logic_flags(xxemul *emulator, uint64_t value, uint8_t size, int carry_valid, int carry)
+{
+    if (emulator->mode == XXEMUL_MODE_ARM_A64) {
+        emulator->arm.pstate &= ~(XXEMUL_ARM_FLAG_C | XXEMUL_ARM_FLAG_V);
+    } else if (carry_valid) {
+        emulator->arm.pstate &= ~XXEMUL_ARM_FLAG_C;
+        if (carry) emulator->arm.pstate |= XXEMUL_ARM_FLAG_C;
+    }
+    xxemul_arm_set_nz(emulator, value, size);
 }
 
 static xxemul_status xxemul_arm_binary(xxemul *emulator, const cdisasm_arm_instruction *instruction, uint64_t current_pc)
@@ -486,6 +528,8 @@ static xxemul_status xxemul_arm_binary(xxemul *emulator, const cdisasm_arm_instr
     uint8_t size;
     uint8_t source_index;
     int set_flags;
+    int shift_carry_valid;
+    int shift_carry;
     xxemul_status status;
 
     if (instruction->operand_count < 2u) {
@@ -504,21 +548,9 @@ static xxemul_status xxemul_arm_binary(xxemul *emulator, const cdisasm_arm_instr
     if (status != XXEMUL_STATUS_OK) {
         return status;
     }
-    status = xxemul_arm_read_operand(emulator, &instruction->operand[source_index + 1u], current_pc, &right);
+    status = xxemul_arm_read_data_operand(emulator, instruction, source_index + 1u, current_pc, &right, &shift_carry_valid, &shift_carry);
     if (status != XXEMUL_STATUS_OK) {
         return status;
-    }
-    /* A32 data-processing encodings with a register-controlled shift expose
-     * the shift register as a fourth operand.  The shift kind remains in the
-     * instruction word because the public operand record has no second
-     * register slot. */
-    if (emulator->mode == XXEMUL_MODE_ARM_A32 && instruction->operand_count > source_index + 2u &&
-        instruction->operand[source_index + 2u].type == CDISASM_OPERAND_REGISTER) {
-        uint64_t amount;
-        cdisasm_arm_shift_type shift_type = (cdisasm_arm_shift_type)(CDISASM_ARM_SHIFT_LSL + ((instruction->raw_instruction >> 5u) & 3u));
-        status = xxemul_arm_read_operand(emulator, &instruction->operand[source_index + 2u], current_pc, &amount);
-        if (status != XXEMUL_STATUS_OK) return status;
-        right = xxemul_arm_apply_shift(emulator, right, size, shift_type, (uint8_t)amount);
     }
     mask = xxemul_mask_for_size(size);
     set_flags = (instruction->instruction_flags & CDISASM_ARM_INSTRUCTION_FLAG_SETS_FLAGS) != 0u;
@@ -547,8 +579,7 @@ static xxemul_status xxemul_arm_binary(xxemul *emulator, const cdisasm_arm_instr
             result = (left & right) & mask;
             status = xxemul_arm_write_register(emulator, destination->reg, result);
             if (status == XXEMUL_STATUS_OK && (set_flags || instruction->name_id == CDISASM_ARM_NAME_ANDS)) {
-                emulator->arm.pstate &= ~(XXEMUL_ARM_FLAG_C | XXEMUL_ARM_FLAG_V);
-                xxemul_arm_set_nz(emulator, result, size);
+                xxemul_arm_set_logic_flags(emulator, result, size, shift_carry_valid, shift_carry);
             }
             return status;
         case CDISASM_ARM_NAME_ORR:
@@ -556,8 +587,7 @@ static xxemul_status xxemul_arm_binary(xxemul *emulator, const cdisasm_arm_instr
             result = (left | right) & mask;
             status = xxemul_arm_write_register(emulator, destination->reg, result);
             if (status == XXEMUL_STATUS_OK && (set_flags || instruction->name_id == CDISASM_ARM_NAME_ORRS)) {
-                emulator->arm.pstate &= ~(XXEMUL_ARM_FLAG_C | XXEMUL_ARM_FLAG_V);
-                xxemul_arm_set_nz(emulator, result, size);
+                xxemul_arm_set_logic_flags(emulator, result, size, shift_carry_valid, shift_carry);
             }
             return status;
         case CDISASM_ARM_NAME_EOR:
@@ -565,8 +595,7 @@ static xxemul_status xxemul_arm_binary(xxemul *emulator, const cdisasm_arm_instr
             result = (left ^ right) & mask;
             status = xxemul_arm_write_register(emulator, destination->reg, result);
             if (status == XXEMUL_STATUS_OK && (set_flags || instruction->name_id == CDISASM_ARM_NAME_EORS)) {
-                emulator->arm.pstate &= ~(XXEMUL_ARM_FLAG_C | XXEMUL_ARM_FLAG_V);
-                xxemul_arm_set_nz(emulator, result, size);
+                xxemul_arm_set_logic_flags(emulator, result, size, shift_carry_valid, shift_carry);
             }
             return status;
         case CDISASM_ARM_NAME_EON:
@@ -577,8 +606,7 @@ static xxemul_status xxemul_arm_binary(xxemul *emulator, const cdisasm_arm_instr
             result = (left & (~right & mask)) & mask;
             status = xxemul_arm_write_register(emulator, destination->reg, result);
             if (status == XXEMUL_STATUS_OK && (set_flags || instruction->name_id == CDISASM_ARM_NAME_BICS)) {
-                emulator->arm.pstate &= ~(XXEMUL_ARM_FLAG_C | XXEMUL_ARM_FLAG_V);
-                xxemul_arm_set_nz(emulator, result, size);
+                xxemul_arm_set_logic_flags(emulator, result, size, shift_carry_valid, shift_carry);
             }
             return status;
         case CDISASM_ARM_NAME_ORN:
@@ -586,8 +614,7 @@ static xxemul_status xxemul_arm_binary(xxemul *emulator, const cdisasm_arm_instr
             result = (left | (~right & mask)) & mask;
             status = xxemul_arm_write_register(emulator, destination->reg, result);
             if (status == XXEMUL_STATUS_OK && (set_flags || instruction->name_id == CDISASM_ARM_NAME_ORNS)) {
-                emulator->arm.pstate &= ~(XXEMUL_ARM_FLAG_C | XXEMUL_ARM_FLAG_V);
-                xxemul_arm_set_nz(emulator, result, size);
+                xxemul_arm_set_logic_flags(emulator, result, size, shift_carry_valid, shift_carry);
             }
             return status;
         default: return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
@@ -600,6 +627,8 @@ static xxemul_status xxemul_arm_compare(xxemul *emulator, const cdisasm_arm_inst
     uint64_t right;
     uint64_t result;
     uint8_t size;
+    int shift_carry_valid;
+    int shift_carry;
     xxemul_status status;
 
     if (instruction->operand_count < 2u) {
@@ -609,7 +638,7 @@ static xxemul_status xxemul_arm_compare(xxemul *emulator, const cdisasm_arm_inst
     if (status != XXEMUL_STATUS_OK) {
         return status;
     }
-    status = xxemul_arm_read_operand(emulator, &instruction->operand[1], current_pc, &right);
+    status = xxemul_arm_read_data_operand(emulator, instruction, 1u, current_pc, &right, &shift_carry_valid, &shift_carry);
     if (status != XXEMUL_STATUS_OK) {
         return status;
     }
@@ -625,8 +654,7 @@ static xxemul_status xxemul_arm_compare(xxemul *emulator, const cdisasm_arm_inst
         xxemul_arm_set_add_flags(emulator, left, right, result, size);
     } else {
         result = (left & right) & xxemul_mask_for_size(size);
-        emulator->arm.pstate &= ~(XXEMUL_ARM_FLAG_C | XXEMUL_ARM_FLAG_V);
-        xxemul_arm_set_nz(emulator, result, size);
+        xxemul_arm_set_logic_flags(emulator, result, size, shift_carry_valid, shift_carry);
     }
     return XXEMUL_STATUS_OK;
 }
@@ -656,17 +684,17 @@ static xxemul_status xxemul_arm_add_with_carry(xxemul *emulator, const cdisasm_a
     }
     if (instruction->name_id == CDISASM_ARM_NAME_NGC || instruction->name_id == CDISASM_ARM_NAME_NGCS) {
         left = UINT64_C(0);
-        status = xxemul_arm_read_operand(emulator, &instruction->operand[1], current_pc, &right);
+        status = xxemul_arm_read_data_operand(emulator, instruction, 1u, current_pc, &right, NULL, NULL);
         if (status != XXEMUL_STATUS_OK) return status;
     } else if (instruction->operand_count == 2u) {
         status = xxemul_arm_read_operand(emulator, &instruction->operand[0], current_pc, &left);
         if (status != XXEMUL_STATUS_OK) return status;
-        status = xxemul_arm_read_operand(emulator, &instruction->operand[1], current_pc, &right);
+        status = xxemul_arm_read_data_operand(emulator, instruction, 1u, current_pc, &right, NULL, NULL);
         if (status != XXEMUL_STATUS_OK) return status;
     } else {
         status = xxemul_arm_read_operand(emulator, &instruction->operand[1], current_pc, &left);
         if (status != XXEMUL_STATUS_OK) return status;
-        status = xxemul_arm_read_operand(emulator, &instruction->operand[2], current_pc, &right);
+        status = xxemul_arm_read_data_operand(emulator, instruction, 2u, current_pc, &right, NULL, NULL);
         if (status != XXEMUL_STATUS_OK) return status;
     }
     if (reverse_subtract) {
@@ -798,6 +826,7 @@ static xxemul_status xxemul_arm_bitfield(xxemul *emulator, const cdisasm_arm_ins
     uint64_t lsb;
     uint64_t width;
     uint8_t size;
+    unsigned bits;
     xxemul_status status;
 
     if (instruction->operand_count < 3u || instruction->operand[0].type != CDISASM_OPERAND_REGISTER) {
@@ -805,65 +834,85 @@ static xxemul_status xxemul_arm_bitfield(xxemul *emulator, const cdisasm_arm_ins
     }
     size = instruction->operand[0].size == 0u ? (emulator->mode == XXEMUL_MODE_ARM_A64 ? 8u : 4u) : instruction->operand[0].size;
     if (size == 0u || size > 8u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    bits = (unsigned)size * 8u;
 
     if (instruction->name_id == CDISASM_ARM_NAME_BFC) {
+        if (instruction->operand_count != 3u || instruction->operand[1].type != CDISASM_OPERAND_IMMEDIATE ||
+            instruction->operand[2].type != CDISASM_OPERAND_IMMEDIATE) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         status = xxemul_arm_read_operand(emulator, &instruction->operand[0], current_pc, &destination);
         lsb = instruction->operand[1].imm;
         width = instruction->operand[2].imm;
     } else {
-        if (instruction->operand_count < 4u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        if (instruction->operand_count != 4u || instruction->operand[1].type != CDISASM_OPERAND_REGISTER ||
+            instruction->operand[2].type != CDISASM_OPERAND_IMMEDIATE || instruction->operand[3].type != CDISASM_OPERAND_IMMEDIATE)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         status = xxemul_arm_read_operand(emulator, &instruction->operand[1], current_pc, &source);
         lsb = instruction->operand[2].imm;
         width = instruction->operand[3].imm;
-        /* A64 UBFX/SBFX are aliases of UBFM/SBFM and cdisasm retains the
-         * inclusive high bit in the last operand. */
-        if (emulator->mode == XXEMUL_MODE_ARM_A64 &&
-            (instruction->name_id == CDISASM_ARM_NAME_UBFX || instruction->name_id == CDISASM_ARM_NAME_SBFX ||
-             instruction->name_id == CDISASM_ARM_NAME_UBFM || instruction->name_id == CDISASM_ARM_NAME_SBFM)) {
-            ++width;
-        }
     }
     if (status != XXEMUL_STATUS_OK) return status;
-    if (instruction->name_id == CDISASM_ARM_NAME_BFM) {
+    if (instruction->name_id == CDISASM_ARM_NAME_BFM || instruction->name_id == CDISASM_ARM_NAME_UBFM ||
+        instruction->name_id == CDISASM_ARM_NAME_SBFM) {
         uint64_t immr = lsb;
         uint64_t imms = width;
-        uint64_t bits = (uint64_t)size * 8u;
+        uint64_t result_width;
 
-        if (immr >= bits || imms >= bits) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        status = xxemul_arm_read_operand(emulator, &instruction->operand[0], current_pc, &destination);
-        if (status != XXEMUL_STATUS_OK) return status;
+        /* Canonical A64 bitfields expose immr/imms. Aliases below expose
+         * lsb/width instead; the two schemas must not be interchanged. */
+        if (emulator->mode != XXEMUL_MODE_ARM_A64 || (size != 4u && size != 8u) || immr >= bits || imms >= bits)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         if (imms >= immr) {
             width = imms - immr + UINT64_C(1);
             field_mask = width == 64u ? UINT64_MAX : (UINT64_C(1) << width) - UINT64_C(1);
-            result = (destination & ~field_mask) | ((source >> immr) & field_mask);
+            result = (source >> immr) & field_mask;
+            result_width = width;
         } else {
             width = imms + UINT64_C(1);
             lsb = bits - immr;
             field_mask = ((UINT64_C(1) << width) - UINT64_C(1)) << lsb;
-            result = (destination & ~field_mask) | ((source << lsb) & field_mask);
+            result = (source << lsb) & field_mask;
+            result_width = lsb + width;
+        }
+        if (instruction->name_id == CDISASM_ARM_NAME_BFM) {
+            status = xxemul_arm_read_operand(emulator, &instruction->operand[0], current_pc, &destination);
+            if (status != XXEMUL_STATUS_OK) return status;
+            result |= destination & ~field_mask;
+        } else if (instruction->name_id == CDISASM_ARM_NAME_SBFM && result_width < 64u &&
+                   (source & (UINT64_C(1) << imms)) != 0u) {
+            result |= UINT64_MAX << result_width;
         }
         return xxemul_arm_write_register(emulator, instruction->operand[0].reg, result & xxemul_mask_for_size(size));
     }
-    if (lsb >= (uint64_t)size * 8u || width == 0u || width > (uint64_t)size * 8u - lsb) {
+    if (lsb >= bits || width == 0u || width > bits - lsb) {
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
     field_mask = width == 64u ? UINT64_MAX : (UINT64_C(1) << width) - UINT64_C(1);
-    if (instruction->name_id == CDISASM_ARM_NAME_UBFX || instruction->name_id == CDISASM_ARM_NAME_SBFX ||
-        instruction->name_id == CDISASM_ARM_NAME_UBFM || instruction->name_id == CDISASM_ARM_NAME_SBFM) {
+    if (instruction->name_id == CDISASM_ARM_NAME_UBFX || instruction->name_id == CDISASM_ARM_NAME_SBFX) {
         result = (source >> lsb) & field_mask;
-        if ((instruction->name_id == CDISASM_ARM_NAME_SBFX || instruction->name_id == CDISASM_ARM_NAME_SBFM) &&
-            width < 64u && (result & (UINT64_C(1) << (width - 1u))) != 0u) {
+        if (instruction->name_id == CDISASM_ARM_NAME_SBFX && width < 64u && (result & (UINT64_C(1) << (width - 1u))) != 0u) {
             result |= ~field_mask;
+        }
+    } else if (instruction->name_id == CDISASM_ARM_NAME_UBFIZ || instruction->name_id == CDISASM_ARM_NAME_SBFIZ) {
+        result = (source & field_mask) << lsb;
+        if (instruction->name_id == CDISASM_ARM_NAME_SBFIZ && lsb + width < 64u &&
+            (source & (UINT64_C(1) << (width - 1u))) != 0u) {
+            result |= UINT64_MAX << (lsb + width);
         }
     } else {
         if (instruction->name_id != CDISASM_ARM_NAME_BFC) {
             status = xxemul_arm_read_operand(emulator, &instruction->operand[0], current_pc, &destination);
             if (status != XXEMUL_STATUS_OK) return status;
         }
-        field_mask <<= lsb;
-        result = instruction->name_id == CDISASM_ARM_NAME_BFC
-                     ? destination & ~field_mask
-                     : (destination & ~field_mask) | ((source << lsb) & field_mask);
+        if (instruction->name_id == CDISASM_ARM_NAME_BFXIL) {
+            result = (destination & ~field_mask) | ((source >> lsb) & field_mask);
+        } else if (instruction->name_id == CDISASM_ARM_NAME_BFC || instruction->name_id == CDISASM_ARM_NAME_BFI) {
+            field_mask <<= lsb;
+            result = instruction->name_id == CDISASM_ARM_NAME_BFC
+                         ? destination & ~field_mask
+                         : (destination & ~field_mask) | ((source << lsb) & field_mask);
+        } else {
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        }
     }
     return xxemul_arm_write_register(emulator, instruction->operand[0].reg, result & xxemul_mask_for_size(size));
 }
@@ -890,7 +939,16 @@ static xxemul_status xxemul_arm_reverse(xxemul *emulator, const cdisasm_arm_inst
     size = instruction->operand[0].size == 0u ? (emulator->mode == XXEMUL_MODE_ARM_A64 ? 8u : 4u) : instruction->operand[0].size;
     status = xxemul_arm_read_operand(emulator, &instruction->operand[1], current_pc, &value);
     if (status != XXEMUL_STATUS_OK) return status;
-    if (instruction->name_id == CDISASM_ARM_NAME_REV) {
+    if (instruction->name_id == CDISASM_ARM_NAME_RBIT) {
+        if ((size != 4u && size != 8u) || instruction->operand_count != 2u ||
+            instruction->operand[0].type != CDISASM_OPERAND_REGISTER ||
+            instruction->operand[1].type != CDISASM_OPERAND_REGISTER ||
+            instruction->operand[1].size != size) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        for (index = 0u; index < (unsigned)size * 8u; ++index) {
+            result = (result << 1u) | (value & UINT64_C(1));
+            value >>= 1u;
+        }
+    } else if (instruction->name_id == CDISASM_ARM_NAME_REV) {
         result = xxemul_arm_reverse_bytes(value, size);
     } else if (instruction->name_id == CDISASM_ARM_NAME_REV16) {
         for (index = 0u; index < size; index += 2u) {
@@ -986,6 +1044,9 @@ static xxemul_status xxemul_arm_shift_instruction(xxemul *emulator, const cdisas
     if (status != XXEMUL_STATUS_OK) return status;
     status = xxemul_arm_read_operand(emulator, &instruction->operand[amount_index], current_pc, &amount);
     if (status != XXEMUL_STATUS_OK) return status;
+    if (emulator->mode == XXEMUL_MODE_ARM_A64 && instruction->operand[amount_index].type == CDISASM_OPERAND_REGISTER) {
+        amount &= (uint64_t)size * 8u - 1u;
+    }
     switch (instruction->name_id) {
         case CDISASM_ARM_NAME_LSL:
         case CDISASM_ARM_NAME_LSLS: type = CDISASM_ARM_SHIFT_LSL; break;
@@ -1024,6 +1085,47 @@ static xxemul_status xxemul_arm_count_leading_zeros(xxemul *emulator, const cdis
     value &= xxemul_mask_for_size(size);
     while (count < bits && (value & (UINT64_C(1) << (bits - count - 1u))) == 0u) ++count;
     return xxemul_arm_write_register(emulator, instruction->operand[0].reg, count);
+}
+
+static xxemul_status xxemul_arm_crc32(xxemul *emulator, const cdisasm_arm_instruction *instruction, uint64_t current_pc)
+{
+    uint64_t accumulator, data;
+    uint32_t crc, polynomial = UINT32_C(0xedb88320);
+    unsigned width, byte, bit;
+    xxemul_status status;
+
+    /* cdisasm carries the consumed byte width independently of the W/X
+     * register width. CRC32B/H use only the low byte/halfword of Wm. */
+    switch (instruction->name_id) {
+        case CDISASM_ARM_NAME_CRC32B: width = 1u; break;
+        case CDISASM_ARM_NAME_CRC32H: width = 2u; break;
+        case CDISASM_ARM_NAME_CRC32W: width = 4u; break;
+        case CDISASM_ARM_NAME_CRC32X: width = 8u; break;
+        case CDISASM_ARM_NAME_CRC32CB: width = 1u; polynomial = UINT32_C(0x82f63b78); break;
+        case CDISASM_ARM_NAME_CRC32CH: width = 2u; polynomial = UINT32_C(0x82f63b78); break;
+        case CDISASM_ARM_NAME_CRC32CW: width = 4u; polynomial = UINT32_C(0x82f63b78); break;
+        case CDISASM_ARM_NAME_CRC32CX: width = 8u; polynomial = UINT32_C(0x82f63b78); break;
+        default: return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    }
+    if (instruction->operand_count != 3u ||
+        instruction->operand[0].type != CDISASM_OPERAND_REGISTER || instruction->operand[0].size != 4u ||
+        instruction->operand[1].type != CDISASM_OPERAND_REGISTER || instruction->operand[1].size != 4u ||
+        instruction->operand[2].type != CDISASM_OPERAND_REGISTER || instruction->operand[2].size != width ||
+        (width == 8u && emulator->mode != XXEMUL_MODE_ARM_A64)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    status = xxemul_arm_read_operand(emulator, &instruction->operand[1], current_pc, &accumulator);
+    if (status != XXEMUL_STATUS_OK) return status;
+    status = xxemul_arm_read_operand(emulator, &instruction->operand[2], current_pc, &data);
+    if (status != XXEMUL_STATUS_OK) return status;
+    crc = (uint32_t)accumulator;
+    /* Architectural instructions consume least-significant data bits first,
+     * without the initial/final complement used by a whole-file CRC API. */
+    for (byte = 0u; byte < width; ++byte) {
+        crc ^= (uint8_t)data;
+        data >>= 8u;
+        for (bit = 0u; bit < 8u; ++bit)
+            crc = (crc >> 1u) ^ ((crc & 1u) != 0u ? polynomial : 0u);
+    }
+    return xxemul_arm_write_register(emulator, instruction->operand[0].reg, crc);
 }
 
 static xxemul_status xxemul_arm_extend_instruction(xxemul *emulator, const cdisasm_arm_instruction *instruction, uint64_t current_pc)
@@ -1356,7 +1458,7 @@ static xxemul_status xxemul_arm_load_store(xxemul *emulator, const cdisasm_arm_i
     uint64_t writeback;
     uint64_t value;
     uint8_t size;
-    int has_writeback;
+    int has_writeback, literal;
     xxemul_status status;
 
     if (instruction->operand_count < 2u) {
@@ -1364,10 +1466,12 @@ static xxemul_status xxemul_arm_load_store(xxemul *emulator, const cdisasm_arm_i
     }
     register_operand = &instruction->operand[0];
     memory_operand = &instruction->operand[1];
-    if (register_operand->type != CDISASM_OPERAND_REGISTER || memory_operand->type != CDISASM_OPERAND_MEMORY) {
+    literal = is_load && xxemul_arm_literal_operand(emulator, instruction, memory_operand);
+    if (register_operand->type != CDISASM_OPERAND_REGISTER ||
+        (memory_operand->type != CDISASM_OPERAND_MEMORY && !literal)) {
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
-    size = memory_operand->size;
+    size = literal ? (instruction->name_id == CDISASM_ARM_NAME_LDRSW ? 4u : register_operand->size) : memory_operand->size;
     if (size == 0u) {
         size = register_operand->size;
     }
@@ -1414,6 +1518,9 @@ static xxemul_status xxemul_arm_branch_target(xxemul *emulator, const cdisasm_ar
     return xxemul_arm_read_operand(emulator, &instruction->operand[0], current_pc, target);
 }
 
+#include "xxemul_arm_auth_exec.h"
+#include "xxemul_arm_simd.h"
+
 xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
 {
     cdisasm_arm_instruction instruction;
@@ -1452,8 +1559,18 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
     }
 
     emulator->arm.pc = next_pc;
-    switch (instruction.name_id) {
+    if (emulator->mode == XXEMUL_MODE_ARM_A64 && xxemul_arm_auth_execute(emulator, &instruction, current_pc, &status)) {
+        /* Pointer authentication uses the same decoded instruction as tracing. */
+    } else if (emulator->mode == XXEMUL_MODE_ARM_A64 && xxemul_arm_simd(emulator, &instruction, current_pc, &status)) {
+        /* Vector and floating-point instructions share the normal step accounting. */
+    } else switch (instruction.name_id) {
         case CDISASM_ARM_NAME_NOP: status = XXEMUL_STATUS_OK; break;
+        case CDISASM_ARM_NAME_SVC:
+            status = emulator->mode == XXEMUL_MODE_ARM_A64 && emulator->darwin != NULL &&
+                     instruction.operand_count == 1u && instruction.operand[0].type == CDISASM_OPERAND_IMMEDIATE
+                         ? xxemul_darwin_handle_svc(emulator->darwin, instruction.operand[0].imm)
+                         : XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            break;
         case CDISASM_ARM_NAME_BKPT:
         case CDISASM_ARM_NAME_BRK:
             emulator->halted = 1;
@@ -1469,21 +1586,10 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
             if (instruction.name_id == CDISASM_ARM_NAME_MOV && emulator->mode == XXEMUL_MODE_ARM_A32 &&
                 instruction.operand[1].type == CDISASM_OPERAND_REGISTER && instruction.operand[1].reg == CDISASM_ARM_REG_R15) {
                 value = next_pc;
-                status = XXEMUL_STATUS_OK;
-            } else if (instruction.name_id == CDISASM_ARM_NAME_MOVS && instruction.operand[1].type == CDISASM_OPERAND_REGISTER &&
-                       instruction.operand[1].shift_type != CDISASM_ARM_SHIFT_NONE) {
-                uint8_t source_size;
-                status = xxemul_arm_read_register(emulator, instruction.operand[1].reg, current_pc, &value, &source_size);
-                if (status == XXEMUL_STATUS_OK) {
-                    value = xxemul_arm_apply_extend(value, instruction.operand[1].extend_type);
-                    value = xxemul_arm_apply_shift_with_carry(emulator, value,
-                                                              instruction.operand[1].size == 0u ? source_size : instruction.operand[1].size,
-                                                              instruction.operand[1].shift_type, instruction.operand[1].shift_amount,
-                                                              &shift_carry_valid, &shift_carry);
-                }
-            } else {
                 shift_carry_valid = 0;
-                status = xxemul_arm_read_operand(emulator, &instruction.operand[1], current_pc, &value);
+                status = XXEMUL_STATUS_OK;
+            } else {
+                status = xxemul_arm_read_data_operand(emulator, &instruction, 1u, current_pc, &value, &shift_carry_valid, &shift_carry);
             }
             if (status == XXEMUL_STATUS_OK) {
                 status = xxemul_arm_write_register(emulator, instruction.operand[0].reg, value);
@@ -1498,14 +1604,19 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
             }
             break;
         case CDISASM_ARM_NAME_MVN:
+        case CDISASM_ARM_NAME_MVNS:
             if (instruction.operand_count < 2u) {
                 status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
                 break;
             }
             size = instruction.operand[0].size == 0u ? (emulator->mode == XXEMUL_MODE_ARM_A64 ? 8u : 4u) : instruction.operand[0].size;
-            status = xxemul_arm_read_operand(emulator, &instruction.operand[1], current_pc, &value);
+            status = xxemul_arm_read_data_operand(emulator, &instruction, 1u, current_pc, &value, &shift_carry_valid, &shift_carry);
             if (status == XXEMUL_STATUS_OK) {
-                status = xxemul_arm_write_register(emulator, instruction.operand[0].reg, (~value) & xxemul_mask_for_size(size));
+                value = (~value) & xxemul_mask_for_size(size);
+                status = xxemul_arm_write_register(emulator, instruction.operand[0].reg, value);
+                if (status == XXEMUL_STATUS_OK && (instruction.instruction_flags & CDISASM_ARM_INSTRUCTION_FLAG_SETS_FLAGS) != 0u) {
+                    xxemul_arm_set_logic_flags(emulator, value, size, shift_carry_valid, shift_carry);
+                }
             }
             break;
         case CDISASM_ARM_NAME_MOVN:
@@ -1606,6 +1717,14 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
         case CDISASM_ARM_NAME_ROR:
         case CDISASM_ARM_NAME_RORS: status = xxemul_arm_shift_instruction(emulator, &instruction, current_pc); break;
         case CDISASM_ARM_NAME_CLZ: status = xxemul_arm_count_leading_zeros(emulator, &instruction, current_pc); break;
+        case CDISASM_ARM_NAME_CRC32B:
+        case CDISASM_ARM_NAME_CRC32H:
+        case CDISASM_ARM_NAME_CRC32W:
+        case CDISASM_ARM_NAME_CRC32X:
+        case CDISASM_ARM_NAME_CRC32CB:
+        case CDISASM_ARM_NAME_CRC32CH:
+        case CDISASM_ARM_NAME_CRC32CW:
+        case CDISASM_ARM_NAME_CRC32CX: status = xxemul_arm_crc32(emulator, &instruction, current_pc); break;
         case CDISASM_ARM_NAME_SXTB:
         case CDISASM_ARM_NAME_SXTH:
         case CDISASM_ARM_NAME_SXTW:
@@ -1615,6 +1734,8 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
         case CDISASM_ARM_NAME_UADD8: status = xxemul_arm_uadd8(emulator, &instruction, current_pc); break;
         case CDISASM_ARM_NAME_UBFX:
         case CDISASM_ARM_NAME_SBFX:
+        case CDISASM_ARM_NAME_UBFIZ:
+        case CDISASM_ARM_NAME_SBFIZ:
         case CDISASM_ARM_NAME_UBFM:
         case CDISASM_ARM_NAME_SBFM:
         case CDISASM_ARM_NAME_BFM:
@@ -1622,6 +1743,7 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
         case CDISASM_ARM_NAME_BFI:
         case CDISASM_ARM_NAME_BFXIL: status = xxemul_arm_bitfield(emulator, &instruction, current_pc); break;
         case CDISASM_ARM_NAME_EXTR: status = xxemul_arm_extract_registers(emulator, &instruction, current_pc); break;
+        case CDISASM_ARM_NAME_RBIT:
         case CDISASM_ARM_NAME_REV:
         case CDISASM_ARM_NAME_REV16:
         case CDISASM_ARM_NAME_REVSH: status = xxemul_arm_reverse(emulator, &instruction, current_pc); break;
@@ -1683,6 +1805,38 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
         case CDISASM_ARM_NAME_STP: status = xxemul_arm_pair_transfer(emulator, &instruction, current_pc, 0); break;
         case CDISASM_ARM_NAME_LDRD: status = xxemul_arm_pair_transfer(emulator, &instruction, current_pc, 1); break;
         case CDISASM_ARM_NAME_STRD: status = xxemul_arm_pair_transfer(emulator, &instruction, current_pc, 0); break;
+        case CDISASM_ARM_NAME_CBZ:
+        case CDISASM_ARM_NAME_CBNZ:
+        case CDISASM_ARM_NAME_TBZ:
+        case CDISASM_ARM_NAME_TBNZ:
+        {
+            int bit_test = instruction.name_id == CDISASM_ARM_NAME_TBZ || instruction.name_id == CDISASM_ARM_NAME_TBNZ;
+            int branch_nonzero = instruction.name_id == CDISASM_ARM_NAME_CBNZ || instruction.name_id == CDISASM_ARM_NAME_TBNZ;
+            unsigned target_index = bit_test ? 2u : 1u;
+            if (instruction.operand_count <= target_index) {
+                status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                break;
+            }
+            status = xxemul_arm_read_operand(emulator, &instruction.operand[0], current_pc, &value);
+            if (status != XXEMUL_STATUS_OK) break;
+            if (bit_test) {
+                uint64_t bit;
+                status = xxemul_arm_read_operand(emulator, &instruction.operand[1], current_pc, &bit);
+                if (status != XXEMUL_STATUS_OK) break;
+                if (bit >= 64u) {
+                    status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                    break;
+                }
+                value &= UINT64_C(1) << bit;
+            }
+            if ((value != 0u) == branch_nonzero) {
+                status = xxemul_arm_read_operand(emulator, &instruction.operand[target_index], current_pc, &target);
+                if (status == XXEMUL_STATUS_OK) {
+                    emulator->arm.pc = xxemul_arm_align_pc(emulator, target & xxemul_arm_address_mask(emulator));
+                }
+            }
+            break;
+        }
         case CDISASM_ARM_NAME_B:
             status = xxemul_arm_branch_target(emulator, &instruction, current_pc, &target);
             if (status == XXEMUL_STATUS_OK) {

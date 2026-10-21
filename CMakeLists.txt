@@ -118,11 +118,15 @@ add_library(xxemul
     src/xxemul_status.c
     src/xxemul_x86.c
     src/xxemul_arm.c
+    src/xxemul_arm_simd.h
+    src/xxemul_arm_auth.h
+    src/xxemul_arm_auth_exec.h
     src/xxemul_display.c
     src/xxemul_image.c
     src/formats/xxemul_pe.c
     src/formats/xxemul_elf.c
     src/formats/xxemul_macho.c
+    src/formats/xxemul_macho_fixups.h
     src/formats/xxemul_com.c
     src/formats/xxemul_msdos_exe.c
     src/platforms/xxemul_dos_loader.c
@@ -132,6 +136,16 @@ add_library(xxemul
     src/platforms/xxemul_dpmi.c
     src/platforms/xxemul_windows.c
     src/platforms/xxemul_linux.c
+    src/platforms/xxemul_darwin.c
+    src/platforms/xxemul_darwin.h
+    src/platforms/xxemul_darwin_posix.c
+    src/platforms/xxemul_darwin_posix.h
+    src/platforms/xxemul_darwin_archive.c
+    src/platforms/xxemul_darwin_archive.h
+    src/platforms/xxemul_darwin_zlib.c
+    src/platforms/xxemul_darwin_zlib.h
+    src/platforms/xxemul_darwin_bzip2.c
+    src/platforms/xxemul_darwin_bzip2.h
 )
 add_library(xxemul::xxemul ALIAS xxemul)
 
@@ -188,6 +202,7 @@ target_link_libraries(xxemul
     PRIVATE
         cdisasm::cdisasm
         xxfclib::xxfclib
+        ${CMAKE_DL_LIBS}
 )
 
 if(NOT BUILD_SHARED_LIBS)
@@ -264,6 +279,18 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
         add_executable(xxemul_x87_tests tests/test_xxemul_x87.c)
         target_link_libraries(xxemul_x87_tests PRIVATE xxemul::xxemul)
         add_test(NAME xxemul_x87_tests COMMAND xxemul_x87_tests)
+        add_executable(xxemul_arm_cache_tests tests/test_arm_cache.c)
+        target_link_libraries(xxemul_arm_cache_tests PRIVATE xxemul::xxemul cdisasm::cdisasm)
+        add_test(NAME xxemul_arm_cache_tests COMMAND xxemul_arm_cache_tests)
+        add_executable(xxemul_arm_crc_tests tests/test_arm_crc.c)
+        target_link_libraries(xxemul_arm_crc_tests PRIVATE xxemul::xxemul cdisasm::cdisasm)
+        add_test(NAME xxemul_arm_crc_tests COMMAND xxemul_arm_crc_tests)
+        add_executable(xxemul_arm_literal_tests tests/test_arm_literal.c)
+        target_link_libraries(xxemul_arm_literal_tests PRIVATE xxemul::xxemul cdisasm::cdisasm)
+        add_test(NAME xxemul_arm_literal_tests COMMAND xxemul_arm_literal_tests)
+        add_executable(xxemul_arm_bitops_tests tests/test_arm_bitops.c)
+        target_link_libraries(xxemul_arm_bitops_tests PRIVATE xxemul::xxemul cdisasm::cdisasm)
+        add_test(NAME xxemul_arm_bitops_tests COMMAND xxemul_arm_bitops_tests)
     endif()
     add_executable(xxemul_tests tests/test_xxemul.c)
     target_compile_features(xxemul_tests PRIVATE c_std_11)
@@ -274,6 +301,62 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
     target_compile_features(xxemul_format_tests PRIVATE c_std_11)
     target_link_libraries(xxemul_format_tests PRIVATE xxemul::xxemul)
     add_test(NAME xxemul_format_tests COMMAND xxemul_format_tests)
+    if(NOT WIN32)
+        add_executable(xxemul_darwin_libc_tests tests/test_darwin_libc.c)
+        target_compile_features(xxemul_darwin_libc_tests PRIVATE c_std_11)
+        target_link_libraries(xxemul_darwin_libc_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+        add_test(NAME xxemul_darwin_libc_tests COMMAND xxemul_darwin_libc_tests)
+
+        add_executable(xxemul_darwin_memory_tests tests/test_darwin_memory.c)
+        target_compile_features(xxemul_darwin_memory_tests PRIVATE c_std_11)
+        target_link_libraries(xxemul_darwin_memory_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+        add_test(NAME xxemul_darwin_memory_tests COMMAND xxemul_darwin_memory_tests)
+
+        if(APPLE)
+            add_executable(xxemul_darwin_bzip2_tests tests/test_darwin_bzip2.c)
+            target_compile_features(xxemul_darwin_bzip2_tests PRIVATE c_std_11)
+            target_link_libraries(xxemul_darwin_bzip2_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+            add_test(NAME xxemul_darwin_bzip2_tests COMMAND xxemul_darwin_bzip2_tests)
+            set_tests_properties(xxemul_darwin_bzip2_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+            add_executable(xxemul_darwin_zlib_tests tests/test_darwin_zlib.c)
+            target_compile_features(xxemul_darwin_zlib_tests PRIVATE c_std_11)
+            target_link_libraries(xxemul_darwin_zlib_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+            add_test(NAME xxemul_darwin_zlib_tests COMMAND xxemul_darwin_zlib_tests)
+            set_tests_properties(xxemul_darwin_zlib_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+            add_executable(xxemul_darwin_archive_tests tests/test_darwin_archive.c)
+            target_compile_features(xxemul_darwin_archive_tests PRIVATE c_std_11)
+            target_link_libraries(xxemul_darwin_archive_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+            add_test(NAME xxemul_darwin_archive_tests COMMAND xxemul_darwin_archive_tests)
+            set_tests_properties(xxemul_darwin_archive_tests PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+
+        add_executable(xxemul_darwin_services_tests tests/test_darwin_services.c)
+        target_compile_features(xxemul_darwin_services_tests PRIVATE c_std_11)
+        target_link_libraries(xxemul_darwin_services_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+        add_test(NAME xxemul_darwin_services_tests COMMAND xxemul_darwin_services_tests)
+
+        add_executable(xxemul_darwin_cli_tests tests/test_darwin_cli.c)
+        target_compile_features(xxemul_darwin_cli_tests PRIVATE c_std_11)
+        target_link_libraries(xxemul_darwin_cli_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+        add_test(NAME xxemul_darwin_cli_tests COMMAND xxemul_darwin_cli_tests)
+
+        add_executable(xxemul_darwin_vm_tests tests/test_darwin_vm.c)
+        target_compile_features(xxemul_darwin_vm_tests PRIVATE c_std_11)
+        target_link_libraries(xxemul_darwin_vm_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+        add_test(NAME xxemul_darwin_vm_tests COMMAND xxemul_darwin_vm_tests)
+    endif()
+    add_executable(xxemul_upx_macos_tests tests/test_upx_macos.c)
+    target_compile_features(xxemul_upx_macos_tests PRIVATE c_std_11)
+    target_link_libraries(xxemul_upx_macos_tests PRIVATE xxemul::xxemul)
+    if(EXISTS "${XXEMUL_UPX_FIXTURE_DIR}/hello-macos-arm64.upx"
+       AND EXISTS "${XXEMUL_UPX_FIXTURE_DIR}/hello-macos-arm64")
+        add_test(NAME xxemul_upx_macos_tests COMMAND xxemul_upx_macos_tests
+            "${XXEMUL_UPX_FIXTURE_DIR}/hello-macos-arm64.upx"
+            "${XXEMUL_UPX_FIXTURE_DIR}/hello-macos-arm64"
+            "${XXEMUL_UPX_FIXTURE_DIR}")
+    endif()
     add_executable(xxemul_upx_dos_tests tests/test_upx_dos.c)
     target_link_libraries(xxemul_upx_dos_tests PRIVATE
         xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)

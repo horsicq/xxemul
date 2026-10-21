@@ -1,6 +1,7 @@
 #include "xxemul_internal.h"
 #include "platforms/xxemul_windows.h"
 #include "platforms/xxemul_linux.h"
+#include "platforms/xxemul_darwin.h"
 #include "platforms/xxemul_dos_files.h"
 
 #include <limits.h>
@@ -157,6 +158,7 @@ void xxemul_destroy(xxemul *emulator)
     }
     xxemul_windows_destroy(emulator->windows);
     xxemul_linux_destroy(emulator->linux_process);
+    xxemul_darwin_destroy(emulator->darwin);
     xxemul_dos_files_stop(emulator);
     xx_mem_free(emulator->x86_decode_cache);
     xx_mem_free(emulator->region_data);
@@ -172,6 +174,11 @@ xxemul_status xxemul_start_process(xxemul *emulator, xxemul_image_format format,
         emulator->linux_process != NULL) {
         return status;
     }
+    if (format == XXEMUL_IMAGE_MACHO32 || format == XXEMUL_IMAGE_MACHO64) {
+        if (emulator->darwin == NULL) return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+        return xxemul_darwin_start(emulator->darwin, program_path, working_directory, argc, argv);
+    }
+    if (emulator->darwin != NULL) return XXEMUL_STATUS_INVALID_ARGUMENT;
     if (format == XXEMUL_IMAGE_PE32 || format == XXEMUL_IMAGE_PE64) {
         size_t skip = argc > 0 ? 1u : 0u;
         emulator->windows = xxemul_windows_create(emulator, program_path, working_directory, argv == NULL ? NULL : argv + skip, (size_t)argc - skip, &status);
@@ -210,8 +217,15 @@ int xxemul_process_exit_code(const xxemul *emulator)
     if (emulator == NULL) return -1;
     if (emulator->windows != NULL) return (int)xxemul_windows_exit_code(emulator->windows);
     if (emulator->linux_process != NULL) return xxemul_linux_exit_code(emulator->linux_process);
+    if (emulator->darwin != NULL) return xxemul_darwin_exit_code(emulator->darwin);
     if (emulator->dos_mode) return (int)emulator->exit_code;
     return -1;
+}
+
+const char *xxemul_process_error(const xxemul *emulator)
+{
+    if (emulator == NULL || emulator->darwin == NULL) return NULL;
+    return xxemul_darwin_last_error(emulator->darwin);
 }
 
 xxemul *xxemul_create_exec_successor(xxemul *emulator, xxemul_status *status)
@@ -470,6 +484,10 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
         }
         return status;
     }
+    if (emulator->darwin != NULL && xxemul_darwin_try_step(emulator->darwin, info, &status)) {
+        if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
+        return status;
+    }
     return xxemul_arm_step(emulator, info);
 }
 
@@ -566,6 +584,58 @@ xxemul_status xxemul_get_current_address(const xxemul *emulator, uint64_t *addre
     return xxemul_x86_linear_address(emulator, XXEMUL_X86_CS, emulator->x86.ip, address);
 }
 
+xxemul_status xxemul_get_stack_address(const xxemul *emulator, uint64_t *address)
+{
+    uint64_t mask, offset;
+    if (emulator == NULL || address == NULL || !xxemul_mode_matches_arch(emulator->arch, emulator->mode)) {
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    }
+    if (emulator->arch == XXEMUL_ARCH_ARM) {
+        *address = emulator->arm.sp & (emulator->mode == XXEMUL_MODE_ARM_A64 ? UINT64_MAX : UINT32_MAX);
+        return XXEMUL_STATUS_OK;
+    }
+    mask = emulator->mode == XXEMUL_MODE_X86_16 ? UINT16_MAX
+        : emulator->mode == XXEMUL_MODE_X86_32 ? UINT32_MAX : UINT64_MAX;
+    /* Match xxemul_x86_stack_mask: SS.B controls protected-mode stack
+     * addressing independently of the current code segment's width. */
+    if (emulator->dos_mode && emulator->dos_segments[XXEMUL_X86_SS].valid) {
+        mask = (emulator->dos_segments[XXEMUL_X86_SS].flags & 4u) != 0u ? UINT32_MAX : UINT16_MAX;
+    }
+    offset = emulator->x86.gpr[XXEMUL_X86_RSP] & mask;
+    if (emulator->dos_mode) {
+        uint64_t base = emulator->dos_segments[XXEMUL_X86_SS].valid
+            ? emulator->dos_segments[XXEMUL_X86_SS].base : (uint32_t)emulator->x86.segment[XXEMUL_X86_SS] << 4u;
+        /* Guest stack accesses wrap the segment sum to 32 bits. With paging
+         * disabled their remaining address translation is the A20 gate. Do
+         * not mask linear bit 20 before paging, whose page tables use it. */
+        uint32_t linear = (uint32_t)(base + offset);
+        if ((emulator->dos_cr0 & UINT32_C(0x80000000)) == 0u && (emulator->dos_port_92 & 2u) == 0u)
+            linear &= ~UINT32_C(0x100000);
+        *address = linear;
+        return XXEMUL_STATUS_OK;
+    }
+    *address = offset;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_x86_get_segment_base(const xxemul *emulator, unsigned segment_index, uint64_t *base)
+{
+    if (emulator == NULL || base == NULL || emulator->arch != XXEMUL_ARCH_X86 || segment_index >= XXEMUL_X86_SEGMENT_COUNT) {
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    }
+    if (emulator->dos_mode) return xxemul_x86_linear_address(emulator, segment_index, 0, base);
+    *base = 0;
+    /* Match the effective-address calculation used by x86 guest accesses. */
+    if (segment_index == XXEMUL_X86_FS || segment_index == XXEMUL_X86_GS) {
+        if (emulator->windows != NULL) {
+            *base = xxemul_windows_segment_base(emulator->windows, (uint8_t)segment_index);
+        } else if (emulator->linux_process != NULL) {
+            *base = xxemul_linux_segment_base(emulator->linux_process, segment_index, emulator->x86.segment[segment_index]);
+        }
+    }
+    return XXEMUL_STATUS_OK;
+}
+
 int xxemul_is_halted(const xxemul *emulator)
 {
     return emulator == NULL || emulator->halted;
@@ -573,6 +643,8 @@ int xxemul_is_halted(const xxemul *emulator)
 
 const char *xxemul_symbol_name(const xxemul *emulator, uint64_t address)
 {
-    if (emulator == NULL || emulator->windows == NULL) return NULL;
-    return xxemul_windows_thunk_name(emulator, address);
+    if (emulator == NULL) return NULL;
+    if (emulator->darwin != NULL) return xxemul_darwin_symbol(emulator->darwin, address);
+    if (emulator->windows != NULL) return xxemul_windows_thunk_name(emulator, address);
+    return NULL;
 }

@@ -13,6 +13,7 @@
 
 typedef struct xxemul_windows xxemul_windows;
 typedef struct xxemul_linux_process xxemul_linux_process;
+typedef struct xxemul_darwin xxemul_darwin;
 typedef struct xxemul_x86_decode_cache_entry xxemul_x86_decode_cache_entry;
 
 typedef struct xxemul_x86_segment_cache {
@@ -33,6 +34,7 @@ struct xxemul {
     uint8_t *region_data;
     xxemul_windows *windows;
     xxemul_linux_process *linux_process;
+    xxemul_darwin *darwin;
     int halted;
     int dos_mode;
     uint16_t psp_segment;

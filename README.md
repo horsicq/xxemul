@@ -43,7 +43,14 @@ can continue using the default full xxfclib profile.
 
 - x86 16-bit, 32-bit, and 64-bit decode modes
 - ARM A32, T32, and A64 decode modes
-- Structured decoding and formatting through `cdisasm`
+- Structured decoding and formatting through `cdisasm` in every native mode:
+  x86 16/32/64, ARM A32, Thumb T32, and ARM A64 (including arm64e)
+- ARM64e PAC/AUT, XPAC, authenticated branches and returns execute from
+  `cdisasm` A64 mnemonics and structured operands, with software pointer
+  authentication shared by the Mach-O loader and Darwin runtime
+- A64 `CTR_EL0`, `DC CVAU`, `IC IVAU`, and memory/instruction barriers for
+  guest code that decompresses or modifies instructions. The interpreter
+  models coherent memory and decodes the current bytes at every ARM step.
 - Generated x86 decode families enabled by default for x87 and other UPX
   guest instructions
 - One bounded, zero-filled, read/write/execute flat region
@@ -58,11 +65,19 @@ can continue using the default full xxfclib profile.
 - Separate bounded ELF32/ELF64 `ET_DYN` API with shared-object relocations,
   explicit version-aware guest import resolution and constructor inventory
 - ARM BX/BLX interworking and Thumb call/return address handling
-- Thin Mach-O 32/64 executable segment mapping with `LC_MAIN` entry points
+- Thin Mach-O executable segment mapping with `LC_MAIN` entry points and
+  ARM64 UPX `LC_UNIXTHREAD` startup; compatible arm64/arm64e universal slices
 - 16-bit segment registers, segment overrides, and a minimal DOS/BIOS layer
 - Experimental DOS file calls, PE import/API thunks, and Linux syscall/process
   setup for running executable images
 - 640x480 headless pixel renderer
+
+Native execution consumes `cdisasm` mnemonics, operands, and instruction
+metadata, including far x86 pointers, ARM shifts, bitfields, SIMD arrangements,
+and system-call instructions. Decoder rejection is reported without local
+opcode fallbacks or stripping prefixes and retrying. A decoded instruction
+still requires execution support in xxemul. DEX and .NET CIL use the separate
+`xxbyte` decoder; they are not native instruction sets supported by `cdisasm`.
 
 The DOS layer implements selected INT 20h/21h/29h filesystem, console, and
 process services, plus selected BIOS INT 10h/11h/12h/16h services.
@@ -100,9 +115,15 @@ currently capped at 128 MiB. PE import thunks and a subset of Windows API
 calls are emulated, along with selected Linux syscalls and an executable
 handoff. The separate shared ELF API supports the bounded dynamic-loading
 subset described below. Memory permissions and full process ABIs are not
-implemented. Mach-O supports little-endian thin executables with
-`LC_MAIN`; fat binaries, `LC_UNIXTHREAD` entry points, dyld, and macOS system
-services are not implemented. COM, MS-DOS EXE, PE, ELF, and Mach-O loaders
+implemented. The Darwin backend models supported libc/libc++/POSIX services
+for arm64/arm64e `LC_MAIN` executables and compatible universal slices.
+ARM64 UPX `LC_UNIXTHREAD` images execute their guest decompressor with kernel
+startup arguments, bounded mappings, and the legacy x8/`svc #0` ABI. A virtual
+dyld entry binds the image restored in guest memory and calls its `LC_MAIN`;
+Apple's dyld and arbitrary dylibs are not executed. The restored-image window
+is 16 MiB, with separate 32 MiB runtime and mapping arenas; protection masks
+are metadata, not enforced page permissions. Unsupported constructors,
+imports and old dyld fixup streams remain unsupported. COM, MS-DOS EXE, PE, ELF, and Mach-O loaders
 live in separate `src/formats` C files. `src/platforms/xxemul_dos_loader.c`
 owns shared DOS setup, while `src/xxemul_image.c` owns image dispatch and
 file I/O.
@@ -154,7 +175,7 @@ formats.
 
 ## Debugger support
 
-These hooks are used by the xxcdebug emulator backend:
+These hooks are used by the xxdebug emulator backend:
 
 - `xxemul_set_debug_traps`: a guest `INT3` (or `INT 3` outside DOS)
   returns `XXEMUL_STATUS_BREAKPOINT` with IP past the instruction, instead

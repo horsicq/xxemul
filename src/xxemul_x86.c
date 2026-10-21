@@ -29,6 +29,8 @@
 struct xxemul_x86_decode_cache_entry {
     uint64_t ip;
     uint64_t fetch_address;
+    xxemul_mode mode;
+    cdisasm_x86_decode_flags decode_flags;
     uint8_t code[15];
     uint8_t available;
     uint8_t valid;
@@ -958,7 +960,6 @@ static xxemul_status xxemul_x86_effective_offset(xxemul *emulator, const cdisasm
     uint64_t result = UINT64_C(0);
     uint64_t value;
     uint64_t displacement = UINT64_C(0);
-    uint8_t displacement_size;
     xxemul_status status;
 
     if (address == NULL || operand->type != CDISASM_OPERAND_MEMORY) {
@@ -983,8 +984,7 @@ static xxemul_status xxemul_x86_effective_offset(xxemul *emulator, const cdisasm
         result += value * (operand->scale == 0u ? 1u : operand->scale);
     }
     if ((operand->flags & CDISASM_OPERAND_FLAG_HAS_DISPLACEMENT) != 0u) {
-        displacement_size = instruction->encoding.displacement_size;
-        displacement = displacement_size == 0u ? operand->imm : xxemul_sign_extend(operand->imm, displacement_size);
+        displacement = operand->imm;
     }
     *address = (result + displacement) & xxemul_x86_operand_address_mask(emulator, instruction);
     return XXEMUL_STATUS_OK;
@@ -1107,48 +1107,18 @@ static xxemul_status xxemul_x86_decode_current_tracked(xxemul *emulator, cdisasm
     if (emulator->x86_decode_cache != NULL) {
         size_t slot = (size_t)((emulator->x86.ip ^ fetch_address ^ (emulator->x86.ip >> 12u)) & (XXEMUL_X86_DECODE_CACHE_SIZE - 1u));
         cache_entry = &emulator->x86_decode_cache[slot];
-        if (cache_entry->valid && cache_entry->ip == emulator->x86.ip && cache_entry->fetch_address == fetch_address && cache_entry->available == available &&
+        if (cache_entry->valid && cache_entry->mode == emulator->mode && cache_entry->ip == emulator->x86.ip &&
+            cache_entry->fetch_address == fetch_address && cache_entry->available == available &&
+            memcmp(&cache_entry->decode_flags, &emulator->x86_decode_flags, sizeof(cache_entry->decode_flags)) == 0 &&
             memcmp(cache_entry->code, code, available) == 0) {
             *instruction = cache_entry->instruction;
             return XXEMUL_STATUS_OK;
         }
     }
+    /* cdisasm owns opcode recognition, prefix legality and instruction size
+     * in all three modes. Never manufacture metadata or retry a different
+     * byte stream after the decoder rejects the original instruction. */
     decoded_size = cdisasm_x86_decode(CDISASM_CPU_X86, xxemul_x86_cdisasm_mode(emulator), code, available, emulator->x86.ip, &emulator->x86_decode_flags, instruction);
-    if (decoded_size == 0u && available >= 4u && code[0] == 0xf3u && code[1] == 0x0fu && code[2] == 0x1eu && (code[3] == 0xfau || code[3] == 0xfbu)) {
-        xx_mem_zero(instruction, sizeof(*instruction));
-        instruction->address = emulator->x86.ip;
-        instruction->opcode_size = 4u;
-        instruction->name_id = code[3] == 0xfau ? CDISASM_X86_NAME_ENDBR64 : CDISASM_X86_NAME_ENDBR32;
-        decoded_size = 4u;
-    }
-    if (decoded_size == 0u && emulator->mode == XXEMUL_MODE_X86_64 && available >= 2u && code[0] == 0x0fu && code[1] == 0x05u) {
-        xx_mem_zero(instruction, sizeof(*instruction));
-        instruction->address = emulator->x86.ip;
-        instruction->opcode_size = 2u;
-        instruction->name_id = CDISASM_X86_NAME_SYSCALL;
-        decoded_size = 2u;
-    }
-    if (decoded_size == 0u && emulator->dos_mode && available > 1u) {
-        size_t prefix_len = 0u;
-        while (prefix_len < available &&
-               (code[prefix_len] == 0xf0u || code[prefix_len] == 0xf2u || code[prefix_len] == 0xf3u || code[prefix_len] == 0x26u || code[prefix_len] == 0x2eu ||
-                code[prefix_len] == 0x36u || code[prefix_len] == 0x3eu || code[prefix_len] == 0x64u || code[prefix_len] == 0x65u)) {
-            ++prefix_len;
-        }
-        if (prefix_len > 0u && prefix_len < available) {
-            decoded_size = cdisasm_x86_decode(CDISASM_CPU_X86, xxemul_x86_cdisasm_mode(emulator), code + prefix_len, available - prefix_len,
-                                              emulator->x86.ip + prefix_len, &emulator->x86_decode_flags, instruction);
-            if (decoded_size != 0u) {
-                instruction->address = emulator->x86.ip;
-                instruction->opcode_size += (uint32_t)prefix_len;
-            }
-        }
-    }
-    if (decoded_size == 0u && emulator->dos_mode && (emulator->dos_cr0 & 1u) == 0u && emulator->mode == XXEMUL_MODE_X86_16 && emulator->x86.ip >= 0xfffeu &&
-        code[0] == 0u) {
-        emulator->x86.ip = 0u;
-        return xxemul_x86_decode_current_tracked(emulator, instruction, page_fault_error);
-    }
     if (decoded_size == 0u) {
         if (emulator->dos_mode && page_fault_error != NULL && available < sizeof(code)) {
             uint32_t missing_page_error = UINT32_MAX;
@@ -1163,6 +1133,8 @@ static xxemul_status xxemul_x86_decode_current_tracked(xxemul *emulator, cdisasm
     if (cache_entry != NULL) {
         cache_entry->ip = emulator->x86.ip;
         cache_entry->fetch_address = fetch_address;
+        cache_entry->mode = emulator->mode;
+        cache_entry->decode_flags = emulator->x86_decode_flags;
         cache_entry->available = (uint8_t)available;
         memcpy(cache_entry->code, code, available);
         cache_entry->instruction = *instruction;
@@ -1632,7 +1604,7 @@ static xxemul_status xxemul_x86_string(xxemul *emulator, const cdisasm_x86_instr
     uint64_t count;
     uint64_t iterations;
     uint64_t index;
-    uint32_t repeat = instruction->opcode_flags & (CDISASM_PREFIX_REP | CDISASM_PREFIX_REPNE);
+    uint32_t repeat = instruction->opcode_flags & (CDISASM_PREFIX_EFFECTIVE_REP | CDISASM_PREFIX_EFFECTIVE_REPNE);
     int operation;
 
     switch (instruction->name_id) {
@@ -1793,7 +1765,7 @@ static xxemul_status xxemul_x86_string(xxemul *emulator, const cdisasm_x86_instr
             emulator->x86.gpr[XXEMUL_X86_RCX] = (emulator->x86.gpr[XXEMUL_X86_RCX] & ~address_mask) | (count & address_mask);
             if ((operation == 3 || operation == 4) && count != 0u) {
                 int zero = (emulator->x86.flags & XXEMUL_X86_FLAG_ZF) != 0u;
-                if (((repeat & CDISASM_PREFIX_REP) != 0u && !zero) || ((repeat & CDISASM_PREFIX_REPNE) != 0u && zero)) {
+                if (((repeat & CDISASM_PREFIX_EFFECTIVE_REP) != 0u && !zero) || ((repeat & CDISASM_PREFIX_EFFECTIVE_REPNE) != 0u && zero)) {
                     break;
                 }
             }
@@ -4440,13 +4412,14 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 (instruction.opcode[0].size == 4u || instruction.opcode[0].size == 6u)) {
                 size = (uint8_t)(instruction.opcode[0].size - 2u);
                 status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[0], next_ip, &right);
-            } else if (emulator->dos_mode) {
-                uint64_t pointer_address;
-                size = xxemul_x86_mode_size(emulator);
-                if ((instruction.opcode_flags & CDISASM_PREFIX_OPERAND_SIZE) != 0u) size = size == 2u ? 4u : 2u;
-                if ((size != 2u && size != 4u) || instruction.opcode_size < (uint32_t)size + 3u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-                status = xxemul_x86_dos_address(emulator, XXEMUL_X86_CS, current_ip + instruction.opcode_size - size - 2u, (uint8_t)(size + 2u), &pointer_address);
-                if (status == XXEMUL_STATUS_OK) status = xxemul_x86_guest_load_integer(emulator, pointer_address, (uint8_t)(size + 2u), &right);
+            } else if (instruction.operand_count == 2u && instruction.opcode[0].type == CDISASM_OPERAND_IMMEDIATE &&
+                       instruction.opcode[1].type == CDISASM_OPERAND_IMMEDIATE &&
+                       (instruction.opcode[0].size == 2u || instruction.opcode[0].size == 4u) && instruction.opcode[1].size == 2u) {
+                /* cdisasm represents an immediate far pointer as offset,
+                 * then selector, with operand-size overrides already applied. */
+                size = instruction.opcode[0].size;
+                right = (instruction.opcode[0].imm & xxemul_mask_for_size(size)) | ((instruction.opcode[1].imm & UINT64_C(0xffff)) << (size * 8u));
+                status = XXEMUL_STATUS_OK;
             } else {
                 return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             }
@@ -4638,25 +4611,12 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
 size_t xxemul_x86_format_current(xxemul *emulator, char *buffer, size_t buffer_size)
 {
     cdisasm_x86_instruction instruction;
-    const char *literal = NULL;
 
     if (xxemul_x86_decode_current(emulator, &instruction) != XXEMUL_STATUS_OK) {
         if (buffer != NULL && buffer_size > 0u) {
             buffer[0] = '\0';
         }
         return 0u;
-    }
-    if (instruction.name_id == CDISASM_X86_NAME_ENDBR32) literal = "endbr32";
-    else if (instruction.name_id == CDISASM_X86_NAME_ENDBR64) literal = "endbr64";
-    else if (instruction.name_id == CDISASM_X86_NAME_SYSCALL) literal = "syscall";
-    if (literal != NULL) {
-        size_t length = strlen(literal);
-        if (buffer != NULL && buffer_size != 0u) {
-            size_t copied = length < buffer_size - 1u ? length : buffer_size - 1u;
-            memcpy(buffer, literal, copied);
-            buffer[copied] = '\0';
-        }
-        return length;
     }
     return cdisasm_x86_format_mode(&instruction, xxemul_x86_cdisasm_mode(emulator), CDISASM_FORMAT_SYNTAX_X86_INTEL, buffer, buffer_size);
 }

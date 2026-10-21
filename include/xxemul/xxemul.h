@@ -114,6 +114,9 @@ typedef struct xxemul_arm_state {
     uint64_t pc;
     uint32_t pstate;
     uint32_t reserved;
+    uint8_t v[32][16];
+    uint32_t fpcr;
+    uint32_t fpsr;
 } xxemul_arm_state;
 
 /**
@@ -151,8 +154,11 @@ XXEMUL_API xxemul *xxemul_create_image_file(xxemul_image_format format, const ch
 XXEMUL_API xxemul *xxemul_create_dos(xxemul_dos_format format, const void *image, size_t image_size, xxemul_status *status);
 /** Reads a COM or MZ file through xxfclib's file device. */
 XXEMUL_API xxemul *xxemul_create_dos_file(xxemul_dos_format format, const char *path, xxemul_status *status);
-/** Initialize guest OS services for a loaded PE or ELF image.
- * argv includes argv[0]; host file access is confined to working_directory. */
+/** Initialize guest OS services for a loaded PE, ELF, DOS, or ARM64/arm64e Mach-O image.
+ * argv includes argv[0]; host file access is confined to working_directory.
+ * Mach-O starts at LC_MAIN with modeled Darwin libc/stdio/libc++ imports and
+ * guest instruction execution. Its bounded filesystem bridge uses working_directory;
+ * it does not run dyld, arbitrary host libraries, or host subprocesses. */
 XXEMUL_API xxemul_status xxemul_start_process(xxemul *emulator, xxemul_image_format format, const char *program_path, const char *working_directory, int argc,
                                               const char *const *argv);
 /** Set one explicit guest variable after process start. The name must be
@@ -162,6 +168,9 @@ XXEMUL_API xxemul_status xxemul_set_guest_environment(xxemul *emulator, const ch
 /** Create a replacement emulator after a Linux memfd exec; caller owns both. */
 XXEMUL_API xxemul *xxemul_create_exec_successor(xxemul *emulator, xxemul_status *status);
 XXEMUL_API int xxemul_process_exit_code(const xxemul *emulator);
+/** Optional process-backend diagnostic; NULL when none is available.
+ * The returned string belongs to the emulator and may change on the next call. */
+XXEMUL_API const char *xxemul_process_error(const xxemul *emulator);
 XXEMUL_API void xxemul_destroy(xxemul *emulator);
 
 /** Real-mode segment:offset to 20-bit physical address. */
@@ -216,6 +225,17 @@ XXEMUL_API xxemul_status xxemul_set_memory_hook(xxemul *emulator, xxemul_memory_
 XXEMUL_API xxemul_status xxemul_set_debug_traps(xxemul *emulator, int enabled);
 /** Linear address of the next instruction (CS base applied in DOS modes). */
 XXEMUL_API xxemul_status xxemul_get_current_address(const xxemul *emulator, uint64_t *address);
+/** Address of the current stack pointer, without reading guest memory.
+ * Uses the DOS SS descriptor's stack width when present, independently of
+ * the code mode, and wraps DOS segment-base plus offset to 32 bits. With DOS
+ * paging disabled the A20 gate is applied; with paging enabled the address
+ * is linear, without page-table translation. No segment access/limit check
+ * is performed. ARM A32/T32 uses the low 32 bits of SP. */
+XXEMUL_API xxemul_status xxemul_get_stack_address(const xxemul *emulator, uint64_t *address);
+/** Current effective x86 segment base, without reading guest memory.
+ * Includes DOS descriptor/real-mode bases and Windows/Linux FS/GS TLS bases.
+ * segment_index uses XXEMUL_X86_ES through XXEMUL_X86_GS. */
+XXEMUL_API xxemul_status xxemul_x86_get_segment_base(const xxemul *emulator, unsigned segment_index, uint64_t *base);
 /** Linear address of segment:offset using the current segment state. */
 XXEMUL_API xxemul_status xxemul_x86_linear_address(const xxemul *emulator, unsigned segment_index, uint64_t offset, uint64_t *address);
 XXEMUL_API int xxemul_is_halted(const xxemul *emulator);
