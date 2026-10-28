@@ -60,7 +60,7 @@ static xxemul_status arm_vector_memory(xxemul *e, const cdisasm_arm_instruction 
     status = xxemul_arm_memory_address(e, in, memory, pc, &address, &writeback, &has_writeback);
     if (status != XXEMUL_STATUS_OK) return status;
     if (load) {
-        status = xxemul_read_memory(e, address, bytes, size * count);
+        status = xxemul_arm_guest_read_memory(e, address, bytes, size * count);
         if (status != XXEMUL_STATUS_OK) return status;
     }
     for (n = 0; n < count; ++n) {
@@ -71,7 +71,7 @@ static xxemul_status arm_vector_memory(xxemul *e, const cdisasm_arm_instruction 
             memcpy(e->arm.v[index], bytes + n * size, size);
         } else memcpy(bytes + n * size, e->arm.v[index], size);
     }
-    if (!load) status = xxemul_write_memory(e, address, bytes, size * count);
+    if (!load) status = xxemul_arm_guest_write_memory(e, address, bytes, size * count);
     if (status == XXEMUL_STATUS_OK && has_writeback) status = xxemul_arm_write_register(e, memory->base_reg, writeback);
     return status;
 }
@@ -103,8 +103,8 @@ static int xxemul_arm_simd(xxemul *e, const cdisasm_arm_instruction *in, uint64_
         uint64_t address, writeback; int has_writeback;
         *status=xxemul_arm_memory_address(e,in,&in->operand[2],pc,&address,&writeback,&has_writeback);
         if(*status!=XXEMUL_STATUS_OK)return 1;
-        *status=xxemul_load_integer(e,address,4,&a);if(*status!=XXEMUL_STATUS_OK)return 1;
-        *status=xxemul_load_integer(e,address+4,4,&b);if(*status!=XXEMUL_STATUS_OK)return 1;
+        *status=xxemul_arm_guest_load_integer(e,address,4,&a);if(*status!=XXEMUL_STATUS_OK)return 1;
+        *status=xxemul_arm_guest_load_integer(e,address+4,4,&b);if(*status!=XXEMUL_STATUS_OK)return 1;
         *status=xxemul_arm_write_register(e,in->operand[0].reg,xxemul_sign_extend(a,4));
         if(*status==XXEMUL_STATUS_OK)*status=xxemul_arm_write_register(e,in->operand[1].reg,xxemul_sign_extend(b,4));
         if(*status==XXEMUL_STATUS_OK && has_writeback)*status=xxemul_arm_write_register(e,in->operand[2].base_reg,writeback);
@@ -153,6 +153,8 @@ static int xxemul_arm_simd(xxemul *e, const cdisasm_arm_instruction *in, uint64_
             *status = xxemul_arm_read_register(e, in->operand[1].reg, pc, &value, NULL);
             if (*status != XXEMUL_STATUS_OK) return 1;
         }
+        /* This byte read validates cache-maintenance addressing; it is not
+         * an architectural data load and must not trigger a watchpoint. */
         *status = xxemul_read_memory(e, value, &byte, 1u);
         return 1;
     }

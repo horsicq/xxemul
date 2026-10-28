@@ -25,6 +25,7 @@ typedef struct xxemul xxemul;
 typedef uint32_t xxemul_arch;
 #define XXEMUL_ARCH_X86 UINT32_C(1)
 #define XXEMUL_ARCH_ARM UINT32_C(2)
+#define XXEMUL_ARCH_MIPS UINT32_C(3)
 
 typedef uint32_t xxemul_mode;
 #define XXEMUL_MODE_X86_16 UINT32_C(16)
@@ -33,6 +34,9 @@ typedef uint32_t xxemul_mode;
 #define XXEMUL_MODE_ARM_A32 UINT32_C(0x101)
 #define XXEMUL_MODE_ARM_T32 UINT32_C(0x102)
 #define XXEMUL_MODE_ARM_A64 UINT32_C(0x103)
+#define XXEMUL_MODE_MIPS32 UINT32_C(0x201)
+#define XXEMUL_MODE_MIPS32_LE XXEMUL_MODE_MIPS32
+#define XXEMUL_MODE_MIPS32_BE UINT32_C(0x202)
 
 typedef uint32_t xxemul_status;
 #define XXEMUL_STATUS_OK UINT32_C(0)
@@ -119,6 +123,17 @@ typedef struct xxemul_arm_state {
     uint32_t fpsr;
 } xxemul_arm_state;
 
+#define XXEMUL_MIPS_GPR_COUNT 32u
+
+/* Standard MIPS32 registers. Register zero always reads zero. The mode
+ * selects little/big endian memory order; both modes use the o32 ABI. */
+typedef struct xxemul_mips_state {
+    uint32_t gpr[XXEMUL_MIPS_GPR_COUNT];
+    uint32_t pc;
+    uint32_t hi;
+    uint32_t lo;
+} xxemul_mips_state;
+
 /**
  * Configuration for the initial flat-region backend.
  *
@@ -150,12 +165,34 @@ XXEMUL_API xxemul *xxemul_create(const xxemul_config *config, xxemul_status *sta
 /** Loads an explicitly selected executable format into owned memory. */
 XXEMUL_API xxemul *xxemul_create_image(xxemul_image_format format, const void *image, size_t image_size, xxemul_status *status);
 XXEMUL_API xxemul *xxemul_create_image_file(xxemul_image_format format, const char *path, xxemul_status *status);
-/** Explicit DOS format; COM has no signature and is never auto-detected. */
+/** Load a PE or DOS image at an explicit address. image_base == 0 preserves
+ * the existing loader behavior (PE preferred base; DOS PSP segment 0x814
+ * and first program/module byte at physical address 0x8240).
+ * A nonzero PE32/PE64 base applies relocations before execution and requires
+ * a complete, valid relocation table. Supported
+ * entries are HIGH/LOW, HIGHLOW (PE32), and DIR64 (PE64); other types are
+ * rejected. The mapped header retains its preferred ImageBase;
+ * xxemul_get_region_address() reports the actual PE load address.
+ * For COM, image_base names program byte zero (PSP:0100); for MZ it names
+ * module byte zero after the file header. DOS bases must be paragraph
+ * aligned, >=0x8240 and <0xa0000; COM additionally requires <=0x90100 so
+ * its stack fits below video memory. PSP = (image_base >> 4) - 0x10, set
+ * before DOS kernel initialization. MZ body, allocation and stack bounds
+ * must fit conventional RAM. DOS region_address remains zero because its
+ * memory region represents physical memory, including the PSP and kernel. */
+XXEMUL_API xxemul *xxemul_create_image_at(xxemul_image_format format, const void *image, size_t image_size, uint64_t image_base, xxemul_status *status);
+XXEMUL_API xxemul *xxemul_create_image_file_at(xxemul_image_format format, const char *path, uint64_t image_base, xxemul_status *status);
+/** Explicit DOS format; COM has no signature and is never auto-detected.
+ * Uses default PSP 0x814 and program/module address 0x8240. Select another
+ * DOS address through xxemul_create_image_at instead. */
 XXEMUL_API xxemul *xxemul_create_dos(xxemul_dos_format format, const void *image, size_t image_size, xxemul_status *status);
 /** Reads a COM or MZ file through xxfclib's file device. */
 XXEMUL_API xxemul *xxemul_create_dos_file(xxemul_dos_format format, const char *path, xxemul_status *status);
 /** Initialize guest OS services for a loaded PE, ELF, DOS, or ARM64/arm64e Mach-O image.
  * argv includes argv[0]; host file access is confined to working_directory.
+ * ELF selects Linux services or native FreeBSD i386 static services from
+ * OSABI 9. FreeBSD uses stack syscall arguments and CF/positive errno;
+ * unsupported FreeBSD architectures, dynamic images and legacy branding fail.
  * Mach-O starts at LC_MAIN with modeled Darwin libc/stdio/libc++ imports and
  * guest instruction execution. Its bounded filesystem bridge uses working_directory;
  * it does not run dyld, arbitrary host libraries, or host subprocesses. */
@@ -185,6 +222,8 @@ XXEMUL_API uint8_t xxemul_display_get_mode(const xxemul *emulator);
 
 XXEMUL_API xxemul_arch xxemul_get_arch(const xxemul *emulator);
 XXEMUL_API xxemul_mode xxemul_get_mode(const xxemul *emulator);
+/** The mapped region base. DOS returns zero because the region contains
+ * flat physical memory, rather than only the program/module bytes. */
 XXEMUL_API uint64_t xxemul_get_region_address(const xxemul *emulator);
 XXEMUL_API size_t xxemul_get_region_size(const xxemul *emulator);
 
@@ -195,6 +234,10 @@ XXEMUL_API xxemul_status xxemul_get_x86_state(const xxemul *emulator, xxemul_x86
 XXEMUL_API xxemul_status xxemul_set_x86_state(xxemul *emulator, const xxemul_x86_state *state);
 XXEMUL_API xxemul_status xxemul_get_arm_state(const xxemul *emulator, xxemul_arm_state *state);
 XXEMUL_API xxemul_status xxemul_set_arm_state(xxemul *emulator, const xxemul_arm_state *state);
+XXEMUL_API xxemul_status xxemul_get_mips_state(const xxemul *emulator, xxemul_mips_state *state);
+/* Changing PC cancels a pending delayed branch. Scalar register changes at
+ * the same PC preserve it so a debugger can stop inside the delay slot. */
+XXEMUL_API xxemul_status xxemul_set_mips_state(xxemul *emulator, const xxemul_mips_state *state);
 
 XXEMUL_API xxemul_status xxemul_step(xxemul *emulator, xxemul_step_info *info);
 XXEMUL_API xxemul_status xxemul_run(xxemul *emulator, uint64_t instruction_limit, uint64_t *instructions_executed);

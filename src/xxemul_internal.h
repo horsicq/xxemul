@@ -66,6 +66,11 @@ struct xxemul {
     uint16_t x87_control;
     uint16_t x87_status;
     xxemul_arm_state arm;
+    xxemul_mips_state mips;
+    uint32_t mips_branch_target;
+    int mips_delay_pending;
+    uint32_t mips_reservation;
+    int mips_reservation_valid;
     uint8_t dos_port_92;
     uint8_t dos_kbc_output;
     uint8_t dos_kbc_command;
@@ -105,11 +110,12 @@ struct xxemul {
 xxemul *xxemul_create_empty(xxemul_arch arch, xxemul_mode mode, uint64_t region_address, size_t region_size, xxemul_status *status);
 
 xxemul *xxemul_image_allocate(xxemul_arch arch, xxemul_mode mode, uint64_t base, uint64_t image_span, uint64_t entry, int unix_stack, xxemul_status *status);
-xxemul *xxemul_load_pe(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, xxemul_status *status);
+xxemul *xxemul_load_pe(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, uint64_t image_base, xxemul_status *status);
 xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, xxemul_status *status);
 xxemul *xxemul_load_macho(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, xxemul_status *status);
 int xxemul_load_com(xxemul *emulator, const uint8_t *image, size_t image_size, xx_io_device *io);
 int xxemul_load_msdos_exe(xxemul *emulator, const uint8_t *image, size_t image_size, xx_io_device *io);
+xxemul *xxemul_create_dos_at(xxemul_dos_format format, const void *image, size_t image_size, uint64_t image_base, xxemul_status *status);
 
 xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector);
 xxemul_status xxemul_bios_interrupt(xxemul *emulator, uint8_t vector);
@@ -133,5 +139,8 @@ size_t xxemul_x86_format_current(xxemul *emulator, char *buffer, size_t buffer_s
 
 xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info);
 size_t xxemul_arm_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
+
+xxemul_status xxemul_mips_step(xxemul *emulator, xxemul_step_info *info);
+size_t xxemul_mips_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
 
 #endif

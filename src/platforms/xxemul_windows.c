@@ -212,6 +212,11 @@ struct xxemul_windows {
     uint32_t resource_size;
 };
 
+static uint8_t win_word_size(const xxemul *emulator)
+{
+    return emulator->mode == XXEMUL_MODE_X86_64 || emulator->mode == XXEMUL_MODE_ARM_A64 ? 8u : 4u;
+}
+
 static uint16_t win_le16(const uint8_t *data)
 {
     return (uint16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
@@ -375,7 +380,7 @@ static int win_environment_match(const char *entry, const char *name)
 
 static int win_sync_environment(xxemul_windows *process)
 {
-    uint8_t word_size = process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u;
+    uint8_t word_size = win_word_size(process->emulator);
     size_t offset = 0u, index = 0u, i;
     if (!win_write(process, process->environment_a, process->environment_data, process->environment_size)) return 0;
     for (i = 0u; i < process->environment_size; ++i) {
@@ -822,7 +827,7 @@ static uint8_t win_argument_count(const char *name)
         win_equal(name, "GetDiskFreeSpaceExW") || win_equal(name, "GetStringTypeW") || win_equal(name, "LoadStringW") || win_equal(name, "LsaOpenPolicy") ||
         win_equal(name, "CreateSemaphoreW") || win_equal(name, "CreateEventW") || win_equal(name, "RtlUnwindEx") || win_equal(name, "VerQueryValueA"))
         return 4u;
-    if (win_equal(name, "GetModuleFileNameA") || win_equal(name, "GetModuleFileNameW") || win_equal(name, "VirtualFree") || win_equal(name, "HeapAlloc") ||
+    if (win_equal(name, "FlushInstructionCache") || win_equal(name, "GetModuleFileNameA") || win_equal(name, "GetModuleFileNameW") || win_equal(name, "VirtualFree") || win_equal(name, "HeapAlloc") ||
         win_equal(name, "HeapFree") || win_equal(name, "HeapSize") || win_equal(name, "LoadLibraryExA") || win_equal(name, "LoadLibraryExW") ||
         win_equal(name, "GetProcessAffinityMask") || win_equal(name, "GetModuleHandleExW") || win_equal(name, "GetModuleHandleExA") ||
         win_equal(name, "InitializeCriticalSectionEx") || win_equal(name, "ExpandEnvironmentStringsW") || win_equal(name, "OpenProcessToken") ||
@@ -865,7 +870,7 @@ static uint8_t win_argument_count(const char *name)
         win_equal(name, "VkKeyScanExA") || win_equal(name, "GetFileVersionInfoSizeA") || win_equal(name, "fputc") || win_equal(name, "putc") ||
         win_equal(name, "ungetc") || win_equal(name, "fputs") || win_equal(name, "_setmode"))
         return 2u;
-    if (win_equal(name, "QueryPerformanceCounter") || win_equal(name, "QueryPerformanceFrequency") || win_equal(name, "LoadLibraryA") ||
+    if (win_equal(name, "CacheSync") || win_equal(name, "QueryPerformanceCounter") || win_equal(name, "QueryPerformanceFrequency") || win_equal(name, "LoadLibraryA") ||
         win_equal(name, "LoadLibraryW") || win_equal(name, "ExitProcess") || win_equal(name, "exit") || win_equal(name, "GetModuleHandleA") ||
         win_equal(name, "GetModuleHandleW") || win_equal(name, "GetStdHandle") || win_equal(name, "GetFileType") || win_equal(name, "FlushFileBuffers") ||
         win_equal(name, "CloseHandle") || win_equal(name, "RemoveVectoredExceptionHandler") || win_equal(name, "InitializeCriticalSection") ||
@@ -908,7 +913,9 @@ static uint64_t win_resolve(xxemul_windows *process, const char *module, const c
     size_t i;
     win_api *api;
     uint64_t address;
-    int is_crt = win_crt_api(name) || win_suffix(module, "msvcrt.dll") || win_suffix(module, "ucrtbase.dll") || strstr(module, "api-ms-win-crt-") != NULL;
+    int is_crt;
+    if (strcmp(name, "GetProcAddressA") == 0) name = "GetProcAddress";
+    is_crt = win_crt_api(name) || win_suffix(module, "msvcrt.dll") || win_suffix(module, "ucrtbase.dll") || strstr(module, "api-ms-win-crt-") != NULL;
     if (win_equal(name, "_iob")) return process->iob_address;
     if (win_equal(name, "__initenv")) return process->runtime_base + WIN_CRT_DATA_OFFSET;
     if (win_equal(name, "__mb_cur_max")) return process->runtime_base + WIN_CRT_DATA_OFFSET + 8u;
@@ -1069,8 +1076,8 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
     xxemul *emulator = process->emulator;
     uint64_t peb = process->runtime_base + 0x2000u;
     uint64_t params = process->runtime_base + 0x4000u;
-    uint64_t stack_top = process->runtime_base - (emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
-    uint8_t word_size = (uint8_t)(emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint64_t stack_top = process->runtime_base - (win_word_size(emulator));
+    uint8_t word_size = (uint8_t)(win_word_size(emulator));
     char command_line[2048];
     uint64_t string_cursor;
     size_t i, length = 0;
@@ -1132,7 +1139,7 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
             !win_store(process, peb + 0x10u, 4u, params) || !win_store(process, params + 0x40u, 2u, length * 2u) ||
             !win_store(process, params + 0x42u, 2u, (length + 1u) * 2u) || !win_store(process, params + 0x44u, 4u, process->command_line_w))
             return 0;
-        emulator->x86.segment[XXEMUL_X86_FS] = 0x53u;
+        if (emulator->arch == XXEMUL_ARCH_X86) emulator->x86.segment[XXEMUL_X86_FS] = 0x53u;
     } else {
         if (!win_store(process, process->runtime_base + 0x08u, 8u, process->runtime_base) ||
             !win_store(process, process->runtime_base + 0x10u, 8u, process->runtime_base - 0x40000u) ||
@@ -1142,9 +1149,15 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
             !win_store(process, peb + 0x20u, 8u, params) || !win_store(process, params + 0x70u, 2u, length * 2u) ||
             !win_store(process, params + 0x72u, 2u, (length + 1u) * 2u) || !win_store(process, params + 0x78u, 8u, process->command_line_w))
             return 0;
-        emulator->x86.segment[XXEMUL_X86_GS] = 0x2bu;
+        if (emulator->arch == XXEMUL_ARCH_X86) emulator->x86.segment[XXEMUL_X86_GS] = 0x2bu;
     }
-    emulator->x86.gpr[XXEMUL_X86_RSP] = stack_top;
+    if (emulator->arch == XXEMUL_ARCH_ARM) {
+        /* AAPCS stack alignment and an explicit return-to-ExitProcess thunk.
+         * Windows ARM64 reserves X18 for its TEB; ARM32 has no x86 segment. */
+        emulator->arm.sp = stack_top & ~(uint64_t)(word_size == 8u ? 15u : 7u);
+        emulator->arm.gpr[word_size == 8u ? 30u : 14u] = win_resolve(process, word_size == 8u ? "kernel32.dll" : "coredll.dll", "ExitProcess");
+        if (word_size == 8u) emulator->arm.gpr[18] = process->runtime_base;
+    } else emulator->x86.gpr[XXEMUL_X86_RSP] = stack_top;
     return 1;
 }
 
@@ -1159,8 +1172,10 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
     int is_64;
 
     if (status != NULL) *status = XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (emulator == NULL || program_path == NULL || working_directory == NULL || emulator->arch != XXEMUL_ARCH_X86 ||
-        (emulator->mode != XXEMUL_MODE_X86_32 && emulator->mode != XXEMUL_MODE_X86_64) || emulator->region_size < WIN_RUNTIME_SIZE + 0x80000u ||
+    if (emulator == NULL || program_path == NULL || working_directory == NULL ||
+        !((emulator->arch == XXEMUL_ARCH_X86 && (emulator->mode == XXEMUL_MODE_X86_32 || emulator->mode == XXEMUL_MODE_X86_64)) ||
+          (emulator->arch == XXEMUL_ARCH_ARM && (emulator->mode == XXEMUL_MODE_ARM_A32 || emulator->mode == XXEMUL_MODE_ARM_T32 || emulator->mode == XXEMUL_MODE_ARM_A64))) ||
+        emulator->region_size < WIN_RUNTIME_SIZE + 0x80000u ||
         (argument_count != 0u && arguments == NULL))
         return NULL;
     bytes = emulator->region_data;
@@ -1172,7 +1187,7 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
     if (optional_size < 64u || optional_size > emulator->region_size || optional_offset > emulator->region_size - optional_size) return NULL;
     optional = bytes + optional_offset;
     magic = win_le16(optional);
-    is_64 = emulator->mode == XXEMUL_MODE_X86_64;
+    is_64 = win_word_size(emulator) == 8u;
     if (magic != (is_64 ? 0x20bu : 0x10bu)) return NULL;
     image_size = win_le32(optional + 56u);
     if (image_size == 0u || image_size > emulator->region_size || image_size + WIN_RUNTIME_SIZE + 0x80000u > emulator->region_size) return NULL;
@@ -1316,6 +1331,7 @@ static uint64_t win_module_handle(xxemul_windows *process, const char *name)
         win_copy(base, sizeof(base), name);
     }
     if (win_suffix(base, "kernel32.dll") || win_suffix(base, "kernelbase.dll") || win_prefix(base, "api-ms-win-core-")) return 0x76000000u;
+    if (win_suffix(base, "coredll.dll")) return 0x75000000u;
     if (win_suffix(base, "msvcrt.dll") || win_suffix(base, "ucrtbase.dll") || win_prefix(base, "api-ms-win-crt-")) return 0x77000000u;
     if (win_suffix(base, "ntdll.dll")) return 0x78000000u;
     if (win_suffix(base, "user32.dll")) return 0x79000000u;
@@ -1328,6 +1344,7 @@ static uint64_t win_module_handle(xxemul_windows *process, const char *name)
 static const char *win_module_name(uint64_t handle)
 {
     switch (handle) {
+        case 0x75000000u: return "coredll.dll";
         case 0x76000000u: return "kernel32.dll";
         case 0x77000000u: return "msvcrt.dll";
         case 0x78000000u: return "ntdll.dll";
@@ -1741,7 +1758,7 @@ static win_critical_section *win_critical_at(xxemul_windows *process, uint64_t a
 
 static xxemul_status win_critical_write(xxemul_windows *process, const win_critical_section *entry)
 {
-    uint8_t word_size = process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u;
+    uint8_t word_size = win_word_size(process->emulator);
     uint64_t address = entry->address;
     uint32_t lock_count = entry->recursion == 0u ? UINT32_MAX : entry->recursion - 1u;
     if (!win_store(process, address + word_size, 4u, lock_count) || !win_store(process, address + word_size + 4u, 4u, entry->recursion) ||
@@ -2658,7 +2675,7 @@ static int win_load_string(xxemul_windows *process, uint32_t uid, uint64_t buffe
             if (k == str_idx) {
                 if (max_chars == 0) {
                     if (buffer != 0) {
-                        win_store(process, buffer, process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u, curr);
+                        win_store(process, buffer, win_word_size(process->emulator), curr);
                     }
                     *result = str_len;
                     return 1;
@@ -2689,7 +2706,7 @@ static xxemul_status win_stdio_vfprintf(xxemul_windows *process, uint64_t stream
     char out_buf[4096];
     size_t out_len = 0;
     const char *p;
-    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint8_t word_size = (uint8_t)(win_word_size(process->emulator));
     uint64_t stride = word_size == 8u ? 48u : 32u;
 
     if (format_addr == 0) {
@@ -2870,7 +2887,7 @@ static uint64_t win_crt_fopen(xxemul_windows *process, const char *filename, con
     uint32_t disposition = 3u;
     uint64_t handle;
     size_t fd;
-    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint8_t word_size = (uint8_t)(win_word_size(process->emulator));
     uint64_t stride = word_size == 8u ? 48u : 32u;
 
     if (filename == NULL || mode == NULL) return 0;
@@ -2904,7 +2921,7 @@ static uint64_t win_crt_fopen(xxemul_windows *process, const char *filename, con
 
 static xxemul_status win_crt_fputc(xxemul_windows *process, uint8_t ch, uint64_t stream, uint64_t *result)
 {
-    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint8_t word_size = (uint8_t)(win_word_size(process->emulator));
     uint64_t stride = word_size == 8u ? 48u : 32u;
     if (stream == process->iob_address || stream == process->iob_address + stride || stream == process->iob_address + 2u * stride) {
         FILE *target_file = (stream == process->iob_address + 2u * stride) ? stderr : stdout;
@@ -2936,7 +2953,7 @@ static xxemul_status win_crt_fputc(xxemul_windows *process, uint8_t ch, uint64_t
 static xxemul_status win_call(xxemul_windows *process, const win_api *api, const uint64_t *arg, uint64_t *result)
 {
     const char *name = api->name;
-    uint8_t word_size = process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u;
+    uint8_t word_size = win_word_size(process->emulator);
     char text[1024];
     xx_io_device *io;
     uint64_t value, address;
@@ -3908,6 +3925,18 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         uint64_t base = process->emulator->region_address;
         uint64_t span = process->emulator->region_size;
         if (arg[0] >= base && arg[1] <= span && arg[0] - base <= span - arg[1] && win_store(process, arg[3], 4u, 0x40u)) *result = 1u;
+        else process->last_error = 487u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "CacheSync") == 0) {
+        /* WinCE exposes this as a void API. ARM instructions are decoded
+         * from current guest memory, so no instruction-cache work is needed. */
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "FlushInstructionCache") == 0) {
+        uint64_t base = process->emulator->region_address;
+        uint64_t span = process->emulator->region_size;
+        if ((arg[1] == 0 && arg[2] == 0) || (arg[1] >= base && arg[2] <= span && arg[1] - base <= span - arg[2])) *result = 1;
         else process->last_error = 487u;
         return XXEMUL_STATUS_OK;
     }
@@ -5757,7 +5786,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         uint64_t vtbl = process->runtime_base + WIN_SHELL_MALLOC_OFFSET + 8u;
         uint64_t stub = process->runtime_base + WIN_SHELL_MALLOC_OFFSET + 0x80u;
         size_t i;
-        word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+        word_size = (uint8_t)(win_word_size(process->emulator));
         if (word_size == 8u) {
             uint8_t ret_code[3] = {0x31, 0xc0, 0xc3}; /* xor eax, eax; ret */
             win_write(process, stub, ret_code, sizeof(ret_code));
@@ -5778,7 +5807,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     if (strcmp(name, "SHGetSpecialFolderLocation") == 0) {
         if (arg[2] != 0u) {
             uint64_t dummy_pidl = process->runtime_base + WIN_SHELL_MALLOC_OFFSET + 0x90u;
-            if (!win_store(process, arg[2], process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u, dummy_pidl)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            if (!win_store(process, arg[2], win_word_size(process->emulator), dummy_pidl)) return XXEMUL_STATUS_ADDRESS_FAULT;
         }
         *result = 0u; /* S_OK */
         return XXEMUL_STATUS_OK;
@@ -5818,7 +5847,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
 static xxemul_status win_initterm_continue(xxemul_windows *process, uint64_t current_ip, xxemul_step_info *info)
 {
     win_initterm_frame *frame;
-    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint8_t word_size = (uint8_t)(win_word_size(process->emulator));
     uint64_t next_ip;
     if (process->initterm_depth == 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     frame = &process->initterm_frames[process->initterm_depth - 1u];
@@ -5870,7 +5899,7 @@ static xxemul_status win_qsort_swap(xxemul_windows *process, const win_qsort_fra
 
 static xxemul_status win_qsort_compare(xxemul_windows *process, const win_qsort_frame *frame, uint64_t left, uint64_t right)
 {
-    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint8_t word_size = (uint8_t)(win_word_size(process->emulator));
     uint64_t reserved = word_size == 8u ? 48u : 16u;
     uint64_t callback_sp;
     if (frame->call_sp < reserved) return XXEMUL_STATUS_ADDRESS_FAULT;
@@ -5890,7 +5919,7 @@ static xxemul_status win_qsort_compare(xxemul_windows *process, const win_qsort_
 static xxemul_status win_qsort_continue(xxemul_windows *process, uint64_t current_ip, xxemul_step_info *info)
 {
     win_qsort_frame *frame;
-    uint8_t word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    uint8_t word_size = (uint8_t)(win_word_size(process->emulator));
     xxemul_status status;
     uint64_t next_ip;
     if (process->qsort_depth == 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
@@ -5961,6 +5990,62 @@ static xxemul_status win_qsort_continue(xxemul_windows *process, uint64_t curren
     return XXEMUL_STATUS_OK;
 }
 
+static int win_arm_try_step(xxemul_windows *process, xxemul_step_info *info, xxemul_status *status)
+{
+    xxemul *emulator = process->emulator;
+    uint64_t ip = emulator->arm.pc, index, result = 0, return_address;
+    uint64_t arguments[16] = {0};
+    uint8_t word_size = win_word_size(emulator), register_count = word_size == 8u ? 8u : 4u;
+    unsigned i;
+    win_api *api;
+    xxemul_status call_status;
+    if (ip < process->runtime_base + WIN_THUNK_OFFSET) return 0;
+    index = (ip - process->runtime_base - WIN_THUNK_OFFSET) / WIN_THUNK_STRIDE;
+    if (index >= process->api_count || ip != process->runtime_base + WIN_THUNK_OFFSET + index * WIN_THUNK_STRIDE) return 0;
+    api = &process->apis[index];
+    /* The shared implementations below use guest-memory addresses and
+     * scalar arguments. Register-context and guest-callback APIs require
+     * architecture-specific implementations and are deliberately rejected. */
+    if (strcmp(api->name, "LoadLibraryA") && strcmp(api->name, "LoadLibraryW") && strcmp(api->name, "LoadLibraryExA") &&
+        strcmp(api->name, "LoadLibraryExW") && strcmp(api->name, "GetProcAddress") && strcmp(api->name, "VirtualProtect") &&
+        strcmp(api->name, "FlushInstructionCache") && strcmp(api->name, "CacheSync") && strcmp(api->name, "ExitProcess") &&
+        strcmp(api->name, "GetStdHandle") && strcmp(api->name, "WriteFile") && strcmp(api->name, "GetCurrentProcess") &&
+        strcmp(api->name, "GetModuleHandleA") && strcmp(api->name, "GetModuleHandleW")) {
+        *status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        return 1;
+    }
+    for (i = 0; i < api->argument_count && i < 16; ++i) {
+        if (i < register_count) arguments[i] = emulator->arm.gpr[i] & (word_size == 8u ? UINT64_MAX : UINT32_MAX);
+        else if (!win_load(process, emulator->arm.sp + (uint64_t)(i - register_count) * word_size, word_size, &arguments[i])) {
+            *status = XXEMUL_STATUS_ADDRESS_FAULT;
+            return 1;
+        }
+    }
+    return_address = emulator->arm.gpr[word_size == 8u ? 30u : 14u];
+    if ((word_size == 8u && (return_address & 3u) != 0u) ||
+        (word_size == 4u && (return_address & 3u) == 2u)) {
+        *status = XXEMUL_STATUS_ADDRESS_FAULT;
+        return 1;
+    }
+    call_status = win_call(process, api, arguments, &result);
+    if (info != NULL) {
+        info->address = ip;
+        info->next_address = return_address & (word_size == 8u ? UINT64_MAX : ~UINT64_C(1));
+        info->size = 4u;
+        info->instruction_id = 0;
+    }
+    if (call_status == XXEMUL_STATUS_OK) {
+        emulator->arm.gpr[0] = result & (word_size == 8u ? UINT64_MAX : UINT32_MAX);
+        if (word_size == 4u) {
+            emulator->mode = (return_address & 1u) != 0u ? XXEMUL_MODE_ARM_T32 : XXEMUL_MODE_ARM_A32;
+            emulator->arm.pstate = (emulator->arm.pstate & ~UINT32_C(0x20)) | ((return_address & 1u) != 0u ? 0x20u : 0u);
+            emulator->arm.pc = return_address & UINT32_C(0xfffffffe);
+        } else emulator->arm.pc = return_address;
+    }
+    *status = call_status;
+    return 1;
+}
+
 int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxemul_status *status)
 {
     uint64_t ip, index, return_address, value = 0;
@@ -5970,6 +6055,7 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
     xxemul_status call_status;
 
     if (process == NULL || status == NULL) return 0;
+    if (process->emulator->arch == XXEMUL_ARCH_ARM) return win_arm_try_step(process, info, status);
     ip = process->emulator->x86.ip;
     if (ip == process->runtime_base + WIN_INITTERM_RETURN_OFFSET) {
         *status = win_initterm_continue(process, ip, info);
@@ -5983,7 +6069,7 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
     index = (ip - process->runtime_base - WIN_THUNK_OFFSET) / WIN_THUNK_STRIDE;
     if (index >= process->api_count || ip != process->runtime_base + WIN_THUNK_OFFSET + index * WIN_THUNK_STRIDE) return 0;
     api = &process->apis[index];
-    word_size = (uint8_t)(process->emulator->mode == XXEMUL_MODE_X86_64 ? 8u : 4u);
+    word_size = (uint8_t)(win_word_size(process->emulator));
     if (!win_load(process, process->emulator->x86.gpr[XXEMUL_X86_RSP], word_size, &return_address)) {
         *status = XXEMUL_STATUS_ADDRESS_FAULT;
         return 1;

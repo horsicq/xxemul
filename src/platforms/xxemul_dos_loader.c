@@ -45,6 +45,11 @@ static void xxemul_dos_make_psp(xxemul *emulator)
 
 xxemul *xxemul_create_dos(xxemul_dos_format format, const void *image, size_t image_size, xxemul_status *status)
 {
+    return xxemul_create_dos_at(format, image, image_size, 0, status);
+}
+
+xxemul *xxemul_create_dos_at(xxemul_dos_format format, const void *image, size_t image_size, uint64_t image_base, xxemul_status *status)
+{
     xx_io_device *io;
     xxemul *emulator;
     int loaded;
@@ -55,6 +60,13 @@ xxemul *xxemul_create_dos(xxemul_dos_format format, const void *image, size_t im
     if ((format != XXEMUL_DOS_COM && format != XXEMUL_DOS_MZ) || image == NULL || image_size == 0u || image_size > (size_t)LONG_MAX) {
         return NULL;
     }
+    /* Keep the PSP and its preceding MCB above the fixed DOS kernel/SFT,
+     * environment, list-of-lists and JFT regions. COM also needs its full
+     * 64 KiB PSP segment because SS:SP starts at PSP:FFFE. MZ image, stack
+     * and allocation bounds are checked by the MZ loader itself. */
+    if (image_base != 0 && ((image_base & 15u) != 0u ||
+        image_base < ((uint64_t)XXEMUL_DOS_PSP_SEGMENT + 0x10u) * 16u || image_base >= 0xa0000u ||
+        (format == XXEMUL_DOS_COM && image_base > 0xa0000u - 0xff00u))) return NULL;
     io = xx_io_mem_open_ro(image, image_size);
     if (io == NULL) {
         if (status != NULL) {
@@ -68,7 +80,7 @@ xxemul *xxemul_create_dos(xxemul_dos_format format, const void *image, size_t im
         return NULL;
     }
     emulator->dos_mode = 1;
-    emulator->psp_segment = XXEMUL_DOS_PSP_SEGMENT;
+    emulator->psp_segment = image_base ? (uint16_t)((image_base >> 4) - 0x10u) : XXEMUL_DOS_PSP_SEGMENT;
     emulator->dos_dta_segment = emulator->psp_segment;
     emulator->dos_dta_offset = 0x80u;
     emulator->dos_port_92 = 2u;

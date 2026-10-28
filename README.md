@@ -1,6 +1,6 @@
 # xxemul
 
-`xxemul` is a pure C11 instruction emulator for x86, ARM and Dalvik. It accepts a
+`xxemul` is a pure C11 instruction emulator for x86, ARM, MIPS32 and Dalvik. It accepts a
 caller-supplied flat region, or explicitly loads COM, MZ, PE32, PE64, ELF32,
 ELF64, Mach-O 32, and Mach-O 64 images. The loaders use format parsers from
 the sibling `xxfclib`.
@@ -43,8 +43,10 @@ can continue using the default full xxfclib profile.
 
 - x86 16-bit, 32-bit, and 64-bit decode modes
 - ARM A32, T32, and A64 decode modes
+- MIPS32 little/big endian integer execution with delayed branches, HI/LO,
+  aligned/unaligned loads and stores, and Linux o32 syscalls
 - Structured decoding and formatting through `cdisasm` in every native mode:
-  x86 16/32/64, ARM A32, Thumb T32, and ARM A64 (including arm64e)
+  x86 16/32/64, ARM A32, Thumb T32, ARM A64 (including arm64e), and MIPS32
 - ARM64e PAC/AUT, XPAC, authenticated branches and returns execute from
   `cdisasm` A64 mnemonics and structured operands, with software pointer
   authentication shared by the Mach-O loader and Darwin runtime
@@ -59,8 +61,9 @@ can continue using the default full xxfclib profile.
   basic loads/stores, stack operations, calls, returns, and branches
 - Explicit halt, decode, address, and unsupported-instruction results
 - COM/MZ loading into real-mode memory with A20 high-memory aliases, PSP
-  creation, and MZ relocations
-- PE32/PE64 preferred-base section mapping; ELF32/ELF64 `ET_EXEC` segment
+  creation, explicit DOS load addresses, and MZ relocations
+- PE32/PE64 preferred-base or explicit-base section mapping with validated
+  HIGH/LOW/HIGHLOW/DIR64 base relocations; ELF32/ELF64 `ET_EXEC` segment
   mapping, including zero-filled BSS and a minimal empty stack
 - Separate bounded ELF32/ELF64 `ET_DYN` API with shared-object relocations,
   explicit version-aware guest import resolution and constructor inventory
@@ -89,8 +92,9 @@ The display renders 80x25 VGA text memory at `0xB8000`, or mode 13h
 is fixed; VGA DAC port programming, sound, timers, and hardware-accurate
 timing are not implemented. DOS filesystem services are incomplete. Port 92h,
 basic keyboard-controller A20 control, and PIC mask/setup registers are
-modeled, but the chipset is not hardware-accurate. DOS MZ loading currently
-uses a low load address. This is an incremental DOS environment, not a full
+modeled, but the chipset is not hardware-accurate. DOS loading defaults to
+program/module address `0x8240` and accepts explicit addresses in conventional
+RAM as described below. This is an incremental DOS environment, not a full
 MS-DOS replacement.
 
 The DOS DPMI host supports the entry switch, descriptor allocation and setup,
@@ -109,7 +113,8 @@ location is `../xxfclib`; use a different source tree with:
 
 The format is explicit because a COM file has no signature. PE supports x86,
 x86-64, ARM32, and ARM64 machine types; ELF supports x86, x86-64, ARM32, and
-ARM64 in little-endian `ET_EXEC` images. PE images use their preferred base;
+ARM64 in little-endian `ET_EXEC` images, plus MIPS32 o32 in either byte order.
+Compressed MIPS encodings, n32/n64 and Release 6 are rejected. PE images use their preferred base;
 ELF images use `PT_LOAD` virtual addresses. Image regions and file inputs are
 currently capped at 128 MiB. PE import thunks and a subset of Windows API
 calls are emulated, along with selected Linux syscalls and an executable
@@ -127,6 +132,29 @@ imports and old dyld fixup streams remain unsupported. COM, MS-DOS EXE, PE, ELF,
 live in separate `src/formats` C files. `src/platforms/xxemul_dos_loader.c`
 owns shared DOS setup, while `src/xxemul_image.c` owns image dispatch and
 file I/O.
+
+The Linux process bridge supports i386, AMD64, ARM32 EABI, AArch64 and
+MIPS32 o32 stack/auxv and syscall conventions. MIPS errors use `a3` and the
+positive `v0` errno; guest stack words, stat fields and syscall data follow
+the selected byte order. `xxemul_mips_state` and its get/set functions expose
+GPR0–31, PC, HI and LO. Mode selects byte order. Guest CPU data accesses
+notify memory observers after successful transfers; instruction fetch and
+host memory inspection do not notify them. LL/SC uses a conservative
+single-emulator reservation invalidated by writes, without a multiprocessor
+atomic-memory model.
+
+The ELF process bridge also models native FreeBSD i386 static executables
+with canonical OSABI 9. It selects FreeBSD stack arguments, auxiliary-vector
+tags, syscall numbers, mapping flags and positive errno/carry-flag results.
+It reuses bounded guest mappings and confined file I/O. FreeBSD AMD64,
+dynamic loading and legacy `e_ident` branding are unsupported. See the
+[FreeBSD UPX guide](../xxdebugscript/samples/README_FREEBSD.md) for fixture
+generation and validation with UPX 3.94.
+
+Static owned ARM32, ARM64 and MIPS32 LE/BE ELF fixtures packed with UPX
+4.2.4 NRV2E/LZMA have been unpacked through both script adapters and executed
+afresh in the debugger. The fixture programs use modeled write/exit calls;
+this does not establish arbitrary libc, dynamic-linker or native-host support.
 
 ## Shared ELF API
 
@@ -173,7 +201,47 @@ CPU memory accesses also honor the emulated A20 gate.
 Use `xxemul_create_image` or `xxemul_create_image_file` for all eight explicit
 formats.
 
+For PE32/PE64 rebasing, use `xxemul_create_image_at` or
+`xxemul_create_image_file_at` with an explicit load base. Zero selects the
+preferred address. The loader validates the full relocation table and applies
+HIGH, LOW, HIGHLOW (PE32), and DIR64 (PE64) fixups before execution. The mapped
+PE header retains the preferred ImageBase; region/entry getters use the actual
+address. Unsupported relocation types and malformed tables return an error.
+An empty relocation directory is valid when relocations are not marked
+stripped, as with a position-independent UPX PE64 loader stub.
+ELF and Mach-O formats reject an explicit load base.
+
+The same `_at` constructors support COM and MZ. Here `image_base` is the
+first COM program byte or the first MZ load-module byte after its file header;
+it is not the PSP address or the MZ entry address. The loader derives the PSP
+segment as `(image_base >> 4) - 0x10` before initializing the PSP, MCB and DOS
+kernel structures. Thus `image_base=0x10000` uses PSP segment `0x0ff0`, while
+`0x18000` uses `0x17f0`. Zero retains PSP `0x0814` and program/module base
+`0x8240`; `xxemul_create_dos` and `xxemul_create_dos_file` retain that default.
+
+An explicit DOS address must be paragraph aligned, at least `0x8240` and
+below `0xa0000`, preserving the fixed DOS kernel and environment regions.
+COM additionally requires an address at most `0x90100` so PSP:FFFE stays in
+conventional RAM. MZ body, minimum allocation, entry and stack bounds are
+validated by its loader, and segment relocation words receive the actual
+module load segment. DOS `xxemul_get_region_address()` remains zero: its
+region models flat physical memory. Use register/linear-address getters for
+the program's current address. The debugger/script `imageBase()` likewise
+remains zero for DOS.
+
+`xxemul_dos_load_base_tests` covers default and explicit COM/MZ placements,
+PSP/kernel initialization, consumed MZ relocations, execution and invalid
+address bounds. It is registered when `XXEMUL_BUILD_TESTS` and
+`BUILD_TESTING` are enabled.
+
 ## Debugger support
+
+The modeled Windows bridge also accepts ARM32 WinCE and Windows ARM64 PE
+images, with AAPCS32/AAPCS64 argument and return handling. It includes the
+COREDLL/kernel32 operations needed by the real UPX ARM stubs, including
+CacheSync and FlushInstructionCache. See the bounded
+[ARM UPX sample](../xxdebugscript/samples/README_ARM.md) for generated inputs
+and unpack/rebase/debugger tests. This does not run the native Windows OS.
 
 These hooks are used by the xxdebug emulator backend:
 

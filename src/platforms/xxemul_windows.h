@@ -17,8 +17,8 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
 xxemul_status xxemul_windows_set_environment(xxemul_windows *process, const char *name, const char *value);
 void xxemul_windows_destroy(xxemul_windows *process);
 
-/* Call before normal x86 instruction decoding. A nonzero return means the
- * guest IP was a synthetic Windows API thunk and status is authoritative. */
+/* Call before normal x86/ARM instruction decoding. A nonzero return means
+ * the guest PC was a synthetic Windows API thunk and status is authoritative. */
 int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxemul_status *status);
 
 /* FS (x86) and GS (x86-64) base for TEB-relative memory operands. */

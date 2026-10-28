@@ -9,7 +9,10 @@
 typedef struct xxemul_linux_process xxemul_linux_process;
 typedef void (*xxemul_linux_output_callback)(void *context, int descriptor, const void *bytes, size_t size);
 
-/* The caller owns the emulator. argv includes argv[0]; when empty, the
+/* Shared bounded ELF process services. OSABI0/3 (and ARM32 OSABI97) select
+ * Linux; canonical static FreeBSD OSABI9 i386 selects its stack syscall ABI.
+ * Unknown/legacy FreeBSD branding and unsupported FreeBSD architectures fail.
+ * The caller owns the emulator. argv includes argv[0]; when empty, the
  * executable path is used. The working directory confines host file I/O. */
 xxemul_linux_process *xxemul_linux_create(xxemul *emulator, const char *executable_path, const char *working_directory, int argc, const char *const *argv);
 /* Start a replacement ELF already held in guest memory (such as a memfd).
@@ -19,7 +22,8 @@ xxemul_linux_process *xxemul_linux_create_image(xxemul *emulator, const uint8_t 
 void xxemul_linux_destroy(xxemul_linux_process *process);
 void xxemul_linux_set_output(xxemul_linux_process *process, xxemul_linux_output_callback callback, void *context);
 
-/* Called for int 0x80 (i386) or syscall (amd64), after instruction decode.
+/* Called for int 0x80 (i386 Linux/FreeBSD), syscall (amd64/MIPS o32 Linux),
+ * or svc #0 (Linux ARM EABI/AArch64), after instruction decode.
  * The CPU still owns advancement of IP and the final HALTED step result. */
 xxemul_status xxemul_linux_dispatch(xxemul_linux_process *process);
 int xxemul_linux_has_exited(const xxemul_linux_process *process);

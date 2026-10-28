@@ -68,6 +68,7 @@ if(NOT TARGET cdisasm::cdisasm)
         set(CDISASM_VERIFY_GENERATED OFF CACHE BOOL "" FORCE)
         set(USE_ARCH_X86 ON CACHE BOOL "" FORCE)
         set(USE_ARCH_ARM ON CACHE BOOL "" FORCE)
+        set(USE_ARCH_MIPS ON CACHE BOOL "" FORCE)
         set(USE_DISASM_FORMAT ON CACHE BOOL "" FORCE)
         set(USE_EXTRA_OPCODES ${XXEMUL_CDISASM_EXTRA_OPCODES} CACHE BOOL "" FORCE)
         set(_xxemul_build_testing "${BUILD_TESTING}")
@@ -118,6 +119,7 @@ add_library(xxemul
     src/xxemul_status.c
     src/xxemul_x86.c
     src/xxemul_arm.c
+    src/xxemul_mips.c
     src/xxemul_arm_simd.h
     src/xxemul_arm_auth.h
     src/xxemul_arm_auth_exec.h
@@ -272,6 +274,24 @@ if(XXEMUL_BUILD_VIEWER)
 endif()
 
 if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
+    add_executable(xxemul_dos_load_base_tests tests/test_dos_load_base.c)
+    target_link_libraries(xxemul_dos_load_base_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_dos_load_base_tests COMMAND xxemul_dos_load_base_tests)
+    set_tests_properties(xxemul_dos_load_base_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_mips_tests tests/test_mips.c)
+    target_link_libraries(xxemul_mips_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_mips_tests COMMAND xxemul_mips_tests)
+    add_executable(xxemul_arm_memory_hook_tests tests/test_arm_memory_hooks.c)
+    target_link_libraries(xxemul_arm_memory_hook_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_arm_memory_hook_tests COMMAND xxemul_arm_memory_hook_tests)
+    add_executable(xxemul_linux_abi_tests tests/test_linux_abis.c)
+    target_include_directories(xxemul_linux_abi_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(xxemul_linux_abi_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+    add_test(NAME xxemul_linux_abi_tests COMMAND xxemul_linux_abi_tests)
+    add_executable(xxemul_freebsd_abi_tests tests/test_freebsd_abi.c)
+    target_include_directories(xxemul_freebsd_abi_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(xxemul_freebsd_abi_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+    add_test(NAME xxemul_freebsd_abi_tests COMMAND xxemul_freebsd_abi_tests)
     if(XXEMUL_CDISASM_EXTRA_OPCODES)
         add_executable(xxemul_cdisasm_x87_tests tests/test_cdisasm_x87.c)
         target_link_libraries(xxemul_cdisasm_x87_tests PRIVATE cdisasm::cdisasm)

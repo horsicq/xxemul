@@ -52,6 +52,11 @@ typedef struct linux_map {
 struct xxemul_linux_process {
     xxemul *emulator;
     int is_64;
+    int big_endian;
+    int freebsd;
+    uint64_t freebsd_arguments[8];
+    int legacy_stat;
+    int argument_fault;
     int exited;
     int exit_code;
     int exec_fd;
@@ -87,19 +92,21 @@ struct xxemul_linux_process {
     size_t first_syscall_count;
 };
 
-static uint16_t linux_u16(const uint8_t *data)
+/* Guest byte order applies to ELF headers, auxv, iovec and syscall structs. */
+static uint64_t linux_load_value(const xxemul_linux_process *process, const uint8_t *data, unsigned width)
 {
-    return (uint16_t)(data[0] | (uint16_t)data[1] << 8);
+    uint64_t value = 0;
+    unsigned index;
+    for (index = 0; index < width; ++index)
+        value |= (uint64_t)data[index] << (8u * (process->big_endian ? width - 1u - index : index));
+    return value;
 }
 
-static uint32_t linux_u32(const uint8_t *data)
+static void linux_put_value(const xxemul_linux_process *process, uint8_t *data, size_t offset, uint64_t value, unsigned width)
 {
-    return (uint32_t)data[0] | (uint32_t)data[1] << 8 | (uint32_t)data[2] << 16 | (uint32_t)data[3] << 24;
-}
-
-static uint64_t linux_u64(const uint8_t *data)
-{
-    return (uint64_t)linux_u32(data) | (uint64_t)linux_u32(data + 4) << 32;
+    unsigned index;
+    for (index = 0; index < width; ++index)
+        data[offset + index] = (uint8_t)(value >> (8u * (process->big_endian ? width - 1u - index : index)));
 }
 
 static uint64_t linux_align_up(uint64_t value, uint64_t alignment)
@@ -287,19 +294,17 @@ static int linux_guest_write(xxemul_linux_process *process, uint64_t address, co
 static int linux_guest_value(xxemul_linux_process *process, uint64_t address, unsigned width, uint64_t *value)
 {
     uint8_t data[8];
-    unsigned index;
     *value = 0;
     if (width > sizeof(data) || !linux_guest_read(process, address, data, width)) return 0;
-    for (index = 0; index < width; ++index) *value |= (uint64_t)data[index] << (8u * index);
+    *value = linux_load_value(process, data, width);
     return 1;
 }
 
 static int linux_guest_store(xxemul_linux_process *process, uint64_t address, unsigned width, uint64_t value)
 {
     uint8_t data[8];
-    unsigned index;
     if (width > sizeof(data)) return 0;
-    for (index = 0; index < width; ++index) data[index] = (uint8_t)(value >> (8u * index));
+    linux_put_value(process, data, 0, value, width);
     return linux_guest_write(process, address, data, width);
 }
 
@@ -322,16 +327,16 @@ static int linux_phdr_info(const xxemul_linux_process *process, uint64_t *addres
     uint64_t offset;
     uint64_t index;
     if (size < (process->is_64 ? 64u : 52u) || memcmp(image, "\177ELF", 4u) != 0) return 0;
-    offset = process->is_64 ? linux_u64(image + 32) : linux_u32(image + 28);
-    *entry_size = linux_u16(image + (process->is_64 ? 54 : 42));
-    *count = linux_u16(image + (process->is_64 ? 56 : 44));
+    offset = process->is_64 ? linux_load_value(process, image + 32, 8u) : linux_load_value(process, image + 28, 4u);
+    *entry_size = linux_load_value(process, image + (process->is_64 ? 54 : 42), 2u);
+    *count = linux_load_value(process, image + (process->is_64 ? 56 : 44), 2u);
     if (*entry_size < (process->is_64 ? 56u : 32u) || *count > 256u || offset > size || *count > (size - (size_t)offset) / *entry_size) return 0;
     for (index = 0; index < *count; ++index) {
         const uint8_t *ph = image + offset + index * *entry_size;
-        uint64_t file_offset = process->is_64 ? linux_u64(ph + 8) : linux_u32(ph + 4);
-        uint64_t virtual_address = process->is_64 ? linux_u64(ph + 16) : linux_u32(ph + 8);
-        uint64_t file_size = process->is_64 ? linux_u64(ph + 32) : linux_u32(ph + 16);
-        if (linux_u32(ph) == 1u && offset >= file_offset && offset - file_offset <= file_size && *count * *entry_size <= file_size - (offset - file_offset)) {
+        uint64_t file_offset = process->is_64 ? linux_load_value(process, ph + 8, 8u) : linux_load_value(process, ph + 4, 4u);
+        uint64_t virtual_address = process->is_64 ? linux_load_value(process, ph + 16, 8u) : linux_load_value(process, ph + 8, 4u);
+        uint64_t file_size = process->is_64 ? linux_load_value(process, ph + 32, 8u) : linux_load_value(process, ph + 16, 4u);
+        if (linux_load_value(process, ph, 4u) == 1u && offset >= file_offset && offset - file_offset <= file_size && *count * *entry_size <= file_size - (offset - file_offset)) {
             *address = virtual_address + offset - file_offset;
             return 1;
         }
@@ -341,8 +346,11 @@ static int linux_phdr_info(const xxemul_linux_process *process, uint64_t *addres
 
 static int linux_initial_stack(xxemul_linux_process *process, int argc, const char *const *argv, int envc, const char *const *envp)
 {
-    static const uint64_t aux_types[] = {3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 23, 25, 31, 0};
-    uint64_t aux_values[sizeof(aux_types) / sizeof(aux_types[0])] = {0};
+    static const uint64_t linux_aux_types[] = {3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 23, 25, 31, 0};
+    static const uint64_t freebsd_aux_types[] = {3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 19, 23, 0};
+    const uint64_t *aux_types = process->freebsd ? freebsd_aux_types : linux_aux_types;
+    const size_t aux_count = sizeof(linux_aux_types) / sizeof(linux_aux_types[0]);
+    uint64_t aux_values[sizeof(linux_aux_types) / sizeof(linux_aux_types[0])] = {0};
     uint64_t arg_address[129];
     uint64_t env_address[129];
     uint64_t stack_top = process->emulator->region_address + process->emulator->region_size;
@@ -387,16 +395,26 @@ static int linux_initial_stack(xxemul_linux_process *process, int argc, const ch
     random_address = (cursor - sizeof(random_bytes)) & ~UINT64_C(15);
     memset(random_bytes, 0x5a, sizeof(random_bytes));
     if (!linux_guest_write(process, random_address, random_bytes, sizeof(random_bytes))) return 0;
-    entry = process->emulator->x86.ip;
+    /* Preserve the Thumb entry bit in AT_ENTRY even though the CPU keeps an
+     * aligned PC and records its instruction set separately. */
+    entry = linux_load_value(process, process->self_data + 24u, width);
     aux_values[0] = phdr;
     aux_values[1] = phent;
     aux_values[2] = phnum;
     aux_values[3] = LINUX_PAGE;
     aux_values[6] = entry;
-    aux_values[12] = 100u;
-    aux_values[14] = random_address;
-    aux_values[15] = execfn_address;
-    i = 1u + (size_t)argc + 1u + (size_t)envc + 1u + 2u * sizeof(aux_types) / sizeof(aux_types[0]);
+    if (process->freebsd) {
+        aux_values[11] = execfn_address; /* AT_EXECPATH */
+        aux_values[12] = random_address; /* AT_CANARY */
+        aux_values[13] = sizeof(random_bytes);
+        aux_values[14] = 1; /* AT_NCPUS */
+        aux_values[15] = 3; /* AT_STACKPROT: read/write */
+    } else {
+        aux_values[12] = 100u;
+        aux_values[14] = random_address;
+        aux_values[15] = execfn_address;
+    }
+    i = 1u + (size_t)argc + 1u + (size_t)envc + 1u + 2u * aux_count;
     if (random_address < low + i * width) return 0;
     sp = (random_address - i * width) & ~UINT64_C(15);
     if (sp < low) return 0;
@@ -411,28 +429,40 @@ static int linux_initial_stack(xxemul_linux_process *process, int argc, const ch
         if (!linux_guest_store(process, cursor, width, env_address[index])) return 0;
     if (!linux_guest_store(process, cursor, width, 0)) return 0;
     cursor += width;
-    for (i = 0; i < sizeof(aux_types) / sizeof(aux_types[0]); ++i) {
+    for (i = 0; i < aux_count; ++i) {
         if (!linux_guest_store(process, cursor, width, aux_types[i]) || !linux_guest_store(process, cursor + width, width, aux_values[i])) return 0;
         cursor += 2u * width;
     }
-    process->emulator->x86.gpr[XXEMUL_X86_RSP] = sp;
-    process->emulator->x86.segment[XXEMUL_X86_CS] = process->is_64 ? 0x33u : 0x23u;
-    process->emulator->x86.segment[XXEMUL_X86_SS] = 0x2bu;
-    process->emulator->x86.segment[XXEMUL_X86_DS] = 0x2bu;
-    process->emulator->x86.segment[XXEMUL_X86_ES] = 0x2bu;
+    if (process->emulator->arch == XXEMUL_ARCH_X86) {
+        process->emulator->x86.gpr[XXEMUL_X86_RSP] = sp;
+        process->emulator->x86.segment[XXEMUL_X86_CS] = process->is_64 ? 0x33u : 0x23u;
+        process->emulator->x86.segment[XXEMUL_X86_SS] = 0x2bu;
+        process->emulator->x86.segment[XXEMUL_X86_DS] = 0x2bu;
+        process->emulator->x86.segment[XXEMUL_X86_ES] = 0x2bu;
+    } else if (process->emulator->arch == XXEMUL_ARCH_ARM) {
+        process->emulator->arm.sp = sp;
+        /* Linux starts a static image with no dynamic-linker finalizer. */
+        process->emulator->arm.gpr[0] = 0;
+    } else {
+        process->emulator->mips.gpr[29] = (uint32_t)sp;
+        process->emulator->mips.gpr[2] = 0;
+    }
     return 1;
 }
 
 static xxemul_linux_process *linux_new_process(xxemul *emulator, const char *guest_executable_path, const char *working_directory)
 {
     xxemul_linux_process *process;
-    if (emulator == NULL || emulator->arch != XXEMUL_ARCH_X86 || (emulator->mode != XXEMUL_MODE_X86_32 && emulator->mode != XXEMUL_MODE_X86_64) ||
-        guest_executable_path == NULL || working_directory == NULL)
+    if (emulator == NULL || guest_executable_path == NULL || working_directory == NULL ||
+        !((emulator->arch == XXEMUL_ARCH_X86 && (emulator->mode == XXEMUL_MODE_X86_32 || emulator->mode == XXEMUL_MODE_X86_64)) ||
+          (emulator->arch == XXEMUL_ARCH_ARM && (emulator->mode == XXEMUL_MODE_ARM_A32 || emulator->mode == XXEMUL_MODE_ARM_T32 || emulator->mode == XXEMUL_MODE_ARM_A64)) ||
+          (emulator->arch == XXEMUL_ARCH_MIPS && (emulator->mode == XXEMUL_MODE_MIPS32 || emulator->mode == XXEMUL_MODE_MIPS32_BE))))
         return NULL;
     process = (xxemul_linux_process *)calloc(1u, sizeof(*process));
     if (process == NULL) return NULL;
     process->emulator = emulator;
-    process->is_64 = emulator->mode == XXEMUL_MODE_X86_64;
+    process->is_64 = emulator->mode == XXEMUL_MODE_X86_64 || emulator->mode == XXEMUL_MODE_ARM_A64;
+    process->big_endian = emulator->mode == XXEMUL_MODE_MIPS32_BE;
     process->next_map = process->is_64 ? UINT64_C(0x100000000) : UINT64_C(0x10000000);
     process->exec_fd = -1;
 #if defined(_MSC_VER)
@@ -452,12 +482,40 @@ failed:
     return NULL;
 }
 
+/* Select the guest kernel ABI from the actual ELF, never the host OS.
+ * FreeBSD support is deliberately limited to canonical static i386 images;
+ * historical EI_PAD branding must not accidentally execute Linux syscalls. */
+static int elf_process_abi(xxemul_linux_process *process)
+{
+    const uint8_t *image = process->self_data;
+    size_t size = process->self_size;
+    uint64_t phoff, count, entry_size, index;
+    if (size < 52u || memcmp(image, "\177ELF", 4) || (image[4] != 1 && image[4] != 2)) return 0;
+    if (image[7] == 0 && !memcmp(image + 8, "FreeBSD", 7)) return 0;
+    if (image[7] == 0 || image[7] == 3) return 1;
+    if (image[7] == 97 && image[4] == 1 && image[5] == 1 &&
+        process->emulator->arch == XXEMUL_ARCH_ARM && !process->is_64) return 1; /* ELFOSABI_ARM */
+    if (image[7] != 9 || image[4] != 1 || image[5] != 1 || process->emulator->arch != XXEMUL_ARCH_X86 ||
+        process->emulator->mode != XXEMUL_MODE_X86_32 || linux_load_value(process, image + 16, 2) != 2 ||
+        linux_load_value(process, image + 18, 2) != 3) return 0;
+    phoff = linux_load_value(process, image + 28, 4);
+    entry_size = linux_load_value(process, image + 42, 2);
+    count = linux_load_value(process, image + 44, 2);
+    if (!count || count > 256 || entry_size != 32 || phoff > size || count > (size - (size_t)phoff) / entry_size) return 0;
+    for (index = 0; index < count; ++index) {
+        uint64_t type = linux_load_value(process, image + phoff + index * entry_size, 4);
+        if (type == 2 || type == 3) return 0; /* PT_DYNAMIC / PT_INTERP */
+    }
+    process->freebsd = 1;
+    return 1;
+}
+
 xxemul_linux_process *xxemul_linux_create(xxemul *emulator, const char *executable_path, const char *working_directory, int argc, const char *const *argv)
 {
     xxemul_linux_process *process = linux_new_process(emulator, executable_path, working_directory);
     if (process == NULL) return NULL;
     process->self_data = linux_read_file(executable_path, &process->self_size);
-    if (process->self_data == NULL || !linux_initial_stack(process, argc, argv, 0, NULL)) goto failed;
+    if (process->self_data == NULL || !elf_process_abi(process) || !linux_initial_stack(process, argc, argv, 0, NULL)) goto failed;
     return process;
 failed:
     xxemul_linux_destroy(process);
@@ -475,7 +533,7 @@ xxemul_linux_process *xxemul_linux_create_image(xxemul *emulator, const uint8_t 
     if (process->self_data == NULL) goto failed;
     memcpy(process->self_data, image, image_size);
     process->self_size = image_size;
-    if (!linux_initial_stack(process, argc, argv, envc, envp)) goto failed;
+    if (!elf_process_abi(process) || !linux_initial_stack(process, argc, argv, envc, envp)) goto failed;
     return process;
 failed:
     xxemul_linux_destroy(process);
@@ -488,7 +546,9 @@ void xxemul_linux_destroy(xxemul_linux_process *process)
     if (process == NULL) return;
     if (process->syscall_stats_enabled) {
         size_t number;
-        fprintf(stderr, "linux %s syscall total=%" PRIu64, process->is_64 ? "amd64" : "i386", process->syscall_total);
+        fprintf(stderr, "%s %s syscall total=%" PRIu64, process->freebsd ? "freebsd" : "linux", process->emulator->arch == XXEMUL_ARCH_X86 ? (process->is_64 ? "amd64" : "i386") :
+            process->emulator->arch == XXEMUL_ARCH_ARM ? (process->is_64 ? "arm64" : "arm-eabi") :
+            (process->big_endian ? "mips-o32-be" : "mips-o32-le"), process->syscall_total);
         for (number = 0; number < sizeof(process->syscall_counts) / sizeof(process->syscall_counts[0]); ++number) {
             if (process->syscall_counts[number] != 0u) fprintf(stderr, " %zu=%" PRIu64, number, process->syscall_counts[number]);
         }
@@ -597,17 +657,47 @@ uint64_t xxemul_linux_segment_base(const xxemul_linux_process *process, unsigned
     return 0;
 }
 
-static uint64_t linux_arg(const xxemul_linux_process *process, unsigned index)
+static uint64_t linux_arg(xxemul_linux_process *process, unsigned index)
 {
     static const unsigned amd64[] = {XXEMUL_X86_RDI, XXEMUL_X86_RSI, XXEMUL_X86_RDX, XXEMUL_X86_R10, XXEMUL_X86_R8, XXEMUL_X86_R9};
     static const unsigned i386[] = {XXEMUL_X86_RBX, XXEMUL_X86_RCX, XXEMUL_X86_RDX, XXEMUL_X86_RSI, XXEMUL_X86_RDI, XXEMUL_X86_RBP};
+    xxemul *emulator = process->emulator;
+    uint64_t value;
+    if (process->freebsd) return index < 8u ? process->freebsd_arguments[index] : 0;
     if (index >= 6u) return 0;
-    return process->emulator->x86.gpr[process->is_64 ? amd64[index] : i386[index]] & (process->is_64 ? UINT64_MAX : UINT32_MAX);
+    if (emulator->arch == XXEMUL_ARCH_ARM)
+        return emulator->arm.gpr[index] & (process->is_64 ? UINT64_MAX : UINT32_MAX);
+    if (emulator->arch == XXEMUL_ARCH_MIPS) {
+        if (index < 4u) return emulator->mips.gpr[4u + index];
+        /* The o32 caller reserves four argument slots even for register args. */
+        if (!linux_guest_value(process, (uint64_t)emulator->mips.gpr[29] + index * 4u, 4u, &value)) {
+            process->argument_fault = 1;
+            return 0;
+        }
+        return value;
+    }
+    return emulator->x86.gpr[process->is_64 ? amd64[index] : i386[index]] & (process->is_64 ? UINT64_MAX : UINT32_MAX);
 }
 
 static void linux_result(xxemul_linux_process *process, uint64_t result)
 {
-    process->emulator->x86.gpr[XXEMUL_X86_RAX] = process->is_64 ? result : (uint32_t)result;
+    xxemul *emulator = process->emulator;
+    if (process->freebsd) {
+        int error = result >= (uint64_t)-(int64_t)4095;
+        uint32_t value = error ? (uint32_t)(0u - result) : (uint32_t)result;
+        if (error && value == LINUX_ENOSYS) value = 78; /* FreeBSD ENOSYS */
+        emulator->x86.gpr[XXEMUL_X86_RAX] = value;
+        emulator->x86.flags = (emulator->x86.flags & ~UINT64_C(1)) | (unsigned)error;
+    } else if (emulator->arch == XXEMUL_ARCH_ARM) {
+        emulator->arm.gpr[0] = process->is_64 ? result : (uint32_t)result;
+    } else if (emulator->arch == XXEMUL_ARCH_MIPS) {
+        int error = result >= (uint64_t)-(int64_t)4095;
+        uint32_t value = error ? (uint32_t)(0u - result) : (uint32_t)result;
+        /* Most errno values used here are common; ENOSYS differs on MIPS. */
+        if (error && value == LINUX_ENOSYS) value = 89u;
+        emulator->mips.gpr[2] = value;
+        emulator->mips.gpr[7] = error ? 1u : 0u;
+    } else emulator->x86.gpr[XXEMUL_X86_RAX] = process->is_64 ? result : (uint32_t)result;
 }
 
 static int linux_host_path(xxemul_linux_process *process, const char *guest, char *host, size_t capacity)
@@ -637,6 +727,12 @@ static uint64_t linux_open(xxemul_linux_process *process, const char *guest, uin
     linux_file *file;
     int fd = linux_new_fd(process);
     int exists;
+    if (process->emulator->arch == XXEMUL_ARCH_MIPS) {
+        uint64_t original = flags;
+        flags &= ~UINT64_C(0x548);
+        if (original & 0x100u) flags |= 0x40u; /* O_CREAT */
+        if (original & 0x008u) flags |= 0x400u; /* O_APPEND */
+    }
     if (process->syscall_stats_enabled && !memfd) fprintf(stderr, "linux open path=\"%s\" flags=0x%" PRIx64 "\n", guest, flags);
     if (fd < 0) return linux_error(LINUX_ENOMEM);
     file = &process->files[fd];
@@ -793,35 +889,71 @@ static uint64_t linux_lseek(xxemul_linux_process *process, int fd, int64_t displ
     return position;
 }
 
+/* Linux stat layouts differ even between 32-bit ABIs. Store each field in
+ * guest byte order rather than copying a host structure. */
 static int linux_stat_buffer(xxemul_linux_process *process, uint64_t address, uint64_t size)
 {
     uint8_t data[144];
-    size_t length = process->is_64 ? 144u : 96u;
+    size_t length;
     memset(data, 0, sizeof(data));
-    if (process->is_64) {
-        data[0] = data[8] = data[16] = 1u;
-        data[24] = 0xa4u;
-        data[25] = 0x81u;
-        data[48] = (uint8_t)size;
-        data[49] = (uint8_t)(size >> 8);
-        data[50] = (uint8_t)(size >> 16);
-        data[51] = (uint8_t)(size >> 24);
-        data[56] = 0u;
-        data[57] = 0x10u;
-        data[64] = (uint8_t)((size + 511u) / 512u);
+    if (process->emulator->arch == XXEMUL_ARCH_MIPS) {
+        length = process->legacy_stat ? 144u : 104u;
+        linux_put_value(process, data, 0, 1, 4);
+        linux_put_value(process, data, 16, 1, process->legacy_stat ? 4 : 8);
+        linux_put_value(process, data, process->legacy_stat ? 20 : 24, 0100644u, 4);
+        linux_put_value(process, data, process->legacy_stat ? 24 : 28, 1, 4);
+        linux_put_value(process, data, process->legacy_stat ? 48 : 56, size, process->legacy_stat ? 4 : 8);
+        linux_put_value(process, data, process->legacy_stat ? 80 : 88, 4096, 4);
+        linux_put_value(process, data, process->legacy_stat ? 84 : 96, (size + 511u) / 512u, process->legacy_stat ? 4 : 8);
+    } else if (process->emulator->arch == XXEMUL_ARCH_ARM) {
+        if (process->is_64) {
+            length = 128u;
+            linux_put_value(process, data, 0, 1, 8);
+            linux_put_value(process, data, 8, 1, 8);
+            linux_put_value(process, data, 16, 0100644u, 4);
+            linux_put_value(process, data, 20, 1, 4);
+            linux_put_value(process, data, 48, size, 8);
+            linux_put_value(process, data, 56, 4096, 4);
+            linux_put_value(process, data, 64, (size + 511u) / 512u, 8);
+        } else if (process->legacy_stat) {
+            length = 64u;
+            linux_put_value(process, data, 0, 1, 4);
+            linux_put_value(process, data, 4, 1, 4);
+            linux_put_value(process, data, 8, 0100644u, 2);
+            linux_put_value(process, data, 10, 1, 2);
+            linux_put_value(process, data, 20, size, 4);
+            linux_put_value(process, data, 24, 4096, 4);
+            linux_put_value(process, data, 28, (size + 511u) / 512u, 4);
+        } else {
+            length = 104u;
+            linux_put_value(process, data, 0, 1, 8);
+            linux_put_value(process, data, 12, 1, 4);
+            linux_put_value(process, data, 16, 0100644u, 4);
+            linux_put_value(process, data, 20, 1, 4);
+            linux_put_value(process, data, 48, size, 8);
+            linux_put_value(process, data, 56, 4096, 4);
+            linux_put_value(process, data, 64, (size + 511u) / 512u, 8);
+            linux_put_value(process, data, 96, 1, 8);
+        }
+    } else if (process->is_64) {
+        length = 144u;
+        linux_put_value(process, data, 0, 1, 8);
+        linux_put_value(process, data, 8, 1, 8);
+        linux_put_value(process, data, 16, 1, 8);
+        linux_put_value(process, data, 24, 0100644u, 4);
+        linux_put_value(process, data, 48, size, 8);
+        linux_put_value(process, data, 56, 4096, 8);
+        linux_put_value(process, data, 64, (size + 511u) / 512u, 8);
     } else {
-        data[0] = 1u;
-        data[12] = 1u;
-        data[16] = 0xa4u;
-        data[17] = 0x81u;
-        data[20] = 1u;
-        data[44] = (uint8_t)size;
-        data[45] = (uint8_t)(size >> 8);
-        data[46] = (uint8_t)(size >> 16);
-        data[47] = (uint8_t)(size >> 24);
-        data[53] = 0x10u;
-        data[56] = (uint8_t)((size + 511u) / 512u);
-        data[88] = 1u;
+        length = 96u;
+        linux_put_value(process, data, 0, 1, 8);
+        linux_put_value(process, data, 12, 1, 4);
+        linux_put_value(process, data, 16, 0100644u, 4);
+        linux_put_value(process, data, 20, 1, 4);
+        linux_put_value(process, data, 44, size, 8);
+        linux_put_value(process, data, 52, 4096, 4);
+        linux_put_value(process, data, 56, (size + 511u) / 512u, 8);
+        linux_put_value(process, data, 88, 1, 8);
     }
     return linux_guest_write(process, address, data, length);
 }
@@ -863,12 +995,6 @@ static uint64_t linux_stat(xxemul_linux_process *process, uint64_t path_address,
     return linux_stat_buffer(process, result_address, size) ? 0 : linux_error(LINUX_EFAULT);
 }
 
-static void linux_put_value(uint8_t *data, size_t offset, uint64_t value, unsigned width)
-{
-    unsigned index;
-    for (index = 0; index < width; ++index) data[offset + index] = (uint8_t)(value >> (8u * index));
-}
-
 static uint64_t linux_statx(xxemul_linux_process *process)
 {
     char guest[1024];
@@ -885,13 +1011,13 @@ static uint64_t linux_statx(xxemul_linux_process *process)
         return linux_error(LINUX_ENOENT);
     }
     memset(data, 0, sizeof(data));
-    linux_put_value(data, 0, 0x7ffu, 4);
-    linux_put_value(data, 4, 4096u, 4);
-    linux_put_value(data, 16, 1u, 4);
-    linux_put_value(data, 28, 0100644u, 2);
-    linux_put_value(data, 32, 1u, 8);
-    linux_put_value(data, 40, size, 8);
-    linux_put_value(data, 48, (size + 511u) / 512u, 8);
+    linux_put_value(process, data, 0, 0x7ffu, 4);
+    linux_put_value(process, data, 4, 4096u, 4);
+    linux_put_value(process, data, 16, 1u, 4);
+    linux_put_value(process, data, 28, 0100644u, 2);
+    linux_put_value(process, data, 32, 1u, 8);
+    linux_put_value(process, data, 40, size, 8);
+    linux_put_value(process, data, 48, (size + 511u) / 512u, 8);
     return linux_guest_write(process, address, data, sizeof(data)) ? 0 : linux_error(LINUX_EFAULT);
 }
 
@@ -1058,6 +1184,7 @@ static uint64_t linux_execve(xxemul_linux_process *process, int at)
     linux_file *file;
     uint64_t path_address = linux_arg(process, at ? 1u : 0u);
     uint64_t flags = at ? linux_arg(process, 4) : 0u;
+    if (process->argument_fault) return linux_error(LINUX_EFAULT);
     if (at && (flags & ~UINT64_C(0x1100)) != 0u) return linux_error(LINUX_EINVAL);
     if (!linux_guest_string(process, path_address, path, sizeof(path))) return linux_error(LINUX_EFAULT);
     if (process->syscall_stats_enabled) fprintf(stderr, "linux exec path=\"%s\" flags=0x%" PRIx64 "\n", path, flags);
@@ -1253,9 +1380,9 @@ static uint64_t linux_dispatch_i386(xxemul_linux_process *process, uint32_t numb
             return 0;
         case 125: return 0;
         case 140: {
-            uint64_t offset = a; /* fd remains arg0; offset is args1:args2 */
-            (void)offset;
-            value = linux_lseek(process, (int)a, (int64_t)((b << 32) | c), linux_arg(process, 4));
+            uint64_t whence = linux_arg(process, 4);
+            if (process->argument_fault) return linux_error(LINUX_EFAULT);
+            value = linux_lseek(process, (int)a, (int64_t)((b << 32) | c), whence);
             if ((int64_t)value < 0) return value;
             return linux_guest_store(process, d, 8u, value) ? 0 : linux_error(LINUX_EFAULT);
         }
@@ -1289,19 +1416,273 @@ static uint64_t linux_dispatch_i386(xxemul_linux_process *process, uint32_t numb
     }
 }
 
+/* Reuse the service implementations above, translating ABI syscall numbers
+ * only. Register extraction remains tied to the guest architecture. */
+static uint64_t linux_dispatch_arm32(xxemul_linux_process *process, uint32_t number)
+{
+    uint64_t a = linux_arg(process, 0), b = linux_arg(process, 1);
+    uint64_t c = linux_arg(process, 2);
+    process->legacy_stat = number >= 106u && number <= 108u;
+    switch (number) {
+        case 1: case 3: case 4: case 5: case 6: case 11: case 19:
+        case 33: case 41: case 45: case 63: case 85: case 91: case 93:
+        case 125: case 140: case 144: case 146: case 174: case 175:
+        case 192: case 195: case 196: case 197:
+            return linux_dispatch_i386(process, number);
+        case 106: case 107: return linux_stat(process, a, b);
+        case 108: return linux_fstat(process, (int)a, b);
+        case 20: case 64: case 224: return 1000; /* stable process identities */
+        case 24: case 47: case 49: case 50: case 199: case 200: case 201: case 202: return 0;
+        case 67: case 118: case 126: case 148: case 256: case 338: case 369:
+        case 0xf0002: return 0; /* cacheflush: instruction memory is coherent */
+        case 181: {
+            /* EABI aligns a 64-bit syscall argument to an even register pair. */
+            uint64_t offset = linux_arg(process, 4) | linux_arg(process, 5) << 32;
+            return linux_file_write(process, (int)a, b, c, offset, 0);
+        }
+        case 194: {
+            uint64_t length = c | linux_arg(process, 3) << 32;
+            linux_file *file = linux_fd(process, (int)a);
+            if (file == NULL || !file->open) return linux_error(LINUX_EBADF);
+            if (!file->writable) return linux_error(LINUX_EACCES);
+            if (length > LINUX_MAX_FILE || !linux_file_reserve(file, (size_t)length)) return linux_error(LINUX_EFBIG);
+            file->size = (size_t)length;
+            file->dirty = file->host_path[0] != '\0';
+            return 0;
+        }
+        case 248: return linux_dispatch_i386(process, 1);
+        case 263: return linux_guest_store(process, b, 4, 0) && linux_guest_store(process, b + 4, 4, 0) ? 0 : linux_error(LINUX_EFAULT);
+        case 322: return linux_dispatch_i386(process, 295);
+        case 327: return linux_dispatch_amd64(process, 262);
+        case 332: return linux_dispatch_i386(process, 305);
+        case 384: return linux_dispatch_amd64(process, 318);
+        case 385: return linux_dispatch_i386(process, 356);
+        case 387: return linux_dispatch_i386(process, 358);
+        case 397: return linux_statx(process);
+        default: return linux_error(LINUX_ENOSYS);
+    }
+}
+
+static uint64_t linux_dispatch_arm64(xxemul_linux_process *process, uint32_t number)
+{
+    uint32_t service;
+    switch (number) {
+        case 23: service = 32; break; /* dup */
+        case 24: service = 33; break; /* dup3 */
+        case 46: service = 77; break;
+        case 48: return 0;
+        case 56: service = 257; break;
+        case 57: service = 3; break;
+        case 62: service = 8; break;
+        case 63: service = 0; break;
+        case 64: service = 1; break;
+        case 66: service = 20; break;
+        case 68: service = 18; break;
+        case 78: service = 267; break;
+        case 79: service = 262; break;
+        case 80: service = 5; break;
+        case 82: case 83: case 96: case 99: return 0;
+        case 93: case 94: service = 60; break;
+        case 113: service = 228; break;
+        case 134: service = 13; break;
+        case 135: service = 14; break;
+        case 172: case 173: case 178: return 1000;
+        case 174: case 175: case 176: case 177: return 0;
+        case 214: service = 12; break;
+        case 215: service = 11; break;
+        case 221: service = 59; break;
+        case 222: service = 9; break;
+        case 226: service = 10; break;
+        case 227: service = 26; break;
+        case 261: service = 302; break;
+        case 278: service = 318; break;
+        case 279: service = 319; break;
+        case 281: service = 322; break;
+        case 291: return linux_statx(process);
+        case 293: service = 334; break;
+        default: return linux_error(LINUX_ENOSYS);
+    }
+    return linux_dispatch_amd64(process, service);
+}
+
+static uint64_t linux_mips_mmap(xxemul_linux_process *process, int pages)
+{
+    uint64_t flags = linux_arg(process, 3);
+    uint64_t offset = linux_arg(process, 5);
+    int fd = (int)(int32_t)linux_arg(process, 4);
+    if (process->argument_fault) return linux_error(LINUX_EFAULT);
+    /* MIPS MAP_ANONYMOUS is 0x800; the shared mapper uses generic 0x20. */
+    flags = (flags & ~UINT64_C(0x820)) | ((flags & 0x800u) ? 0x20u : 0u);
+    return linux_mmap(process, linux_arg(process, 0), linux_arg(process, 1), flags, fd, pages ? offset * LINUX_PAGE : offset);
+}
+
+static uint64_t linux_dispatch_mips32(xxemul_linux_process *process, uint32_t number)
+{
+    uint32_t service;
+    uint64_t a = linux_arg(process, 0), b = linux_arg(process, 1);
+    if (number < 4000u) return linux_error(LINUX_ENOSYS);
+    number -= 4000u;
+    process->legacy_stat = number >= 106u && number <= 108u;
+    switch (number) {
+        case 1: case 3: case 4: case 5: case 6: case 11: case 19: case 33:
+        case 41: case 45: case 63: case 85: case 91: case 93: case 125:
+        case 140: case 144: case 146: service = number; break;
+        case 20: case 64: case 222: return 1000;
+        case 24: case 47: case 49: case 50: return 0;
+        case 67: case 118: case 126: case 147: case 148: case 152:
+        case 194: case 195: case 252: case 283: case 309: case 338: return 0;
+        case 90: return linux_mips_mmap(process, 0);
+        case 106: case 107: return linux_stat(process, a, b);
+        case 108: return linux_fstat(process, (int)a, b);
+        case 201: {
+            uint64_t low = linux_arg(process, process->big_endian ? 5 : 4);
+            uint64_t high = linux_arg(process, process->big_endian ? 4 : 5);
+            if (process->argument_fault) return linux_error(LINUX_EFAULT);
+            return linux_file_write(process, (int)a, b, linux_arg(process, 2), (high << 32) | low, 0);
+        }
+        case 210: return linux_mips_mmap(process, 1);
+        case 212: {
+            uint64_t low = linux_arg(process, process->big_endian ? 3 : 2);
+            uint64_t high = linux_arg(process, process->big_endian ? 2 : 3);
+            uint64_t length = (high << 32) | low;
+            linux_file *file = linux_fd(process, (int)a);
+            if (file == NULL || !file->open) return linux_error(LINUX_EBADF);
+            if (!file->writable) return linux_error(LINUX_EACCES);
+            if (length > LINUX_MAX_FILE || !linux_file_reserve(file, (size_t)length)) return linux_error(LINUX_EFBIG);
+            file->size = (size_t)length;
+            file->dirty = file->host_path[0] != '\0';
+            return 0;
+        }
+        case 213: case 214: return linux_stat(process, a, b);
+        case 215: return linux_fstat(process, (int)a, b);
+        case 246: service = 1; break;
+        case 263: return linux_guest_store(process, b, 4, 0) && linux_guest_store(process, b + 4, 4, 0) ? 0 : linux_error(LINUX_EFAULT);
+        case 288: service = 295; break;
+        case 293: return linux_dispatch_amd64(process, 262);
+        case 298: service = 305; break;
+        case 353: return linux_dispatch_amd64(process, 318);
+        case 354: service = 356; break;
+        case 356: service = 358; break;
+        case 366: return linux_statx(process);
+        default: return linux_error(LINUX_ENOSYS);
+    }
+    return linux_dispatch_i386(process, service);
+}
+
+/* FreeBSD rounds mprotect's address down and its end up, and skips holes
+ * while protecting existing mappings. Permissions remain advisory here. */
+static uint64_t freebsd_mprotect(uint64_t address, uint64_t length)
+{
+    uint64_t size, page_offset = address & (LINUX_PAGE - 1u);
+    address -= page_offset;
+    if (length > UINT32_MAX - page_offset) return linux_error(LINUX_EINVAL);
+    size = linux_align_up(length + page_offset, LINUX_PAGE);
+    if (size > UINT32_MAX - address) return linux_error(LINUX_EINVAL);
+    return 0;
+}
+
+/* FreeBSD/i386 INT80 uses EAX plus stack words after a dummy return PC.
+ * SYS_syscall(0) adds one syscall-number word; __syscall(198) adds a quad.
+ * The compat6 mmap(197) ABI includes an explicit pad before off_t. */
+static uint64_t freebsd_dispatch_i386(xxemul_linux_process *process, uint32_t number)
+{
+    uint64_t parameters = (uint64_t)(uint32_t)process->emulator->x86.gpr[XXEMUL_X86_RSP] + 4u;
+    uint64_t *args = process->freebsd_arguments;
+    uint64_t value, offset, flags;
+    unsigned count, index;
+    char path[1024];
+    linux_file *file;
+    memset(args, 0, sizeof(process->freebsd_arguments));
+    if (number == 0 || number == 198) {
+        if (!linux_guest_value(process, parameters, 4, &value)) return linux_error(LINUX_EFAULT);
+        parameters += number == 198 ? 8u : 4u;
+        number = (uint32_t)value;
+    }
+    switch (number) {
+        case 1: case 6: count = 1; break;
+        case 3: case 4: case 5: case 74: case 121: count = 3; break;
+        case 20: count = 0; break;
+        case 73: count = 2; break;
+        case 197: count = 8; break;
+        case 477: count = 7; break;
+        case 199: count = 5; break;
+        default: return linux_error(LINUX_ENOSYS);
+    }
+    for (index = 0; index < count; ++index) {
+        if (parameters > UINT32_MAX || 4u > UINT64_C(0x100000000) - parameters ||
+            !linux_guest_value(process, parameters, 4, &args[index])) return linux_error(LINUX_EFAULT);
+        parameters += 4;
+    }
+    switch (number) {
+        case 1:
+            process->exited = 1;
+            process->exit_code = (int)(args[0] & 255u);
+            process->emulator->halted = 1;
+            return 0;
+        case 3: return linux_read(process, (int)(int32_t)args[0], args[1], args[2]);
+        case 4: return linux_write(process, (int)(int32_t)args[0], args[1], args[2]);
+        case 5:
+            if (!linux_guest_string(process, args[0], path, sizeof(path))) return linux_error(LINUX_EFAULT);
+            if ((args[1] & ~UINT64_C(0x60b)) || (args[1] & 3u) == 3u) return linux_error(LINUX_EINVAL);
+            /* FreeBSD O_CREAT/TRUNC/APPEND differ from their Linux bits. */
+            flags = args[1] & 3u;
+            if (args[1] & 0x200u) flags |= 0x40u;
+            if (args[1] & 0x400u) flags |= 0x200u;
+            if (args[1] & 0x8u) flags |= 0x400u;
+            return linux_open(process, path, flags, 0);
+        case 6:
+            file = linux_fd(process, (int)args[0]);
+            if (!file || !file->open) return args[0] < 3u ? 0 : linux_error(LINUX_EBADF);
+            if (!linux_file_save(file)) return linux_error(LINUX_EIO);
+            file->open = 0;
+            return 0;
+        case 20: return 1000;
+        case 73: return linux_munmap(process, args[0], args[1]);
+        case 74: return freebsd_mprotect(args[0], args[1]);
+        case 121: return linux_writev(process, (int)(int32_t)args[0], args[1], args[2]);
+        case 197: case 477:
+            if ((args[2] & ~UINT64_C(7)) || (args[3] & ~UINT64_C(0x1013)) ||
+                ((args[3] & 3u) != 1u && (args[3] & 3u) != 2u)) return linux_error(LINUX_EINVAL);
+            offset = number == 197 ? (args[7] << 32) | args[6] : (args[6] << 32) | args[5];
+            if ((offset & 4095u) || (offset & (UINT64_C(1) << 63))) return linux_error(LINUX_EINVAL);
+            if ((args[3] & 0x1000u) && ((int32_t)args[4] != -1 || offset)) return linux_error(LINUX_EINVAL);
+            flags = args[3] & 0x13u;
+            if (args[3] & 0x1000u) flags |= 0x20u;
+            return linux_mmap(process, args[0], args[1], flags, (int)(int32_t)args[4], offset);
+        case 199:
+            offset = (args[3] << 32) | args[2];
+            value = linux_lseek(process, (int)(int32_t)args[0], (int64_t)offset, args[4]);
+            if (value < (uint64_t)-(int64_t)4095) process->emulator->x86.gpr[XXEMUL_X86_RDX] = (uint32_t)(value >> 32);
+            return value;
+        default: return linux_error(LINUX_ENOSYS);
+    }
+}
+
 xxemul_status xxemul_linux_dispatch(xxemul_linux_process *process)
 {
+    xxemul *emulator;
     uint32_t number;
     uint64_t result;
     if (process == NULL || process->emulator == NULL || process->exited) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    number = (uint32_t)process->emulator->x86.gpr[XXEMUL_X86_RAX];
+    emulator = process->emulator;
+    if (emulator->arch == XXEMUL_ARCH_ARM) number = (uint32_t)emulator->arm.gpr[process->is_64 ? 8 : 7];
+    else if (emulator->arch == XXEMUL_ARCH_MIPS) number = emulator->mips.gpr[2];
+    else number = (uint32_t)emulator->x86.gpr[XXEMUL_X86_RAX];
     if (process->syscall_stats_enabled) {
+        uint32_t slot = emulator->arch == XXEMUL_ARCH_MIPS && number >= 4000u ? number - 4000u : number;
         ++process->syscall_total;
-        if (number < sizeof(process->syscall_counts) / sizeof(process->syscall_counts[0])) ++process->syscall_counts[number];
+        if (slot < sizeof(process->syscall_counts) / sizeof(process->syscall_counts[0])) ++process->syscall_counts[slot];
         if (process->first_syscall_count < sizeof(process->first_syscalls) / sizeof(process->first_syscalls[0]))
             process->first_syscalls[process->first_syscall_count++] = number;
     }
-    result = process->is_64 ? linux_dispatch_amd64(process, number) : linux_dispatch_i386(process, number);
+    process->argument_fault = 0;
+    process->legacy_stat = 0;
+    if (process->freebsd) result = freebsd_dispatch_i386(process, number);
+    else if (emulator->arch == XXEMUL_ARCH_ARM)
+        result = process->is_64 ? linux_dispatch_arm64(process, number) : linux_dispatch_arm32(process, number);
+    else if (emulator->arch == XXEMUL_ARCH_MIPS) result = linux_dispatch_mips32(process, number);
+    else result = process->is_64 ? linux_dispatch_amd64(process, number) : linux_dispatch_i386(process, number);
+    if (process->argument_fault) result = linux_error(LINUX_EFAULT);
     linux_result(process, result);
     return process->exited ? XXEMUL_STATUS_HALTED : XXEMUL_STATUS_OK;
 }

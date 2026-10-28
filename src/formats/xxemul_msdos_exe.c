@@ -53,7 +53,7 @@ int xxemul_load_msdos_exe(xxemul *emulator, const uint8_t *image, size_t image_s
     }
     body_paragraphs = (body_size + 15u) / 16u;
     block_end = (uint32_t)load_segment + (uint32_t)body_paragraphs;
-    if (block_end >= XXEMUL_DOS_CONVENTIONAL_END_SEGMENT) {
+    if (block_end > XXEMUL_DOS_CONVENTIONAL_END_SEGMENT) {
         goto done;
     }
     available_extra = XXEMUL_DOS_CONVENTIONAL_END_SEGMENT - block_end;

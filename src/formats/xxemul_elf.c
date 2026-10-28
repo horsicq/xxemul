@@ -53,12 +53,33 @@ xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t
     if (!xx_elf_handle_base_info(&elf.format, NULL) || xx_elf_is_64(&elf) != (format == XXEMUL_IMAGE_ELF64)) {
         goto done;
     }
-    if (xx_elf_get_type(&elf) != XX_ELF_TYPE_EXEC || elf.data_encoding != XX_ELF_DATA_LSB) {
+    if (xx_elf_get_type(&elf) != XX_ELF_TYPE_EXEC ||
+        (elf.data_encoding != XX_ELF_DATA_LSB && elf.data_encoding != XX_ELF_DATA_MSB)) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         goto done;
     }
     entry = xx_elf_get_entry_point(&elf);
-    if (!xxemul_elf_machine_mode(xx_elf_get_machine(&elf), format, &entry, &arch, &mode)) {
+    if (xx_elf_get_machine(&elf) == 8u && format == XXEMUL_IMAGE_ELF32) {
+        uint32_t flags, isa, abi;
+        int big = elf.data_encoding == XX_ELF_DATA_MSB;
+        if (image_size < 52u) goto done;
+        flags = big ? ((uint32_t)image[36] << 24) | ((uint32_t)image[37] << 16) |
+                      ((uint32_t)image[38] << 8) | image[39]
+                    : image[36] | ((uint32_t)image[37] << 8) |
+                      ((uint32_t)image[38] << 16) | ((uint32_t)image[39] << 24);
+        isa = flags & 0xf0000000u;
+        abi = flags & 0x0000f000u;
+        /* Standard MIPS I/II or MIPS32/r2, o32 only. Compressed encodings,
+         * n32/n64 and release6 have different execution/ABI semantics. */
+        if ((flags & 0x06000020u) || (abi && abi != 0x1000u) ||
+            (isa != 0u && isa != 0x10000000u && isa != 0x50000000u && isa != 0x70000000u)) {
+            *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+            goto done;
+        }
+        arch = XXEMUL_ARCH_MIPS;
+        mode = big ? XXEMUL_MODE_MIPS32_BE : XXEMUL_MODE_MIPS32;
+    } else if (elf.data_encoding != XX_ELF_DATA_LSB ||
+               !xxemul_elf_machine_mode(xx_elf_get_machine(&elf), format, &entry, &arch, &mode)) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         goto done;
     }

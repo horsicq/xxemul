@@ -28,6 +28,7 @@ static int xxemul_mode_matches_arch(xxemul_arch arch, xxemul_mode mode)
     if (arch == XXEMUL_ARCH_ARM) {
         return mode == XXEMUL_MODE_ARM_A32 || mode == XXEMUL_MODE_ARM_T32 || mode == XXEMUL_MODE_ARM_A64;
     }
+    if (arch == XXEMUL_ARCH_MIPS) return mode == XXEMUL_MODE_MIPS32 || mode == XXEMUL_MODE_MIPS32_BE;
     return 0;
 }
 
@@ -60,7 +61,8 @@ static int xxemul_config_addressable(const xxemul_config *config)
     }
     last_address = config->region_address + (uint64_t)(config->region_size - 1);
     if ((config->mode == XXEMUL_MODE_X86_16 && last_address > UINT16_MAX) ||
-        ((config->mode == XXEMUL_MODE_X86_32 || config->mode == XXEMUL_MODE_ARM_A32 || config->mode == XXEMUL_MODE_ARM_T32) && last_address > UINT32_MAX)) {
+        ((config->mode == XXEMUL_MODE_X86_32 || config->mode == XXEMUL_MODE_ARM_A32 || config->mode == XXEMUL_MODE_ARM_T32 ||
+          config->arch == XXEMUL_ARCH_MIPS) && last_address > UINT32_MAX)) {
         return 0;
     }
     return config->entry_address >= config->region_address && config->entry_address <= last_address;
@@ -120,7 +122,7 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
         config->region_size < config->code_size || config->region_size > (size_t)LONG_MAX || !xxemul_config_addressable(config)) {
         return NULL;
     }
-    if ((config->mode == XXEMUL_MODE_ARM_A32 || config->mode == XXEMUL_MODE_ARM_A64) && (config->entry_address & UINT64_C(3)) != 0) {
+    if ((config->mode == XXEMUL_MODE_ARM_A32 || config->mode == XXEMUL_MODE_ARM_A64 || config->arch == XXEMUL_ARCH_MIPS) && (config->entry_address & UINT64_C(3)) != 0) {
         return NULL;
     }
     if (config->mode == XXEMUL_MODE_ARM_T32 && (config->entry_address & UINT64_C(1)) != 0) {
@@ -132,7 +134,8 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
     }
     xx_mem_copy(emulator->region_data, config->code, config->code_size);
 
-    stack_alignment = config->arch == XXEMUL_ARCH_ARM ? 16u : (config->mode == XXEMUL_MODE_X86_16 ? 2u : (config->mode == XXEMUL_MODE_X86_32 ? 4u : 8u));
+    stack_alignment = config->arch == XXEMUL_ARCH_ARM ? 16u : (config->arch == XXEMUL_ARCH_MIPS ? 8u :
+        (config->mode == XXEMUL_MODE_X86_16 ? 2u : (config->mode == XXEMUL_MODE_X86_32 ? 4u : 8u)));
     stack_top = config->region_address + (uint64_t)config->region_size;
     stack_top &= ~((uint64_t)stack_alignment - UINT64_C(1));
 
@@ -140,6 +143,9 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
         emulator->x86.ip = config->entry_address;
         emulator->x86.flags = UINT64_C(2);
         emulator->x86.gpr[XXEMUL_X86_RSP] = stack_top;
+    } else if (config->arch == XXEMUL_ARCH_MIPS) {
+        emulator->mips.pc = (uint32_t)config->entry_address;
+        emulator->mips.gpr[29] = (uint32_t)stack_top;
     } else {
         emulator->arm.pc = config->entry_address;
         emulator->arm.sp = stack_top;
@@ -333,6 +339,9 @@ xxemul_status xxemul_write_memory(xxemul *emulator, uint64_t address, const void
     if (size == 0) {
         return emulator == NULL ? XXEMUL_STATUS_INVALID_ARGUMENT : XXEMUL_STATUS_OK;
     }
+    /* Host/debugger writes and guest stores conservatively invalidate an
+     * outstanding MIPS LL/SC reservation, including writes through mmap. */
+    if (emulator != NULL && emulator->arch == XXEMUL_ARCH_MIPS) emulator->mips_reservation_valid = 0;
     if (emulator != NULL && buffer != NULL && emulator->linux_process != NULL) {
         mapped = xxemul_linux_mapping_write(emulator->linux_process, address, buffer, size);
         if (mapped != 0) return mapped > 0 ? XXEMUL_STATUS_OK : XXEMUL_STATUS_ADDRESS_FAULT;
@@ -415,8 +424,17 @@ xxemul_status xxemul_get_x86_state(const xxemul *emulator, xxemul_x86_state *sta
 
 xxemul_status xxemul_set_x86_state(xxemul *emulator, const xxemul_x86_state *state)
 {
+    unsigned index;
     if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_X86) {
         return XXEMUL_STATUS_INVALID_ARGUMENT;
+    }
+    /* A real-mode debugger selector write must reload its segment base,
+     * just as a guest MOV/POP to that segment would. Keep unchanged hidden
+     * caches, including unreal-mode limits, and leave protected descriptors
+     * under their existing instruction/DPMI handling. */
+    if (emulator->dos_mode && emulator->mode == XXEMUL_MODE_X86_16 && !(emulator->dos_cr0 & 1u)) {
+        for (index = 0; index < XXEMUL_X86_SEGMENT_COUNT; ++index)
+            if (emulator->x86.segment[index] != state->segment[index]) emulator->dos_segments[index].valid = 0;
     }
     emulator->x86 = *state;
     emulator->x86.flags |= UINT64_C(2);
@@ -439,6 +457,26 @@ xxemul_status xxemul_set_arm_state(xxemul *emulator, const xxemul_arm_state *sta
         return XXEMUL_STATUS_INVALID_ARGUMENT;
     }
     emulator->arm = *state;
+    emulator->halted = 0;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_get_mips_state(const xxemul *emulator, xxemul_mips_state *state)
+{
+    if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_MIPS) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    *state = emulator->mips;
+    state->gpr[0] = 0;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_set_mips_state(xxemul *emulator, const xxemul_mips_state *state)
+{
+    if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_MIPS || (state->pc & 3u))
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (emulator->mips.pc != state->pc) emulator->mips_delay_pending = 0;
+    emulator->mips = *state;
+    emulator->mips.gpr[0] = 0;
+    emulator->mips_reservation_valid = 0;
     emulator->halted = 0;
     return XXEMUL_STATUS_OK;
 }
@@ -471,12 +509,12 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
     if (emulator->halted) {
         return XXEMUL_STATUS_HALTED;
     }
+    if (emulator->windows != NULL && xxemul_windows_try_step(emulator->windows, info, &status)) {
+        if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
+        return status;
+    }
     if (emulator->arch == XXEMUL_ARCH_X86) {
         uint64_t fault_ip;
-        if (emulator->windows != NULL && xxemul_windows_try_step(emulator->windows, info, &status)) {
-            if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
-            return status;
-        }
         fault_ip = emulator->x86.ip;
         status = xxemul_x86_step(emulator, info);
         if (status == XXEMUL_STATUS_ADDRESS_FAULT && emulator->dos_mode) {
@@ -484,6 +522,7 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
         }
         return status;
     }
+    if (emulator->arch == XXEMUL_ARCH_MIPS) return xxemul_mips_step(emulator, info);
     if (emulator->darwin != NULL && xxemul_darwin_try_step(emulator->darwin, info, &status)) {
         if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
         return status;
@@ -529,6 +568,7 @@ size_t xxemul_format_current(xxemul *emulator, char *buffer, size_t buffer_size)
     if (emulator->arch == XXEMUL_ARCH_X86) {
         return xxemul_x86_format_current(emulator, buffer, buffer_size);
     }
+    if (emulator->arch == XXEMUL_ARCH_MIPS) return xxemul_mips_format_current(emulator, buffer, buffer_size);
     return xxemul_arm_format_current(emulator, buffer, buffer_size);
 }
 
@@ -581,6 +621,7 @@ xxemul_status xxemul_get_current_address(const xxemul *emulator, uint64_t *addre
         *address = emulator->arm.pc;
         return XXEMUL_STATUS_OK;
     }
+    if (emulator->arch == XXEMUL_ARCH_MIPS) { *address = emulator->mips.pc; return XXEMUL_STATUS_OK; }
     return xxemul_x86_linear_address(emulator, XXEMUL_X86_CS, emulator->x86.ip, address);
 }
 
@@ -594,6 +635,7 @@ xxemul_status xxemul_get_stack_address(const xxemul *emulator, uint64_t *address
         *address = emulator->arm.sp & (emulator->mode == XXEMUL_MODE_ARM_A64 ? UINT64_MAX : UINT32_MAX);
         return XXEMUL_STATUS_OK;
     }
+    if (emulator->arch == XXEMUL_ARCH_MIPS) { *address = emulator->mips.gpr[29]; return XXEMUL_STATUS_OK; }
     mask = emulator->mode == XXEMUL_MODE_X86_16 ? UINT16_MAX
         : emulator->mode == XXEMUL_MODE_X86_32 ? UINT32_MAX : UINT64_MAX;
     /* Match xxemul_x86_stack_mask: SS.B controls protected-mode stack
