@@ -274,6 +274,117 @@ if(XXEMUL_BUILD_VIEWER)
 endif()
 
 if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
+    add_executable(xxemul_dos_cpu_faults_tests tests/test_dos_cpu_faults.c)
+    target_link_libraries(xxemul_dos_cpu_faults_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_dos_cpu_faults_tests COMMAND xxemul_dos_cpu_faults_tests)
+    set_tests_properties(xxemul_dos_cpu_faults_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_dos_exec_tests tests/test_dos_exec.c)
+    target_link_libraries(xxemul_dos_exec_tests PRIVATE xxemul::xxemul xxfclib::xxfclib cdisasm::cdisasm)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dos-exec-run")
+    add_test(NAME xxemul_dos_exec_tests COMMAND xxemul_dos_exec_tests "${CMAKE_CURRENT_BINARY_DIR}/dos-exec-run")
+    set_tests_properties(xxemul_dos_exec_tests PROPERTIES TIMEOUT 30
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dos-exec-run")
+    add_executable(xxemul_dos_irq0_tests tests/test_dos_irq0.c)
+    target_link_libraries(xxemul_dos_irq0_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_dos_irq0_tests COMMAND xxemul_dos_irq0_tests)
+    set_tests_properties(xxemul_dos_irq0_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_dpmi_installation_tests tests/test_dpmi_installation.c)
+    target_link_libraries(xxemul_dpmi_installation_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_dpmi_installation_tests COMMAND xxemul_dpmi_installation_tests)
+    set_tests_properties(xxemul_dpmi_installation_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_dos_string_segments_tests tests/test_dos_string_segments.c)
+    target_link_libraries(xxemul_dos_string_segments_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_dos_string_segments_tests COMMAND xxemul_dos_string_segments_tests)
+    set_tests_properties(xxemul_dos_string_segments_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_dos_mz_compat_tests tests/test_dos_mz_compat.c)
+    target_link_libraries(xxemul_dos_mz_compat_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_dos_mz_compat_tests COMMAND xxemul_dos_mz_compat_tests)
+    set_tests_properties(xxemul_dos_mz_compat_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_dos_bios_clock_tests tests/test_dos_bios_clock.c)
+    target_link_libraries(xxemul_dos_bios_clock_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_dos_bios_clock_tests COMMAND xxemul_dos_bios_clock_tests)
+    set_tests_properties(xxemul_dos_bios_clock_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_dos_file_services_tests tests/test_dos_file_services.c)
+    target_link_libraries(xxemul_dos_file_services_tests PRIVATE xxemul::xxemul)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dos-file-services-run")
+    add_test(NAME xxemul_dos_file_services_tests COMMAND xxemul_dos_file_services_tests)
+    set_tests_properties(xxemul_dos_file_services_tests PROPERTIES TIMEOUT 30
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/dos-file-services-run")
+    add_executable(xxemul_windows_modules_tests tests/test_windows_modules.c)
+    target_link_libraries(xxemul_windows_modules_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_windows_modules_tests COMMAND xxemul_windows_modules_tests)
+    set_tests_properties(xxemul_windows_modules_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_windows_runtime_tests tests/test_windows_runtime_edges.c)
+    target_link_libraries(xxemul_windows_runtime_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_windows_runtime_tests COMMAND xxemul_windows_runtime_tests)
+    set_tests_properties(xxemul_windows_runtime_tests PROPERTIES TIMEOUT 30)
+    foreach(component format heap crt_startup mapping memory_status locale startup_abi)
+        add_executable(xxemul_windows_${component}_tests tests/test_windows_${component}.c)
+        target_link_libraries(xxemul_windows_${component}_tests PRIVATE xxemul::xxemul)
+        add_test(NAME xxemul_windows_${component}_tests COMMAND xxemul_windows_${component}_tests)
+        set_tests_properties(xxemul_windows_${component}_tests PROPERTIES TIMEOUT 30)
+    endforeach()
+    add_executable(xxemul_x87_integer_tests tests/test_x87_integer.c)
+    target_link_libraries(xxemul_x87_integer_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_x87_integer_tests COMMAND xxemul_x87_integer_tests)
+    set_tests_properties(xxemul_x87_integer_tests PROPERTIES TIMEOUT 30)
+    if(UNIX)
+        foreach(component crt_extensions profile find legacy_file legacy_write)
+            add_executable(xxemul_windows_${component}_tests tests/test_windows_${component}.c)
+            target_link_libraries(xxemul_windows_${component}_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_${component}_tests COMMAND xxemul_windows_${component}_tests)
+            set_tests_properties(xxemul_windows_${component}_tests PROPERTIES TIMEOUT 30)
+        endforeach()
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            foreach(component environment_cwd children resources move startup_info child_review dll dll_resources dll_edges resource_generations tls main_dll)
+                add_executable(xxemul_windows_${component}_tests tests/test_windows_${component}.c)
+                target_link_libraries(xxemul_windows_${component}_tests PRIVATE xxemul::xxemul)
+                target_compile_features(xxemul_windows_${component}_tests PRIVATE c_std_11)
+                add_test(NAME xxemul_windows_${component}_tests
+                    COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_guest_tests.py"
+                        --test $<TARGET_FILE:xxemul_windows_${component}_tests>
+                        --work "${CMAKE_CURRENT_BINARY_DIR}/windows-${component}-tests" --mode ${component})
+                set_tests_properties(xxemul_windows_${component}_tests PROPERTIES TIMEOUT 180)
+            endforeach()
+            add_executable(xxemul_windows_registry_temp_tests tests/test_windows_registry_temp.c)
+            target_link_libraries(xxemul_windows_registry_temp_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_registry_temp_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_registry_temp_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-registry-tests")
+            set_tests_properties(xxemul_windows_registry_temp_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_threads_tests tests/test_windows_threads.c)
+            target_link_libraries(xxemul_windows_threads_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_threads_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_threads_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-thread-tests")
+            set_tests_properties(xxemul_windows_threads_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_dialog_tests tests/test_windows_dialog.c)
+            target_link_libraries(xxemul_windows_dialog_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_dialog_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_dialog_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-dialog-tests" --dialogs)
+            set_tests_properties(xxemul_windows_dialog_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_gui_abi_tests tests/test_windows_gui_abi.c)
+            target_link_libraries(xxemul_windows_gui_abi_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_gui_abi_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_gui_abi_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-gui-abi-tests")
+            set_tests_properties(xxemul_windows_gui_abi_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_file_commit_tests tests/test_windows_file_commit.c)
+            target_link_libraries(xxemul_windows_file_commit_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_file_commit_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_file_commit_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-file-commit-tests")
+            set_tests_properties(xxemul_windows_file_commit_tests PROPERTIES TIMEOUT 60
+                ENVIRONMENT "TEST_FILE_ATTRIBUTES=1;TEST_HANDLE_COUNT=1")
+        endif()
+    endif()
     add_executable(xxemul_dos_load_base_tests tests/test_dos_load_base.c)
     target_link_libraries(xxemul_dos_load_base_tests PRIVATE xxemul::xxemul)
     add_test(NAME xxemul_dos_load_base_tests COMMAND xxemul_dos_load_base_tests)
@@ -317,6 +428,25 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
     target_link_libraries(xxemul_tests PRIVATE
         xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
     add_test(NAME xxemul_tests COMMAND xxemul_tests)
+    add_executable(xxemul_elf_shared_tests tests/test_elf_shared.c)
+    target_compile_features(xxemul_elf_shared_tests PRIVATE c_std_11)
+    target_link_libraries(xxemul_elf_shared_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_elf_shared_tests COMMAND xxemul_elf_shared_tests)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND Python3_Interpreter_FOUND AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$" AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        add_executable(xxemul_elf_primary_tests tests/test_elf_primary.c)
+        target_compile_features(xxemul_elf_primary_tests PRIVATE c_std_11)
+        target_link_libraries(xxemul_elf_primary_tests PRIVATE xxemul::xxemul)
+        add_executable(xxemul_linux_auxv_tests tests/test_linux_auxv.c)
+        target_compile_features(xxemul_linux_auxv_tests PRIVATE c_std_11)
+        target_link_libraries(xxemul_linux_auxv_tests PRIVATE xxemul::xxemul)
+        add_test(NAME xxemul_elf_primary_tests
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_elf_primary_tests.py"
+                --test $<TARGET_FILE:xxemul_elf_primary_tests>
+                --auxv-test $<TARGET_FILE:xxemul_linux_auxv_tests>
+                --work "${CMAKE_CURRENT_BINARY_DIR}/elf-primary"
+                --compiler "${CMAKE_C_COMPILER}")
+        set_tests_properties(xxemul_elf_primary_tests PROPERTIES TIMEOUT 120)
+    endif()
     add_executable(xxemul_format_tests tests/test_formats.c)
     target_compile_features(xxemul_format_tests PRIVATE c_std_11)
     target_link_libraries(xxemul_format_tests PRIVATE xxemul::xxemul)

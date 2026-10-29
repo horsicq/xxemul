@@ -83,11 +83,13 @@ xxemul *xxemul_create_dos_at(xxemul_dos_format format, const void *image, size_t
     emulator->psp_segment = image_base ? (uint16_t)((image_base >> 4) - 0x10u) : XXEMUL_DOS_PSP_SEGMENT;
     emulator->dos_dta_segment = emulator->psp_segment;
     emulator->dos_dta_offset = 0x80u;
-    emulator->dos_port_92 = 2u;
-    emulator->dos_kbc_output = 3u;
+    /* Plain DOS starts without an XMS/HMA driver: retain 8086 wraparound. */
+    emulator->dos_port_92 = 0u;
+    emulator->dos_kbc_output = 1u;
     emulator->x86.flags = 0x202u;
     xxemul_dos_make_psp(emulator);
     xxemul_dos_files_initialize_kernel(emulator);
+    xxemul_bios_initialize_timer(emulator);
     /* Real-mode DPMI interrupt simulation reads the IVT directly. */
     emulator->region_data[0x21u * 4u] = 0x00u;
     emulator->region_data[0x21u * 4u + 1u] = 0x01u;
@@ -101,6 +103,19 @@ xxemul *xxemul_create_dos_at(xxemul_dos_format format, const void *image, size_t
     emulator->region_data[XXEMUL_DOS_INT10_THUNK_PHYSICAL] = 0xcfu;
     emulator->region_data[0x449u] = 3u;
     emulator->region_data[0x44au] = 80u;
+    emulator->region_data[0x410u] = 0x21u;
+    emulator->region_data[0x413u] = 0x80u;
+    emulator->region_data[0x414u] = 0x02u;
+    /* Default color text adapter. Programs use the BDA CRT base to find
+     * status port 3DAh; leaving it zero sends retrace polling to port 6. */
+    emulator->region_data[0x44cu] = 0x00u;
+    emulator->region_data[0x44du] = 0x10u;
+    emulator->region_data[0x460u] = 0x0du;
+    emulator->region_data[0x461u] = 0x0cu;
+    emulator->region_data[0x463u] = 0xd4u;
+    emulator->region_data[0x464u] = 0x03u;
+    emulator->region_data[0x484u] = 24u;
+    emulator->region_data[0x485u] = 16u;
     loaded = format == XXEMUL_DOS_COM ? xxemul_load_com(emulator, image, image_size, io) : xxemul_load_msdos_exe(emulator, image, image_size, io);
     xx_io_close(io);
     if (!loaded) {

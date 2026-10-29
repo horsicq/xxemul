@@ -1,5 +1,6 @@
 #include "xxemul_linux.h"
 #include "xxemul_internal.h"
+#include <xxemul/xxemul_elf.h>
 
 #include <inttypes.h>
 #include <limits.h>
@@ -81,6 +82,8 @@ struct xxemul_linux_process {
     char workdir[1024];
     uint8_t *self_data;
     size_t self_size;
+    uint8_t auxv_data[17u * 2u * 8u];
+    size_t auxv_size;
     linux_file files[LINUX_MAX_FDS];
     linux_map maps[LINUX_MAX_MAPS];
     xxemul_linux_output_callback output;
@@ -320,7 +323,7 @@ static int linux_guest_string(xxemul_linux_process *process, uint64_t address, c
     return 0;
 }
 
-static int linux_phdr_info(const xxemul_linux_process *process, uint64_t *address, uint64_t *entry_size, uint64_t *count)
+static int linux_phdr_info(const xxemul_linux_process *process, uint64_t *address, uint64_t *entry_size, uint64_t *count, uint64_t *load_bias)
 {
     const uint8_t *image = process->self_data;
     size_t size = process->self_size;
@@ -331,13 +334,36 @@ static int linux_phdr_info(const xxemul_linux_process *process, uint64_t *addres
     *entry_size = linux_load_value(process, image + (process->is_64 ? 54 : 42), 2u);
     *count = linux_load_value(process, image + (process->is_64 ? 56 : 44), 2u);
     if (*entry_size < (process->is_64 ? 56u : 32u) || *count > 256u || offset > size || *count > (size - (size_t)offset) / *entry_size) return 0;
+    *load_bias = 0;
+    if (!process->freebsd && linux_load_value(process, image + 16u, 2u) == 3u) {
+        const xxemul_elf_shared_info *primary = xxemul_elf_primary_get_info(process->emulator);
+        if (primary) *load_bias = primary->load_bias;
+        else {
+            uint64_t low = UINT64_MAX;
+            /* A shared_create caller may attach a Linux context without
+             * registering the module as the primary image. Its arena starts
+             * at the page-aligned lowest nonempty PT_LOAD virtual address. */
+            for (index = 0; index < *count; ++index) {
+                const uint8_t *ph = image + offset + index * *entry_size;
+                uint64_t memory_size = linux_load_value(process, ph + (process->is_64 ? 40u : 20u), process->is_64 ? 8u : 4u);
+                uint64_t virtual_address = linux_load_value(process, ph + (process->is_64 ? 16u : 8u), process->is_64 ? 8u : 4u);
+                if (linux_load_value(process, ph, 4u) == 1u && memory_size && virtual_address < low) low = virtual_address;
+            }
+            if (low == UINT64_MAX) return 0;
+            low &= ~(LINUX_PAGE - 1u);
+            if (process->emulator->region_address < low) return 0;
+            *load_bias = process->emulator->region_address - low;
+        }
+    }
     for (index = 0; index < *count; ++index) {
         const uint8_t *ph = image + offset + index * *entry_size;
         uint64_t file_offset = process->is_64 ? linux_load_value(process, ph + 8, 8u) : linux_load_value(process, ph + 4, 4u);
         uint64_t virtual_address = process->is_64 ? linux_load_value(process, ph + 16, 8u) : linux_load_value(process, ph + 8, 4u);
         uint64_t file_size = process->is_64 ? linux_load_value(process, ph + 32, 8u) : linux_load_value(process, ph + 16, 4u);
         if (linux_load_value(process, ph, 4u) == 1u && offset >= file_offset && offset - file_offset <= file_size && *count * *entry_size <= file_size - (offset - file_offset)) {
-            *address = virtual_address + offset - file_offset;
+            uint64_t relative = offset - file_offset;
+            if (virtual_address > UINT64_MAX - relative || virtual_address + relative > UINT64_MAX - *load_bias) return 0;
+            *address = *load_bias + virtual_address + relative;
             return 1;
         }
     }
@@ -356,13 +382,13 @@ static int linux_initial_stack(xxemul_linux_process *process, int argc, const ch
     uint64_t stack_top = process->emulator->region_address + process->emulator->region_size;
     uint64_t cursor = (stack_top - 0x100u) & ~UINT64_C(15);
     uint64_t low = stack_top - 1024u * 1024u;
-    uint64_t phdr, phent, phnum, random_address, execfn_address, sp, entry;
+    uint64_t phdr, phent, phnum, random_address, execfn_address, sp, entry, load_bias;
     uint8_t random_bytes[16];
     unsigned width = process->is_64 ? 8u : 4u;
     int index;
     size_t i;
     if (argc < 0 || argc > (int)LINUX_MAX_EXEC_STRINGS || envc < 0 || envc > (int)LINUX_MAX_EXEC_STRINGS || (argc > 0 && argv == NULL) || (envc > 0 && envp == NULL) ||
-        !linux_phdr_info(process, &phdr, &phent, &phnum))
+        !linux_phdr_info(process, &phdr, &phent, &phnum, &load_bias))
         return 0;
     for (index = 0; index < argc; ++index) {
         const char *value = argv[index];
@@ -398,6 +424,10 @@ static int linux_initial_stack(xxemul_linux_process *process, int argc, const ch
     /* Preserve the Thumb entry bit in AT_ENTRY even though the CPU keeps an
      * aligned PC and records its instruction set separately. */
     entry = linux_load_value(process, process->self_data + 24u, width);
+    if (entry) {
+        if (entry > UINT64_MAX - load_bias) return 0;
+        entry += load_bias;
+    }
     aux_values[0] = phdr;
     aux_values[1] = phent;
     aux_values[2] = phnum;
@@ -429,8 +459,11 @@ static int linux_initial_stack(xxemul_linux_process *process, int argc, const ch
         if (!linux_guest_store(process, cursor, width, env_address[index])) return 0;
     if (!linux_guest_store(process, cursor, width, 0)) return 0;
     cursor += width;
+    process->auxv_size = aux_count * 2u * width;
     for (i = 0; i < aux_count; ++i) {
         if (!linux_guest_store(process, cursor, width, aux_types[i]) || !linux_guest_store(process, cursor + width, width, aux_values[i])) return 0;
+        linux_put_value(process, process->auxv_data, i * 2u * width, aux_types[i], width);
+        linux_put_value(process, process->auxv_data, (i * 2u + 1u) * width, aux_values[i], width);
         cursor += 2u * width;
     }
     if (process->emulator->arch == XXEMUL_ARCH_X86) {
@@ -744,6 +777,18 @@ static uint64_t linux_open(xxemul_linux_process *process, const char *guest, uin
         memcpy(file->data, process->self_data, process->self_size);
         file->size = file->capacity = process->self_size;
         file->self = 1;
+        file->writable = 0;
+        return (uint64_t)fd;
+    }
+    if (!process->freebsd && strcmp(guest, "/proc/self/auxv") == 0) {
+        if ((flags & 3u) != 0u) {
+            memset(file, 0, sizeof(*file));
+            return linux_error(LINUX_EACCES);
+        }
+        file->data = (uint8_t *)malloc(process->auxv_size + 1u);
+        if (file->data == NULL) goto no_memory;
+        memcpy(file->data, process->auxv_data, process->auxv_size);
+        file->size = file->capacity = process->auxv_size;
         file->writable = 0;
         return (uint64_t)fd;
     }

@@ -75,7 +75,7 @@ xxemul *xxemul_create_image_at(xxemul_image_format format, const void *image, si
         return NULL;
     }
     if (image_base != 0 && format != XXEMUL_IMAGE_PE32 && format != XXEMUL_IMAGE_PE64 &&
-        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ) {
+        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ && format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }
@@ -91,7 +91,7 @@ xxemul *xxemul_create_image_at(xxemul_image_format format, const void *image, si
         case XXEMUL_IMAGE_PE32:
         case XXEMUL_IMAGE_PE64: emulator = xxemul_load_pe(format, (const uint8_t *)image, image_size, io, image_base, status); break;
         case XXEMUL_IMAGE_ELF32:
-        case XXEMUL_IMAGE_ELF64: emulator = xxemul_load_elf(format, (const uint8_t *)image, image_size, io, status); break;
+        case XXEMUL_IMAGE_ELF64: emulator = xxemul_load_elf(format, (const uint8_t *)image, image_size, io, image_base, status); break;
         default: emulator = xxemul_load_macho(format, (const uint8_t *)image, image_size, io, status); break;
     }
     xx_io_close(io);
@@ -119,7 +119,7 @@ xxemul *xxemul_create_image_file_at(xxemul_image_format format, const char *path
         return NULL;
     }
     if (image_base != 0 && format != XXEMUL_IMAGE_PE32 && format != XXEMUL_IMAGE_PE64 &&
-        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ) {
+        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ && format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }

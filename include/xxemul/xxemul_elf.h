@@ -73,6 +73,19 @@ XXEMUL_API xxemul_status xxemul_elf_shared_find_export(const xxemul_elf_shared *
 XXEMUL_API size_t xxemul_elf_shared_initializer_count(const xxemul_elf_shared *module);
 XXEMUL_API xxemul_status xxemul_elf_shared_initializer_at(const xxemul_elf_shared *module, size_t index, uint64_t *address);
 
+/** Ordinary ELF image loading also admits bounded i386/amd64
+ * ET_DYN libraries: no PT_INTERP, DF_1_PIE or DT_NEEDED. A self-named library
+ * may also alias its DT_INIT in e_entry (as library packers do). Startup runs
+ * DT_INIT before reading the live DT_INIT_ARRAY, with the guest SysV ABI.
+ * Completion halts with load-result zero and retains initialized exports.
+ * The borrowed info is NULL for ordinary executable/non-ELF images. */
+XXEMUL_API const xxemul_elf_shared_info *xxemul_elf_primary_get_info(const xxemul *emulator);
+XXEMUL_API xxemul_status xxemul_elf_primary_find_export(const xxemul *emulator, const char *name, uint64_t *address);
+/** Analysis entry is the first actual initializer; the original ELF e_entry
+ * is preserved. Returns OK plus zero for a library without initializers,
+ * and UNSUPPORTED_IMAGE for an image which is not a primary library. */
+XXEMUL_API xxemul_status xxemul_elf_primary_get_entry(const xxemul *emulator, uint64_t *address);
+
 #ifdef __cplusplus
 }
 #endif

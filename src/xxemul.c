@@ -91,6 +91,8 @@ xxemul *xxemul_create_empty(xxemul_arch arch, xxemul_mode mode, uint64_t region_
     emulator->mode = mode;
     if (arch == XXEMUL_ARCH_X86) {
         cdisasm_x86_mode decode_mode = mode == XXEMUL_MODE_X86_16 ? CDISASM_X86_MODE_16 : mode == XXEMUL_MODE_X86_32 ? CDISASM_X86_MODE_32 : CDISASM_X86_MODE_64;
+        emulator->dos_pic_master_offset = 8u;
+        emulator->dos_pic_slave_offset = 0x70u;
         if (cdisasm_x86_cpu_decode_flag_mask(CDISASM_CPU_X86, decode_mode, &emulator->x86_decode_flags) != CDISASM_STATUS_OK) {
             xx_mem_free(emulator->region_data);
             xx_mem_free(emulator);
@@ -163,6 +165,7 @@ void xxemul_destroy(xxemul *emulator)
         return;
     }
     xxemul_windows_destroy(emulator->windows);
+    xxemul_elf_primary_destroy(emulator);
     xxemul_linux_destroy(emulator->linux_process);
     xxemul_darwin_destroy(emulator->darwin);
     xxemul_dos_files_stop(emulator);
@@ -194,6 +197,14 @@ xxemul_status xxemul_start_process(xxemul *emulator, xxemul_image_format format,
         emulator->linux_process = xxemul_linux_create(emulator, program_path, working_directory, argc, argv);
         if (emulator->linux_process == NULL) return XXEMUL_STATUS_INVALID_IMAGE;
         xxemul_linux_set_output(emulator->linux_process, xxemul_linux_output_bridge, emulator);
+        if (emulator->elf_primary != NULL) {
+            status = xxemul_elf_primary_start(emulator);
+            if (status != XXEMUL_STATUS_OK) {
+                xxemul_linux_destroy(emulator->linux_process);
+                emulator->linux_process = NULL;
+            }
+            return status;
+        }
         return XXEMUL_STATUS_OK;
     }
     if (format == XXEMUL_IMAGE_COM || format == XXEMUL_IMAGE_MZ) {
@@ -230,6 +241,8 @@ int xxemul_process_exit_code(const xxemul *emulator)
 
 const char *xxemul_process_error(const xxemul *emulator)
 {
+    const char *elf_error = xxemul_elf_primary_error(emulator);
+    if (elf_error != NULL) return elf_error;
     if (emulator == NULL || emulator->darwin == NULL) return NULL;
     return xxemul_darwin_last_error(emulator->darwin);
 }
@@ -325,6 +338,11 @@ xxemul_status xxemul_read_memory(xxemul *emulator, uint64_t address, void *buffe
         if (mapped != 0) return mapped > 0 ? XXEMUL_STATUS_OK : XXEMUL_STATUS_ADDRESS_FAULT;
     }
     if (buffer == NULL || !xxemul_region_contains(emulator, address, size, &offset)) {
+        if (emulator && emulator->in_step && buffer) {
+            emulator->fault_address = address;
+            emulator->fault_access = emulator->x86_fetching ? 8u : 0u;
+            emulator->fault_address_valid = 1;
+        }
         return buffer == NULL ? XXEMUL_STATUS_INVALID_ARGUMENT : XXEMUL_STATUS_ADDRESS_FAULT;
     }
     xx_mem_copy(buffer, emulator->region_data + offset, size);
@@ -347,6 +365,11 @@ xxemul_status xxemul_write_memory(xxemul *emulator, uint64_t address, const void
         if (mapped != 0) return mapped > 0 ? XXEMUL_STATUS_OK : XXEMUL_STATUS_ADDRESS_FAULT;
     }
     if (buffer == NULL || !xxemul_region_contains(emulator, address, size, &offset)) {
+        if (emulator && emulator->in_step && buffer) {
+            emulator->fault_address = address;
+            emulator->fault_access = 1u;
+            emulator->fault_address_valid = 1;
+        }
         return buffer == NULL ? XXEMUL_STATUS_INVALID_ARGUMENT : XXEMUL_STATUS_ADDRESS_FAULT;
     }
     xx_mem_copy(emulator->region_data + offset, buffer, size);
@@ -492,8 +515,15 @@ xxemul_status xxemul_step(xxemul *emulator, xxemul_step_info *info)
     }
     emulator->in_step = 1;
     status = xxemul_step_inner(emulator, info);
-    emulator->in_step = 0;
+    status = xxemul_elf_primary_after_step(emulator, status);
     emulator->x86_fetching = 0;
+    if (status == XXEMUL_STATUS_OK && emulator->dos_mode) {
+        xxemul_bios_advance_clock(emulator);
+        /* The dispatcher owns shared interrupt eligibility. Protected DPMI
+         * clients use its bounded default-BIOS virtual timer service. */
+        status = xxemul_x86_dos_dispatch_irq0(emulator, info);
+    }
+    emulator->in_step = 0;
     return status;
 }
 
@@ -509,17 +539,24 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
     if (emulator->halted) {
         return XXEMUL_STATUS_HALTED;
     }
+    if (emulator->elf_primary != NULL && xxemul_elf_primary_try_step(emulator, info, &status)) return status;
     if (emulator->windows != NULL && xxemul_windows_try_step(emulator->windows, info, &status)) {
         if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
         return status;
     }
     if (emulator->arch == XXEMUL_ARCH_X86) {
         uint64_t fault_ip;
+        xxemul_x86_state before;
         fault_ip = emulator->x86.ip;
+        if (emulator->windows) before = emulator->x86;
+        emulator->fault_address_valid = 0;
         status = xxemul_x86_step(emulator, info);
         if (status == XXEMUL_STATUS_ADDRESS_FAULT && emulator->dos_mode) {
             return xxemul_x86_dispatch_pending_page_fault(emulator, info, fault_ip);
         }
+        if (emulator->windows && xxemul_windows_try_exception(emulator->windows, &before, status, info)) return XXEMUL_STATUS_OK;
+        if (emulator->windows && status == XXEMUL_STATUS_OK && (before.flags & 0x100u) &&
+            xxemul_windows_try_exception(emulator->windows, &emulator->x86, XXEMUL_WINDOWS_SINGLE_STEP_FAULT, info)) return XXEMUL_STATUS_OK;
         return status;
     }
     if (emulator->arch == XXEMUL_ARCH_MIPS) return xxemul_mips_step(emulator, info);
@@ -689,4 +726,10 @@ const char *xxemul_symbol_name(const xxemul *emulator, uint64_t address)
     if (emulator->darwin != NULL) return xxemul_darwin_symbol(emulator->darwin, address);
     if (emulator->windows != NULL) return xxemul_windows_thunk_name(emulator, address);
     return NULL;
+}
+
+const char *xxemul_symbol_qualified_name(const xxemul *emulator, uint64_t address)
+{
+    if (emulator != NULL && emulator->windows != NULL) return xxemul_windows_thunk_qualified_name(emulator, address);
+    return xxemul_symbol_name(emulator, address);
 }

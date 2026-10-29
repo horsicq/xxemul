@@ -131,6 +131,7 @@ xxemul *xxemul_load_pe(xxemul_image_format format, const uint8_t *image, size_t 
     xxemul_mode mode;
     uint64_t entry;
     uint64_t base;
+    uint64_t mapped_size;
     uint16_t index;
 
     xx_pe_init(&pe, io, 0);
@@ -141,6 +142,7 @@ xxemul *xxemul_load_pe(xxemul_image_format format, const uint8_t *image, size_t 
         goto done;
     }
     base = image_base != 0 ? image_base : pe.image_base;
+    mapped_size = ((uint64_t)pe.size_of_image + 0xfffu) & ~UINT64_C(0xfff);
     if (base > UINT64_MAX - pe.entry_point_rva) goto done;
     entry = base + pe.entry_point_rva;
     if (!xxemul_pe_machine_mode(xx_pe_get_machine(&pe), format, &entry, &arch, &mode)) {
@@ -155,12 +157,12 @@ xxemul *xxemul_load_pe(xxemul_image_format format, const uint8_t *image, size_t 
             goto done;
         }
         section_size = section->virtual_size > section->raw_size ? section->virtual_size : section->raw_size;
-        if (section->virtual_address > pe.size_of_image || section_size > pe.size_of_image - section->virtual_address || section->raw_offset > image_size ||
+        if (section->virtual_address > mapped_size || section_size > mapped_size - section->virtual_address || section->raw_offset > image_size ||
             section->raw_size > image_size - section->raw_offset) {
             goto done;
         }
     }
-    emulator = xxemul_image_allocate(arch, mode, base, pe.size_of_image, entry, 0, status);
+    emulator = xxemul_image_allocate(arch, mode, base, mapped_size, entry, 0, status);
     if (emulator == NULL) {
         goto done;
     }
@@ -169,7 +171,16 @@ xxemul *xxemul_load_pe(xxemul_image_format format, const uint8_t *image, size_t 
         const xx_pe_section *section = xx_pe_get_section(&pe, index);
 
         if (section->raw_size != 0u) {
-            xx_mem_copy(emulator->region_data + section->virtual_address, image + section->raw_offset, section->raw_size);
+            uint64_t raw_start = section->raw_offset, copy_size = section->raw_size;
+            if (pe.section_alignment >= 0x1000u && pe.file_alignment >= 0x200u) {
+                uint64_t map_size = (((uint64_t)(section->virtual_size ? section->virtual_size : section->raw_size)) + 0xfffu) & ~UINT64_C(0xfff);
+                copy_size = (copy_size + (raw_start & 0x1ffu) + 0x1ffu) & ~UINT64_C(0x1ff);
+                raw_start &= ~UINT64_C(0x1ff);
+                if (copy_size > map_size) copy_size = map_size;
+            }
+            if (copy_size > image_size - raw_start) copy_size = image_size - raw_start;
+            if (copy_size > mapped_size - section->virtual_address) copy_size = mapped_size - section->virtual_address;
+            xx_mem_copy(emulator->region_data + section->virtual_address, image + raw_start, (size_t)copy_size);
         }
     }
     *status = xxemul_pe_relocate(emulator, &pe, format);

@@ -67,6 +67,8 @@ can continue using the default full xxfclib profile.
   mapping, including zero-filled BSS and a minimal empty stack
 - Separate bounded ELF32/ELF64 `ET_DYN` API with shared-object relocations,
   explicit version-aware guest import resolution and constructor inventory
+- Primary Linux i386/AMD64 shared objects through the image API, with SysV
+  DT_INIT/DT_INIT_ARRAY execution and retained initialized exports
 - ARM BX/BLX interworking and Thumb call/return address handling
 - Thin Mach-O executable segment mapping with `LC_MAIN` entry points and
   ARM64 UPX `LC_UNIXTHREAD` startup; compatible arm64/arm64e universal slices
@@ -115,7 +117,8 @@ The format is explicit because a COM file has no signature. PE supports x86,
 x86-64, ARM32, and ARM64 machine types; ELF supports x86, x86-64, ARM32, and
 ARM64 in little-endian `ET_EXEC` images, plus MIPS32 o32 in either byte order.
 Compressed MIPS encodings, n32/n64 and Release 6 are rejected. PE images use their preferred base;
-ELF images use `PT_LOAD` virtual addresses. Image regions and file inputs are
+Static ELF images use `PT_LOAD` virtual addresses; supported primary libraries
+add a load bias. Image regions and file inputs are
 currently capped at 128 MiB. PE import thunks and a subset of Windows API
 calls are emulated, along with selected Linux syscalls and an executable
 handoff. The separate shared ELF API supports the bounded dynamic-loading
@@ -156,6 +159,97 @@ Static owned ARM32, ARM64 and MIPS32 LE/BE ELF fixtures packed with UPX
 afresh in the debugger. The fixture programs use modeled write/exit calls;
 this does not establish arbitrary libc, dynamic-linker or native-host support.
 
+## Windows process model
+
+PE32/PE64 execution supplies bounded, process-local Win32 and CRT services.
+Guest paths use a virtual `C:\` rooted at the selected working directory;
+file operations and enumeration access real files below that root. Registry
+keys and archive attributes are process-local metadata. Temporary files,
+copies, truncation, legacy HFILE I/O and file-section writeback perform real
+I/O. POSIX traversal rejects symlinks. File sections currently permit one live
+view per backing file or section; extra views fail explicitly. Read-only view
+permissions are not enforced by the flat memory model.
+
+The x86/x64 bridge loads real guest PE DLLs, resolves named, ordinal, data and
+forwarded exports, binds dependencies, applies relocations and calls guest
+`DllMain` for process attach/detach. Reference counts, pinned modules and loader
+lists track module lifetime. Resource handles include a load generation so an
+unloaded module's handles cannot refer to a later DLL at the same address.
+
+An x86/x64 DLL can also be the main analysis image. The PE `IMAGE_FILE_DLL`
+flag selects this mode automatically, regardless of filename. Dependencies
+initialize first, then the primary image's TLS callbacks and
+`DllMain(image_base, DLL_PROCESS_ATTACH, NULL)` run as guest instructions.
+Successful initialization completes the load phase with `HALTED` and code zero;
+a FALSE return or dependency initialization failure reports code 1114 and runs
+rollback notifications. This is a loader result rather than an invocation of
+guest `ExitProcess`. The initialized primary image stays mapped and pinned,
+with real export lookup and self-module handles, for inspection or export calls.
+An absent DLL entrypoint completes without executing image headers; TLS
+callbacks still run when present. Main EXE return/exit behavior is separate.
+
+Static TLS and TLS callbacks are supported for x86/x64 EXEs and guest DLLs.
+Each thread gets an aligned copy of every image's initialized template and
+zero-fill, addressed by the image's DWORD TLS index through the TEB vector.
+Loading a DLL initializes TLS storage for existing threads without inventing
+earlier thread-attach notifications. TLS callbacks execute in array order before
+the image's `DllMain`, for process/thread attach and normal detach. The callback
+return value is ignored and its reserved argument is NULL. New thread routines
+start after their attach notifications; waits signal only after normal detach.
+The last normally exiting thread receives process detach only. Forced
+`TerminateProcess`/`TerminateThread` bypass these callbacks.
+
+Callback lists are bounded to 64 entries plus a NULL terminator, static TLS data
+to 16 MiB per image and alignment to 8192 bytes. Image metadata, template,
+callback-array and DWORD index spans are checked before publication. A zero
+directory-size field is accepted when the complete TLS structure fits.
+Callback target addresses follow the existing flat guest memory model.
+`DisableThreadLibraryCalls` fails for active static TLS or a callback array.
+Loader notifications are serialized: creating a thread inside a callback queues
+its startup until the callback returns; yielding inside TLS callbacks or
+`DllMain` remains unsupported. ARM TLS callback-bearing images are rejected.
+Cyclic dependencies, delay imports and CLR modules fail explicitly. There are
+at most 24 modules and eight nested initialization frames, with a 16 MiB bound
+per dependency DLL file/image. Primary images use the normal PE image limits.
+
+`CreateProcessA/W` creates a separate guest CPU and address space, including
+cross-bitness x86/x64 children. Guest arguments, environment and current directory
+are process-local. Cooperative execution supports suspended creation, child
+process/thread handles, waits, exit codes, resume/suspend and termination.
+Closing public handles does not stop a live child. The session owns the entire
+tree: at most eight processes, four child levels and 256 MiB of guest regions;
+each child also has a `0x40000000` instruction bound. Executable lookup uses the
+parent executable's directory followed by guest CWD. Guest PATH/system-directory
+search and arbitrary inherited handles or pipe redirection are unsupported.
+Standard console output is forwarded to the session callback. Destroying the
+root emulator tears down the tree.
+
+Current-directory and environment APIs update the guest process state without
+changing the host CWD. Real no-overwrite `MoveFileA/W` is supported on Linux and
+macOS; other POSIX hosts return an explicit unsupported error. Resource APIs
+read bounded numeric/named PE resource trees from the EXE and live guest DLLs.
+
+The x86/x64 cooperative scheduler supports the main thread and seven workers,
+individual stacks, static/dynamic TLS, register and floating-point state,
+thread-local errors, suspend/resume, waits and termination. It does not model
+parallel host execution. ARM thread creation, APCs and yielding through active
+SEH frames remain unsupported.
+
+Headless modal dialogs parse bounded standard/extended numeric RT_DIALOG
+resources and execute the real guest dialog procedure, including worker-thread
+completion. Text, font and selected progress messages retain actual object
+state. A dialog that requires user interaction returns
+`XXEMUL_STATUS_INPUT_REQUIRED`; no commands are injected automatically.
+Custom window classes, arbitrary message queues and general desktop rendering
+are outside this model. Unsupported calls must be distinguished from modeled
+exports when assessing a program's result.
+
+Formatting, heap ownership, CRT file operations, INI reads, guest memory
+status and selected en-US/CP1252/CP437 locale services have public API tests
+on both x86 and x64. This remains a selected Windows API model, not a complete
+Windows installation: x64 exception unwinding and CRT `_except_handler3`
+execution are unsupported. Unsupported APIs and execution faults remain errors.
+
 ## Shared ELF API
 
 `xxemul/xxemul_elf.h` owns a guest CPU and mapped little-endian `ET_DYN` image
@@ -173,7 +267,23 @@ remain valid until `xxemul_elf_shared_destroy`. The input bytes need not outlive
 creation. ARM function addresses retain their Thumb bit.
 
 Unsupported relocations, TLS, IFUNC and packed relocations fail explicitly.
-The original ET_EXEC loader and executable process setup remain separate.
+
+The ordinary ELF image constructors also load little-endian i386 and AMD64
+shared libraries with PT_DYNAMIC, without PT_INTERP, DF_1_PIE or DT_NEEDED
+dependencies. Their ELF entry may be zero, or may alias DT_INIT when a valid
+SONAME identifies the library, as in the tested UPX shared-library wrapper.
+`xxemul_start_process` supplies the Linux stack and
+syscall context, then schedules DT_INIT followed by the live DT_INIT_ARRAY
+using `(argc, argv, envp)`. The array is read after DT_INIT, allowing a loader
+to restore its callbacks first. Successful initialization halts with result
+zero and leaves exports mapped for guest calls. Initializer return values
+are ignored. `xxemul_elf_primary_get_info`, `find_export` and `get_entry`
+expose the layout, dynamic exports and first initializer to analysis clients.
+The analysis entry is zero when no initializer exists. ELF e_entry remains
+metadata and is not used to invoke the library as an executable.
+Linux `/proc/self/auxv` exposes the same guest-width auxiliary vector as the
+initial stack, with biased addresses for shared objects.
+
 XAPKEmul's native bridge supplies Android import models, executes initialization
 and JNI_OnLoad, and binds DEX native declarations to JNI exports. See its README
 for the implemented JNI subset and actual Oxygen APK integration tests.
@@ -209,7 +319,9 @@ PE header retains the preferred ImageBase; region/entry getters use the actual
 address. Unsupported relocation types and malformed tables return an error.
 An empty relocation directory is valid when relocations are not marked
 stripped, as with a position-independent UPX PE64 loader stub.
-ELF and Mach-O formats reject an explicit load base.
+For a primary ELF shared library, `_at` selects the actual first mapped
+PT_LOAD address. Zero selects the shared loader's default bias, 0x10000000.
+Static ELF and Mach-O images reject an explicit load base.
 
 The same `_at` constructors support COM and MZ. Here `image_base` is the
 first COM program byte or the first MZ load-module byte after its file header;

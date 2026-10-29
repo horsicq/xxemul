@@ -24,26 +24,38 @@ int xxemul_load_msdos_exe(xxemul *emulator, const uint8_t *image, size_t image_s
     uint32_t block_end;
     uint32_t available_extra;
     uint32_t allocated_extra;
+    uint32_t stack_base;
+    uint32_t stack_address;
     uint16_t load_segment = (uint16_t)(emulator->psp_segment + 0x10u);
     uint32_t load_address = (uint32_t)load_segment << 4;
     int valid = 0;
 
     xx_msdos_init(&msdos, io, 0);
-    if (!xx_msdos_check_is_valid(&msdos.format, NULL) || !xx_msdos_handle_base_info(&msdos.format, NULL) || xx_msdos_has_pe_header(&msdos) ||
+    if (!xx_msdos_check_is_valid(&msdos.format, NULL) || !xx_msdos_handle_base_info(&msdos.format, NULL) ||
         msdos.format.format_size <= 0) {
         goto done;
     }
+    if (xx_msdos_has_pe_header(&msdos)) {
+        /* LE/LX DOS extenders execute the real-mode MZ loader first. PE and
+         * NE images still belong to their separate execution environments. */
+        int64_t offset = xx_msdos_get_pe_offset(&msdos);
+        if (offset < 0 || (uint64_t)offset > image_size || image_size - (size_t)offset < 2u ||
+            image[offset] != 'L' || (image[offset + 1] != 'E' && image[offset + 1] != 'X')) goto done;
+    }
     header_size = (size_t)xx_msdos_get_header_size(&msdos) * 16u;
     declared_size = (size_t)msdos.format.format_size;
-    if (xx_msdos_get_pages_in_file(&msdos) == 0u || xx_msdos_get_bytes_on_last_page(&msdos) > 511u) {
+    if (xx_msdos_get_pages_in_file(&msdos) == 0u || xx_msdos_get_bytes_on_last_page(&msdos) > 512u) {
         goto done;
     }
     file_declared_size =
         ((size_t)xx_msdos_get_pages_in_file(&msdos) - 1u) * 512u + (xx_msdos_get_bytes_on_last_page(&msdos) == 0u ? 512u : xx_msdos_get_bytes_on_last_page(&msdos));
+    /* Some DOS producers spell a complete final page as 512 instead of 0.
+     * Honor that measured DOS extent rather than mapping an overlay as code. */
+    if (xx_msdos_get_bytes_on_last_page(&msdos) == 512u) declared_size = file_declared_size;
     relocation_count = xx_msdos_get_relocations(&msdos);
     relocation_offset = xx_msdos_get_reloc_offset(&msdos);
-    if (file_declared_size > image_size || header_size < 28u || header_size > declared_size || declared_size > image_size || relocation_offset > header_size ||
-        relocation_count > (header_size - relocation_offset) / 4u) {
+    if (file_declared_size > image_size || header_size < 28u || header_size > declared_size || declared_size > image_size ||
+        (relocation_count && (relocation_offset > header_size || relocation_count > (header_size - relocation_offset) / 4u))) {
         goto done;
     }
     body_size = declared_size - header_size;
@@ -89,8 +101,12 @@ int xxemul_load_msdos_exe(xxemul *emulator, const uint8_t *image, size_t image_s
     emulator->x86.segment[XXEMUL_X86_ES] = emulator->psp_segment;
     emulator->x86.ip = xx_msdos_get_ip(&msdos);
     emulator->x86.gpr[XXEMUL_X86_RSP] = xx_msdos_get_sp(&msdos);
+    stack_base = (uint32_t)emulator->x86.segment[XXEMUL_X86_SS] << 4;
+    stack_address = stack_base + (uint16_t)emulator->x86.gpr[XXEMUL_X86_RSP];
+    /* SP can point just past conventional memory: a descending stack's
+     * first PUSH accesses the preceding word. SS itself must remain inside. */
     if (xxemul_dos_linear(emulator->x86.segment[XXEMUL_X86_CS], (uint16_t)emulator->x86.ip) >= XXEMUL_DOS_CONVENTIONAL_END ||
-        xxemul_dos_linear(emulator->x86.segment[XXEMUL_X86_SS], (uint16_t)emulator->x86.gpr[XXEMUL_X86_RSP]) >= XXEMUL_DOS_CONVENTIONAL_END) {
+        stack_base >= XXEMUL_DOS_CONVENTIONAL_END || stack_address > XXEMUL_DOS_CONVENTIONAL_END) {
         goto done;
     }
     {

@@ -285,6 +285,8 @@ XXEMUL_API int xxemul_is_halted(const xxemul *emulator);
 /** Name of a synthetic OS entry point (for example a PE import thunk), or
  * NULL. The string is borrowed from the emulator. */
 XXEMUL_API const char *xxemul_symbol_name(const xxemul *emulator, uint64_t address);
+/** Best available symbol name, retaining module!function for modeled imports. */
+XXEMUL_API const char *xxemul_symbol_qualified_name(const xxemul *emulator, uint64_t address);
 
 #ifdef __cplusplus
 }

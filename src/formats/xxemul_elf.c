@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 
+static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t *image, size_t image_size,
+                                      uint64_t image_base, xxemul_status *status);
+
 static int xxemul_elf_machine_mode(uint16_t machine, xxemul_image_format format, uint64_t *entry, xxemul_arch *arch, xxemul_mode *mode)
 {
     switch (machine) {
@@ -36,7 +39,7 @@ static int xxemul_elf_machine_mode(uint16_t machine, xxemul_image_format format,
     }
 }
 
-xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, xxemul_status *status)
+xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, uint64_t image_base, xxemul_status *status)
 {
     xx_elf elf;
     xxemul *emulator = NULL;
@@ -51,6 +54,14 @@ xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t
     xx_elf_init(&elf, io, 0);
     *status = XXEMUL_STATUS_INVALID_IMAGE;
     if (!xx_elf_handle_base_info(&elf.format, NULL) || xx_elf_is_64(&elf) != (format == XXEMUL_IMAGE_ELF64)) {
+        goto done;
+    }
+    if (xx_elf_get_type(&elf) == 3u) {
+        emulator = xxemul_load_elf_primary(format, image, image_size, image_base, status);
+        goto done;
+    }
+    if (image_base != 0u) {
+        *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         goto done;
     }
     if (xx_elf_get_type(&elf) != XX_ELF_TYPE_EXEC ||
@@ -173,6 +184,12 @@ struct xxemul_elf_shared {
     size_t version_count;
     uint64_t *initializers;
     size_t initializer_count;
+    uint64_t dynamic_address, dynamic_size, init;
+    uint64_t primary_return, primary_stack, primary_expected_sp;
+    uint64_t primary_argc, primary_argv, primary_envp;
+    uint64_t primary_array, primary_array_count, primary_array_index;
+    unsigned primary_stage;
+    char primary_error[256];
     unsigned width;
 };
 
@@ -928,7 +945,7 @@ static int shared_initializers(shared_input *input, const shared_dynamic *dynami
     return 1;
 }
 
-xxemul_elf_shared *xxemul_elf_shared_create(const void *image, size_t image_size, const xxemul_elf_shared_config *config, xxemul_elf_result *result)
+static xxemul_elf_shared *shared_create(const void *image, size_t image_size, const xxemul_elf_shared_config *config, xxemul_elf_result *result, unsigned flags)
 {
     xxemul_elf_result local_result;
     xxemul_elf_shared *module;
@@ -950,7 +967,7 @@ xxemul_elf_shared *xxemul_elf_shared_create(const void *image, size_t image_size
         return NULL;
     }
     if (config) module->config = *config;
-    if (!module->config.load_bias) module->config.load_bias = UINT64_C(0x10000000);
+    if (!module->config.load_bias && !(flags & 1u)) module->config.load_bias = UINT64_C(0x10000000);
     if (!module->config.max_memory_bytes) module->config.max_memory_bytes = 64u * 1024u * 1024u;
     if (!module->config.stack_bytes) module->config.stack_bytes = 1024u * 1024u;
     if (!module->config.auxiliary_bytes) module->config.auxiliary_bytes = 1024u * 1024u;
@@ -984,14 +1001,29 @@ xxemul_elf_shared *xxemul_elf_shared_create(const void *image, size_t image_size
     }
     if (!shared_relocation_table(&input, dynamic.rel, dynamic.rel_size, dynamic.rel_entry, 0) ||
         !shared_relocation_table(&input, dynamic.rela, dynamic.rela_size, dynamic.rela_entry, 1) ||
-        !shared_relocation_table(&input, dynamic.jump_rel, dynamic.jump_size, module->width * (dynamic.jump_kind == 7 ? 3u : 2u), dynamic.jump_kind == 7) ||
-        !shared_initializers(&input, &dynamic))
+        !shared_relocation_table(&input, dynamic.jump_rel, dynamic.jump_size, module->width * (dynamic.jump_kind == 7 ? 3u : 2u), dynamic.jump_kind == 7))
         goto failed;
+    if ((flags & 2u) && dynamic.init) {
+        shared_dynamic first = dynamic;
+        /* A primary DT_INIT can repair/change its later array. Only admit
+         * the first function now; array metadata and cells are read live
+         * after its return. The explicit shared API keeps its strict snapshot. */
+        first.init_array = first.init_array_size = 0;
+        if (!shared_initializers(&input, &first)) goto failed;
+    } else if (!shared_initializers(&input, &dynamic)) goto failed;
+    module->dynamic_address = dynamic_address;
+    module->dynamic_size = dynamic_size;
+    module->init = dynamic.init;
     (void)snprintf(result->diagnostic, sizeof(result->diagnostic), "shared ELF loaded and relocated; constructors not executed");
     return module;
 failed:
     xxemul_elf_shared_destroy(module);
     return NULL;
+}
+
+xxemul_elf_shared *xxemul_elf_shared_create(const void *image, size_t image_size, const xxemul_elf_shared_config *config, xxemul_elf_result *result)
+{
+    return shared_create(image, image_size, config, result, 0);
 }
 
 void xxemul_elf_shared_destroy(xxemul_elf_shared *module)
@@ -1047,4 +1079,263 @@ xxemul_status xxemul_elf_shared_initializer_at(const xxemul_elf_shared *module, 
     if (index >= module->initializer_count) return XXEMUL_STATUS_ADDRESS_FAULT;
     *address = module->initializers[index];
     return XXEMUL_STATUS_OK;
+}
+
+enum { PRIMARY_BEFORE_INIT = 1, PRIMARY_WAIT_INIT, PRIMARY_ARRAY, PRIMARY_WAIT_ARRAY, PRIMARY_COMPLETE, PRIMARY_FAILED };
+
+static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t *image, size_t size,
+                                      uint64_t image_base, xxemul_status *status)
+{
+    xxemul_elf_shared_config config;
+    xxemul_elf_result result;
+    xxemul_elf_shared *module;
+    uint64_t phoff, low = UINT64_MAX, dynamic_offset = 0, dynamic_size = 0, i;
+    uint64_t entry, init = 0, soname = UINT64_MAX;
+    uint16_t phsize, phcount;
+    unsigned width = format == XXEMUL_IMAGE_ELF64 ? 8u : 4u;
+    int found_dynamic = 0;
+    *status = XXEMUL_STATUS_INVALID_IMAGE;
+    if (size < (width == 8u ? 64u : 52u) || image[4] != (width == 8u ? 2u : 1u) || image[5] != 1u) return NULL;
+    entry = shared_word(image + 24u, width);
+    if ((image[7] != 0u && image[7] != 3u) ||
+        shared_u16(image + 18u) != (width == 8u ? 62u : 3u)) {
+        *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+        return NULL;
+    }
+    phoff = width == 8u ? shared_u64(image + 32u) : shared_u32(image + 28u);
+    phsize = shared_u16(image + (width == 8u ? 54u : 42u));
+    phcount = shared_u16(image + (width == 8u ? 56u : 44u));
+    if (phsize != (width == 8u ? 56u : 32u) || !phcount || phcount > ELF_SHARED_MAX_PHDRS ||
+        phoff > size || (uint64_t)phsize * phcount > size - phoff) return NULL;
+    for (i = 0; i < phcount; ++i) {
+        const uint8_t *p = image + (size_t)phoff + (size_t)i * phsize;
+        uint32_t type = shared_u32(p);
+        uint64_t address = width == 8u ? shared_u64(p + 16u) : shared_u32(p + 8u);
+        uint64_t memory = width == 8u ? shared_u64(p + 40u) : shared_u32(p + 20u);
+        if (type == 3u) { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; return NULL; }
+        if (type == 1u && memory && address < low) low = address;
+        if (type == 2u) {
+            if (found_dynamic++) return NULL;
+            dynamic_offset = width == 8u ? shared_u64(p + 8u) : shared_u32(p + 4u);
+            dynamic_size = width == 8u ? shared_u64(p + 32u) : shared_u32(p + 16u);
+        }
+    }
+    if (!found_dynamic || !dynamic_size || dynamic_size % (width * 2u) || dynamic_offset > size ||
+        dynamic_size > size - dynamic_offset || dynamic_size / (width * 2u) > ELF_SHARED_MAX_DYNAMIC || low == UINT64_MAX) return NULL;
+    for (i = 0; i < dynamic_size / (width * 2u); ++i) {
+        const uint8_t *p = image + (size_t)dynamic_offset + (size_t)i * width * 2u;
+        uint64_t tag = shared_word(p, width), value = shared_word(p + width, width);
+        if (!tag) break;
+        if (tag == 12u) init = value;
+        if (tag == 14u) soname = value;
+        if (tag == 1u || (tag == UINT64_C(0x6ffffffb) && (value & UINT64_C(0x08000000)))) {
+            *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+            return NULL;
+        }
+    }
+    /* Some library packers publish their DT_INIT wrapper in e_entry too.
+     * Require a self-named library and an exact initializer alias; this does
+     * not admit arbitrary nonzero-entry ET_DYN executables. */
+    if (entry && (entry != init || soname == UINT64_MAX)) {
+        *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+        return NULL;
+    }
+    memset(&config, 0, sizeof(config));
+    low &= ~UINT64_C(4095);
+    if (image_base) {
+        if (image_base < low) { *status = XXEMUL_STATUS_INVALID_ARGUMENT; return NULL; }
+        config.load_bias = image_base - low;
+    }
+    module = shared_create(image, size, &config, &result, 2u | (image_base != 0u ? 1u : 0u));
+    if (!module) { *status = result.status; return NULL; }
+    if (entry && (soname >= module->string_size || !module->strings[soname] ||
+                  !memchr(module->strings + soname, 0, module->string_size - (size_t)soname))) {
+        xxemul_elf_shared_destroy(module);
+        *status = XXEMUL_STATUS_INVALID_IMAGE;
+        return NULL;
+    }
+    module->primary_return = module->info.auxiliary_address + 0x80u;
+    module->emulator->elf_primary = module;
+    module->emulator->x86.ip = module->primary_return;
+    *status = XXEMUL_STATUS_OK;
+    return module->emulator;
+}
+
+const xxemul_elf_shared_info *xxemul_elf_primary_get_info(const xxemul *emulator)
+{
+    return emulator && emulator->elf_primary ? &emulator->elf_primary->info : NULL;
+}
+
+xxemul_status xxemul_elf_primary_find_export(const xxemul *emulator, const char *name, uint64_t *address)
+{
+    if (address) *address = 0;
+    if (!emulator || !name || !address) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (!emulator->elf_primary) return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+    return xxemul_elf_shared_find_export(emulator->elf_primary, name, address);
+}
+
+xxemul_status xxemul_elf_primary_get_entry(const xxemul *emulator, uint64_t *address)
+{
+    if (address) *address = 0;
+    if (!emulator || !address) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (!emulator->elf_primary) return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+    if (emulator->elf_primary->initializer_count) *address = emulator->elf_primary->initializers[0];
+    return XXEMUL_STATUS_OK;
+}
+
+void xxemul_elf_primary_destroy(xxemul *emulator)
+{
+    xxemul_elf_shared *module;
+    if (!emulator || !(module = emulator->elf_primary)) return;
+    emulator->elf_primary = NULL;
+    /* The containing emulator owns its CPU. Release only module metadata. */
+    module->emulator = NULL;
+    xxemul_elf_shared_destroy(module);
+}
+
+static xxemul_status primary_fail(xxemul_elf_shared *module, xxemul_status status, const char *message)
+{
+    (void)snprintf(module->primary_error, sizeof(module->primary_error), "%s", message);
+    module->primary_stage = PRIMARY_FAILED;
+    module->emulator->halted = 1;
+    return status;
+}
+
+static int primary_word(xxemul_elf_shared *module, uint64_t address, uint64_t *value)
+{
+    uint8_t bytes[8];
+    if (xxemul_read_memory(module->emulator, address, bytes, module->width) != XXEMUL_STATUS_OK) return 0;
+    *value = shared_word(bytes, module->width);
+    return 1;
+}
+
+xxemul_status xxemul_elf_primary_start(xxemul *emulator)
+{
+    xxemul_elf_shared *module = emulator->elf_primary;
+    uint64_t sp = emulator->x86.gpr[XXEMUL_X86_RSP], argc;
+    if (!module || module->primary_stage) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (sp < module->info.stack_address + 0x100u || !primary_word(module, sp, &argc) || argc > 128u ||
+        sp > UINT64_MAX - (argc + 3u) * module->width)
+        return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "invalid primary ELF initial process stack");
+    module->primary_argc = argc;
+    module->primary_argv = sp + module->width;
+    module->primary_envp = sp + (argc + 2u) * module->width;
+    module->primary_stack = (sp - 0x100u) & ~UINT64_C(15);
+    module->primary_stage = PRIMARY_BEFORE_INIT;
+    emulator->x86.ip = module->primary_return;
+    return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status primary_array(xxemul_elf_shared *module)
+{
+    uint64_t i, array = 0, size = 0;
+    unsigned seen = 0;
+    for (i = 0; i < module->dynamic_size / (module->width * 2u); ++i) {
+        uint64_t address = module->info.load_bias + module->dynamic_address + i * module->width * 2u, tag, value;
+        if (!primary_word(module, address, &tag) || !primary_word(module, address + module->width, &value))
+            return primary_fail(module, XXEMUL_STATUS_ADDRESS_FAULT, "cannot read live ELF initializer metadata");
+        if (!tag) break;
+        if (tag == 25u) {
+            if (seen & 1u) return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "duplicate live DT_INIT_ARRAY");
+            seen |= 1u; array = value;
+        } else if (tag == 27u) {
+            if (seen & 2u) return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "duplicate live DT_INIT_ARRAYSZ");
+            seen |= 2u; size = value;
+        }
+    }
+    if (i == module->dynamic_size / (module->width * 2u) || size % module->width ||
+        size / module->width >= ELF_SHARED_MAX_INITIALIZERS || (array && !(seen & 2u)) ||
+        (size && (!array || !shared_mapped(module, array, size, 0))) || array > UINT64_MAX - module->info.load_bias)
+        return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "invalid live ELF initializer array");
+    module->primary_array = module->info.load_bias + array;
+    module->primary_array_count = size / module->width;
+    module->primary_array_index = 0;
+    module->primary_stage = PRIMARY_ARRAY;
+    return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status primary_call(xxemul_elf_shared *module, uint64_t target)
+{
+    xxemul *emulator = module->emulator;
+    uint64_t sp = module->primary_stack - module->width;
+    uint8_t frame[16];
+    if (target < module->info.load_bias || !shared_mapped(module, target - module->info.load_bias, 1u, 1))
+        return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "ELF initializer is outside executable PT_LOAD");
+    if (module->width == 8u) {
+        uint64_t value = module->primary_return;
+        unsigned i;
+        for (i = 0; i < 8u; ++i) frame[i] = (uint8_t)(value >> (8u * i));
+        if (xxemul_write_memory(emulator, sp, frame, 8u) != XXEMUL_STATUS_OK)
+            return primary_fail(module, XXEMUL_STATUS_ADDRESS_FAULT, "cannot build ELF initializer return frame");
+        emulator->x86.gpr[XXEMUL_X86_RDI] = module->primary_argc;
+        emulator->x86.gpr[XXEMUL_X86_RSI] = module->primary_argv;
+        emulator->x86.gpr[XXEMUL_X86_RDX] = module->primary_envp;
+    } else {
+        uint64_t values[4];
+        unsigned i, j;
+        values[0] = module->primary_return; values[1] = module->primary_argc;
+        values[2] = module->primary_argv; values[3] = module->primary_envp;
+        for (i = 0; i < 4u; ++i) for (j = 0; j < 4u; ++j) frame[i * 4u + j] = (uint8_t)(values[i] >> (8u * j));
+        if (xxemul_write_memory(emulator, sp, frame, 16u) != XXEMUL_STATUS_OK)
+            return primary_fail(module, XXEMUL_STATUS_ADDRESS_FAULT, "cannot build ELF initializer arguments");
+    }
+    module->primary_expected_sp = sp + module->width;
+    emulator->x86.gpr[XXEMUL_X86_RAX] = 0u;
+    emulator->x86.gpr[XXEMUL_X86_RSP] = sp;
+    emulator->x86.ip = target;
+    return XXEMUL_STATUS_OK;
+}
+
+int xxemul_elf_primary_try_step(xxemul *emulator, xxemul_step_info *info, xxemul_status *status)
+{
+    xxemul_elf_shared *module = emulator->elf_primary;
+    uint64_t target;
+    if (!module || !module->primary_stage || module->primary_stage >= PRIMARY_COMPLETE || emulator->x86.ip != module->primary_return) return 0;
+    if (info) info->address = module->primary_return;
+    if ((module->primary_stage == PRIMARY_WAIT_INIT || module->primary_stage == PRIMARY_WAIT_ARRAY) &&
+        emulator->x86.gpr[XXEMUL_X86_RSP] != module->primary_expected_sp) {
+        *status = primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "ELF initializer violates guest SysV stack cleanup");
+        return 1;
+    }
+    if (module->primary_stage == PRIMARY_BEFORE_INIT && module->init) {
+        module->primary_stage = PRIMARY_WAIT_INIT;
+        *status = primary_call(module, module->info.load_bias + module->init);
+        if (info) info->next_address = emulator->x86.ip;
+        return 1;
+    }
+    if (module->primary_stage == PRIMARY_BEFORE_INIT || module->primary_stage == PRIMARY_WAIT_INIT) {
+        *status = primary_array(module);
+        if (*status != XXEMUL_STATUS_OK) return 1;
+    } else if (module->primary_stage == PRIMARY_WAIT_ARRAY) {
+        ++module->primary_array_index;
+        module->primary_stage = PRIMARY_ARRAY;
+    }
+    while (module->primary_array_index < module->primary_array_count) {
+        if (!primary_word(module, module->primary_array + module->primary_array_index * module->width, &target)) {
+            *status = primary_fail(module, XXEMUL_STATUS_ADDRESS_FAULT, "cannot read live ELF initializer pointer");
+            return 1;
+        }
+        if (!target || target == (module->width == 8u ? UINT64_MAX : UINT32_MAX)) { ++module->primary_array_index; continue; }
+        module->primary_stage = PRIMARY_WAIT_ARRAY;
+        *status = primary_call(module, target);
+        if (info) info->next_address = emulator->x86.ip;
+        return 1;
+    }
+    module->primary_stage = PRIMARY_COMPLETE;
+    emulator->halted = 1;
+    *status = XXEMUL_STATUS_HALTED;
+    return 1;
+}
+
+xxemul_status xxemul_elf_primary_after_step(xxemul *emulator, xxemul_status status)
+{
+    xxemul_elf_shared *module = emulator->elf_primary;
+    if (module && module->primary_stage && module->primary_stage < PRIMARY_COMPLETE && status == XXEMUL_STATUS_HALTED)
+        return primary_fail(module, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "ELF initializer halted before returning to its loader");
+    return status;
+}
+
+const char *xxemul_elf_primary_error(const xxemul *emulator)
+{
+    return emulator && emulator->elf_primary && emulator->elf_primary->primary_error[0] ? emulator->elf_primary->primary_error : NULL;
 }

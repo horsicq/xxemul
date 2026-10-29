@@ -359,6 +359,8 @@ static xxemul_status xxemul_x86_load_dos_segment(xxemul *emulator, uint8_t segme
     if (status != XXEMUL_STATUS_OK) return status;
     emulator->x86.segment[segment_index] = selector;
     emulator->dos_segments[segment_index] = cache;
+    if (segment_index == XXEMUL_X86_SS && (emulator->dos_cr0 & 1u) == 0u && emulator->in_step)
+        emulator->dos_irq0_shadow = 1u;
     if (segment_index == XXEMUL_X86_CS) {
         emulator->mode = (cache.flags & 4u) != 0u ? XXEMUL_MODE_X86_32 : XXEMUL_MODE_X86_16;
     }
@@ -569,10 +571,49 @@ static xxemul_status xxemul_x86_dos_host_thunk(xxemul *emulator, uint8_t vector)
 
     status = vector == 0x21u ? xxemul_msdos_interrupt(emulator, vector) : xxemul_bios_interrupt(emulator, vector);
     if (status != XXEMUL_STATUS_OK) return status;
+    if (emulator->dos_context_transfer) return XXEMUL_STATUS_OK;
     /* The following IRET restores status from the saved return frame. */
-    if (vector == 0x21u && (ax >> 8u) == 0x06u && (uint8_t)dx == 0xffu) status_mask |= XXEMUL_X86_FLAG_ZF;
+    if (vector == 0x21u && ((ax >> 8u) == 0x06u || ax == 0x0c06u) && (uint8_t)dx == 0xffu)
+        status_mask |= XXEMUL_X86_FLAG_ZF;
     saved_flags = (saved_flags & ~status_mask) | (emulator->x86.flags & status_mask);
     return xxemul_x86_guest_store_integer(emulator, flags_address, 2u, saved_flags);
+}
+
+static int xxemul_x86_dpmi_default_vector(xxemul *emulator, uint8_t vector)
+{
+    uint8_t gate[8];
+    uint32_t at = (uint32_t)vector * 8u;
+    if (at + 7u > emulator->dos_idtr_limit ||
+        xxemul_x86_guest_memory(emulator, (uint64_t)emulator->dos_idtr_base + at, gate, sizeof(gate), 0) != XXEMUL_STATUS_OK) return 0;
+    return xxemul_x86_dos_u16(gate + 2u) == XXEMUL_DPMI_HOST_SELECTOR &&
+           xxemul_x86_dos_u16(gate) == XXEMUL_DPMI_HOST_VECTOR_BASE + (uint32_t)vector * 4u &&
+           gate[4] == 0u && gate[5] == (emulator->dos_dpmi_client32 ? 0x8eu : 0x86u) &&
+           xxemul_x86_dos_u16(gate + 6u) == 0u;
+}
+
+static xxemul_status xxemul_x86_dpmi_host_thunk(xxemul *emulator, uint8_t vector, uint8_t width)
+{
+    uint32_t mask = (emulator->dos_segments[XXEMUL_X86_SS].flags & 4u) ? UINT32_MAX : UINT16_MAX;
+    uint32_t offset = ((uint32_t)emulator->x86.gpr[XXEMUL_X86_RSP] + width * 2u) & mask;
+    uint32_t address;
+    uint64_t flags, result_mask = XXEMUL_X86_FLAG_CF;
+    uint16_t ax = (uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX];
+    uint16_t dx = (uint16_t)emulator->x86.gpr[XXEMUL_X86_RDX];
+    xxemul_status status;
+    if (width != (emulator->dos_dpmi_client32 ? 4u : 2u)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    status = xxemul_x86_dos_stack_address(emulator->dos_segments + XXEMUL_X86_SS, offset, width, &address);
+    if (status != XXEMUL_STATUS_OK) return status;
+    status = xxemul_x86_guest_load_integer(emulator, address, width, &flags);
+    if (status != XXEMUL_STATUS_OK) return status;
+    status = xxemul_x86_dos_preflight_write(emulator, address, width);
+    if (status != XXEMUL_STATUS_OK) return status;
+    status = xxemul_dpmi_reflect_interrupt(emulator, vector);
+    if (status != XXEMUL_STATUS_OK) return status;
+    if (emulator->dos_context_transfer) return XXEMUL_STATUS_OK;
+    if (vector == 0x21u && ((ax >> 8u) == 0x06u || ax == 0x0c06u) && (uint8_t)dx == 0xffu)
+        result_mask |= XXEMUL_X86_FLAG_ZF;
+    flags = (flags & ~result_mask) | (emulator->x86.flags & result_mask);
+    return xxemul_x86_guest_store_integer(emulator, address, width, flags);
 }
 
 static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vector, uint32_t resume_ip, int hardware_fault, uint32_t error_code, uint64_t *target_ip)
@@ -580,7 +621,8 @@ static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vec
     uint8_t gate[8];
     uint8_t stack_pointer[6];
     uint8_t frame[24];
-    uint8_t *return_frame = frame + (hardware_fault ? 4u : 0u);
+    uint8_t *return_frame;
+    uint8_t width;
     uint8_t fetch_byte;
     uint16_t code_selector;
     uint16_t stack_selector = emulator->x86.segment[XXEMUL_X86_SS];
@@ -601,9 +643,12 @@ static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vec
 
     if ((uint32_t)vector * 8u + 7u > emulator->dos_idtr_limit) return XXEMUL_STATUS_ADDRESS_FAULT;
     if ((emulator->x86.flags & XXEMUL_X86_FLAG_VM) != 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-    status = xxemul_x86_guest_memory(emulator, emulator->dos_idtr_base + (uint32_t)vector * 8u, gate, sizeof(gate), 0);
+    status = xxemul_x86_guest_memory(emulator, (uint64_t)emulator->dos_idtr_base + (uint32_t)vector * 8u, gate, sizeof(gate), 0);
     if (status != XXEMUL_STATUS_OK) return status;
-    if ((gate[5] & 0x9fu) != 0x8eu || gate[4] != 0u || (!hardware_fault && old_cpl > ((gate[5] >> 5u) & 3u))) return XXEMUL_STATUS_ADDRESS_FAULT;
+    if ((gate[5] & 0x97u) != 0x86u || gate[4] != 0u || (!hardware_fault && old_cpl > ((gate[5] >> 5u) & 3u))) return XXEMUL_STATUS_ADDRESS_FAULT;
+    width = (gate[5] & 8u) ? 4u : 2u;
+    if (width == 2u && xxemul_x86_dos_u16(gate + 6u)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    return_frame = frame + (hardware_fault ? width : 0u);
     code_selector = xxemul_x86_dos_u16(gate + 2u);
     code_offset = xxemul_x86_dos_u16(gate) | ((uint32_t)xxemul_x86_dos_u16(gate + 6u) << 16u);
     status = xxemul_x86_decode_dos_segment(emulator, XXEMUL_X86_CS, code_selector, emulator->dos_ldtr_selector, emulator->dos_ldtr_base, emulator->dos_ldtr_limit,
@@ -629,17 +674,28 @@ static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vec
         if ((stack_selector & 3u) != new_cpl || ((stack_cache.access >> 5u) & 3u) != new_cpl) return XXEMUL_STATUS_ADDRESS_FAULT;
     }
     stack_mask = (stack_cache.flags & 4u) != 0u ? UINT32_MAX : UINT16_MAX;
-    frame_size = (stack_switch ? 20u : 12u) + (hardware_fault ? 4u : 0u);
+    frame_size = width * (stack_switch ? 5u : 3u) + (hardware_fault ? width : 0u);
     frame_offset = (stack_offset - (uint32_t)frame_size) & stack_mask;
     status = xxemul_x86_dos_stack_address(&stack_cache, frame_offset, frame_size, &frame_address);
     if (status != XXEMUL_STATUS_OK) return status;
-    if (hardware_fault) xxemul_x86_dos_put_u32(frame, error_code);
-    xxemul_x86_dos_put_u32(return_frame, resume_ip);
-    xxemul_x86_dos_put_u32(return_frame + 4u, emulator->x86.segment[XXEMUL_X86_CS]);
-    xxemul_x86_dos_put_u32(return_frame + 8u, (uint32_t)emulator->x86.flags);
-    if (stack_switch) {
-        xxemul_x86_dos_put_u32(return_frame + 12u, (uint32_t)emulator->x86.gpr[XXEMUL_X86_RSP]);
-        xxemul_x86_dos_put_u32(return_frame + 16u, emulator->x86.segment[XXEMUL_X86_SS]);
+    if (width == 4u) {
+        if (hardware_fault) xxemul_x86_dos_put_u32(frame, error_code);
+        xxemul_x86_dos_put_u32(return_frame, resume_ip);
+        xxemul_x86_dos_put_u32(return_frame + 4u, emulator->x86.segment[XXEMUL_X86_CS]);
+        xxemul_x86_dos_put_u32(return_frame + 8u, (uint32_t)emulator->x86.flags);
+        if (stack_switch) {
+            xxemul_x86_dos_put_u32(return_frame + 12u, (uint32_t)emulator->x86.gpr[XXEMUL_X86_RSP]);
+            xxemul_x86_dos_put_u32(return_frame + 16u, emulator->x86.segment[XXEMUL_X86_SS]);
+        }
+    } else {
+        if (hardware_fault) xxemul_x86_dos_put_u16(frame, (uint16_t)error_code);
+        xxemul_x86_dos_put_u16(return_frame, (uint16_t)resume_ip);
+        xxemul_x86_dos_put_u16(return_frame + 2u, emulator->x86.segment[XXEMUL_X86_CS]);
+        xxemul_x86_dos_put_u16(return_frame + 4u, (uint16_t)emulator->x86.flags);
+        if (stack_switch) {
+            xxemul_x86_dos_put_u16(return_frame + 6u, (uint16_t)emulator->x86.gpr[XXEMUL_X86_RSP]);
+            xxemul_x86_dos_put_u16(return_frame + 8u, emulator->x86.segment[XXEMUL_X86_SS]);
+        }
     }
     status = xxemul_x86_dos_preflight_write(emulator, frame_address, frame_size);
     if (status != XXEMUL_STATUS_OK) return status;
@@ -1222,6 +1278,25 @@ static xxemul_status xxemul_x86_dos_fault_interrupt(xxemul *emulator, uint8_t ve
         if (vector_offset == 0u && vector_segment == 0u) {
             return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         }
+        /* Check the whole real-mode frame before committing any push. A
+         * later word can cross the SS limit even when the first is valid.
+         * Probe physical backing without manufacturing guest data reads. */
+        {
+            uint64_t mask = xxemul_x86_stack_mask(emulator);
+            unsigned index;
+            for (index = 1u; index <= 3u; ++index) {
+                uint64_t offset = (emulator->x86.gpr[XXEMUL_X86_RSP] - index * 2u) & mask;
+                uint64_t address;
+                uint8_t probe;
+                unsigned byte;
+                status = xxemul_x86_dos_address(emulator, XXEMUL_X86_SS, offset, 2u, &address);
+                if (status != XXEMUL_STATUS_OK) return status;
+                for (byte = 0u; byte < 2u; ++byte) {
+                    status = xxemul_read_memory(emulator, xxemul_x86_dos_a20(emulator, (uint32_t)(address + byte)), &probe, 1u);
+                    if (status != XXEMUL_STATUS_OK) return status;
+                }
+            }
+        }
         status = xxemul_x86_push_width(emulator, emulator->x86.flags, 2u);
         if (status != XXEMUL_STATUS_OK) return status;
         status = xxemul_x86_push_width(emulator, emulator->x86.segment[XXEMUL_X86_CS], 2u);
@@ -1234,6 +1309,52 @@ static xxemul_status xxemul_x86_dos_fault_interrupt(xxemul *emulator, uint8_t ve
         *target_ip = (uint16_t)vector_offset;
         return XXEMUL_STATUS_OK;
     }
+}
+
+xxemul_status xxemul_x86_dos_dispatch_irq0(xxemul *emulator, xxemul_step_info *info)
+{
+    uint8_t vector;
+    uint64_t offset, segment, target;
+    xxemul_status status;
+
+    if (!emulator || !emulator->dos_mode || emulator->arch != XXEMUL_ARCH_X86)
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    /* STI and a successful SS load inhibit interrupts until the following
+     * instruction has completed. This runs after each completed instruction. */
+    if (emulator->dos_irq0_shadow) {
+        --emulator->dos_irq0_shadow;
+        return XXEMUL_STATUS_OK;
+    }
+    if (!emulator->dos_irq0_pending || emulator->dos_irq0_in_service ||
+        (emulator->dos_pic_master_mask & 1u) || !(emulator->x86.flags & XXEMUL_X86_FLAG_IF))
+        return XXEMUL_STATUS_OK;
+    if ((emulator->dos_cr0 & 1u) != 0u) {
+        /* No protected hardware IRQ frame is manufactured. The DPMI host
+         * services only its unchanged default real-mode BIOS timer; a custom
+         * real handler keeps its request pending until real-mode delivery. */
+        if (xxemul_bios_timer_is_default(emulator)) {
+            xxemul_bios_service_timer(emulator);
+            emulator->dos_irq0_pending = 0u;
+        }
+        return XXEMUL_STATUS_OK;
+    }
+    vector = emulator->dos_pic_master_offset;
+    status = xxemul_load_integer(emulator, (uint64_t)vector * 4u, 2u, &offset);
+    if (status != XXEMUL_STATUS_OK) return status;
+    status = xxemul_load_integer(emulator, (uint64_t)vector * 4u + 2u, 2u, &segment);
+    if (status != XXEMUL_STATUS_OK) return status;
+    /* An absent vector has no BIOS handler to update the BDA clock. */
+    if (!offset && !segment) {
+        emulator->dos_irq0_pending = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    status = xxemul_x86_dos_fault_interrupt(emulator, vector, emulator->x86.ip, &target);
+    if (status != XXEMUL_STATUS_OK) return status;
+    emulator->x86.ip = target;
+    emulator->dos_irq0_pending = 0u;
+    emulator->dos_irq0_in_service = 1u;
+    if (info) info->next_address = (uint64_t)emulator->dos_segments[XXEMUL_X86_CS].base + target;
+    return XXEMUL_STATUS_OK;
 }
 
 static void xxemul_x86_multiply_u64(uint64_t left, uint64_t right, uint64_t *low, uint64_t *high)
@@ -1713,7 +1834,9 @@ static xxemul_status xxemul_x86_string(xxemul *emulator, const cdisasm_x86_instr
 
         if (emulator->dos_mode) {
             uint8_t source_segment = XXEMUL_X86_DS;
-            const cdisasm_x86_operand *source_operand = operation == 2 ? &instruction->opcode[0] : &instruction->opcode[1];
+            /* MOVS/LODS put the source memory in operand 1; CMPS puts it in
+             * operand 0. LODS operand 0 is AL/AX, and CMPS operand 1 is ES:DI. */
+            const cdisasm_x86_operand *source_operand = &instruction->opcode[operation == 3 ? 0 : 1];
             if (source_operand->segment_reg >= CDISASM_X86_REG_ES && source_operand->segment_reg <= CDISASM_X86_REG_GS) {
                 source_segment = (uint8_t)(source_operand->segment_reg - CDISASM_X86_REG_ES);
             }
@@ -2201,6 +2324,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
     xxemul_status status;
 
     emulator->dos_pending_page_fault_error = UINT32_MAX;
+    if (xxemul_dpmi_try_transition(emulator, info, &status)) return status;
     if (emulator->dos_mode && emulator->dos_dpmi_prepared && (emulator->dos_cr0 & 1u) == 0u && emulator->x86.segment[XXEMUL_X86_CS] == 0xf000u && current_ip == 0x0200u) {
         status = xxemul_dpmi_enter(emulator);
         if (status == XXEMUL_STATUS_OK && info != NULL) {
@@ -2213,6 +2337,25 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
     }
     status = xxemul_x86_decode_current_tracked(emulator, &instruction, &page_fault_error);
     if (status != XXEMUL_STATUS_OK) {
+        if (status == XXEMUL_STATUS_DECODE_ERROR && instruction.last_error_id == CDISASM_STATUS_INVALID_INSTRUCTION &&
+            emulator->dos_mode && (emulator->dos_cr0 & 1u) == 0u) {
+            uint64_t fault_address = emulator->dos_segments[XXEMUL_X86_CS].valid
+                                         ? (uint64_t)emulator->dos_segments[XXEMUL_X86_CS].base + current_ip
+                                         : xxemul_dos_physical(emulator, emulator->x86.segment[XXEMUL_X86_CS], (uint16_t)current_ip);
+            xxemul_status fault_status = xxemul_x86_dos_fault_interrupt(emulator, 6u, current_ip, &next_ip);
+            /* An absent guest handler keeps invalid decoding explicit. */
+            if (fault_status == XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION) return status;
+            if (fault_status != XXEMUL_STATUS_OK) return fault_status;
+            emulator->x86.ip = next_ip;
+            emulator->x86.flags |= UINT64_C(2);
+            if (info != NULL) {
+                info->address = fault_address;
+                info->next_address = (uint64_t)emulator->dos_segments[XXEMUL_X86_CS].base + next_ip;
+                info->size = 0u;
+                info->instruction_id = 0u;
+            }
+            return XXEMUL_STATUS_OK;
+        }
         if (status == XXEMUL_STATUS_ADDRESS_FAULT && page_fault_error != UINT32_MAX && emulator->dos_mode && (emulator->dos_cr0 & 1u) != 0u) {
             uint64_t fault_address = (uint64_t)emulator->dos_segments[XXEMUL_X86_CS].base + current_ip;
 
@@ -2231,6 +2374,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
     }
     emulator->dos_pending_page_fault_error = UINT32_MAX;
     next_ip = (current_ip + instruction.opcode_size) & xxemul_x86_address_mask(emulator);
+    if (emulator->dos_mode) emulator->dos_call_next_ip = next_ip;
     if (info != NULL) {
         info->address = emulator->dos_mode ? emulator->dos_segments[XXEMUL_X86_CS].valid
                                                  ? (uint64_t)emulator->dos_segments[XXEMUL_X86_CS].base + current_ip
@@ -2242,6 +2386,12 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
     }
 
     switch (instruction.name_id) {
+        case CDISASM_X86_NAME_UD0:
+        case CDISASM_X86_NAME_UD1:
+        case CDISASM_X86_NAME_UD2:
+            if (!emulator->dos_mode || (emulator->dos_cr0 & 1u) != 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            status = xxemul_x86_dos_fault_interrupt(emulator, 6u, current_ip, &next_ip);
+            break;
         case CDISASM_X86_NAME_IN:
         case CDISASM_X86_NAME_OUT: {
             uint16_t port;
@@ -2261,8 +2411,10 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                     in_result = emulator->dos_kbc_data_ready ? emulator->dos_kbc_data : 0u;
                     emulator->dos_kbc_data_ready = 0u;
                 } else if (port == 0x3dau || port == 0x3bau) {
-                    emulator->dos_vga_retrace ^= 0x08u;
-                    in_result = emulator->dos_vga_retrace;
+                    /* DOS text drivers poll display-disable bit zero as
+                     * well as vertical retrace bit three. */
+                    static const uint8_t status_cycle[4] = {0u, 1u, 0u, 9u};
+                    in_result = status_cycle[emulator->dos_vga_retrace++ & 3u];
                 } else if (port == 0x40u || port == 0x41u || port == 0x42u) {
                     in_result = ++emulator->dos_pit_counter;
                 } else {
@@ -2305,6 +2457,11 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                         uint8_t *icw4 = port == 0x20u ? &emulator->dos_pic_master_icw4 : &emulator->dos_pic_slave_icw4;
                         *stage = 1u;
                         *icw4 = value & 1u;
+                        if (port == 0x20u) emulator->dos_irq0_in_service = 0u;
+                    } else if (port == 0x20u && (value & 0x20u) != 0u &&
+                        ((value & 0x40u) == 0u || (value & 7u) == 0u)) {
+                        /* Non-specific EOI, or specific EOI for IRQ0. */
+                        emulator->dos_irq0_in_service = 0u;
                     }
                 } else if (port == 0x64u) {
                     if (value == 0xd0u) {
@@ -2462,10 +2619,22 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             }
             break;
         case CDISASM_X86_NAME_INTO:
-            /* Interrupt on Overflow: trigger INT 4 if OF set */
+            /* #OF is a trap: save the following IP, with no error word.
+             * Real-mode clients may install their own IVT4 handler. The
+             * frame helper also clears TF, preventing an extra #DB here.
+             * Keep the existing unhooked BIOS and protected-mode paths. */
             if (!emulator->dos_mode) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             if ((emulator->x86.flags & XXEMUL_X86_FLAG_OF) != 0u) {
-                status = xxemul_bios_interrupt(emulator, 4u);
+                uint64_t offset=0u, segment=0u;
+                if ((emulator->dos_cr0 & 1u) == 0u) {
+                    status=xxemul_load_integer(emulator,4u*4u,2u,&offset);
+                    if (status != XXEMUL_STATUS_OK) break;
+                    status=xxemul_load_integer(emulator,4u*4u+2u,2u,&segment);
+                    if (status != XXEMUL_STATUS_OK) break;
+                }
+                status=(offset != 0u || segment != 0u)
+                           ? xxemul_x86_dos_fault_interrupt(emulator,4u,next_ip,&next_ip)
+                           : xxemul_bios_interrupt(emulator,4u);
             } else {
                 status = XXEMUL_STATUS_OK;
             }
@@ -3220,6 +3389,71 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             }
             status = XXEMUL_STATUS_OK;
             break;
+        case CDISASM_X86_NAME_FIADD:
+        case CDISASM_X86_NAME_FIMUL:
+        case CDISASM_X86_NAME_FISUB:
+        case CDISASM_X86_NAME_FISUBR:
+        case CDISASM_X86_NAME_FIDIV:
+        case CDISASM_X86_NAME_FIDIVR:
+        case CDISASM_X86_NAME_FICOM:
+        case CDISASM_X86_NAME_FICOMP: {
+            double st0, operand, value = 0.0;
+            uint16_t exceptions = 0u;
+            int compare = instruction.name_id == CDISASM_X86_NAME_FICOM || instruction.name_id == CDISASM_X86_NAME_FICOMP;
+            int empty = emulator->x87_depth == 0u;
+            if (instruction.operand_count != 1u || instruction.opcode[0].type != CDISASM_OPERAND_MEMORY ||
+                (instruction.opcode[0].size != 2u && instruction.opcode[0].size != 4u)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            page_fault_error = UINT32_MAX;
+            status = xxemul_x86_read_operand_tracked(emulator, &instruction, &instruction.opcode[0], next_ip, &right, &page_fault_error);
+            if (status != XXEMUL_STATUS_OK) {
+                status = xxemul_x86_dos_page_fault(emulator, status, page_fault_error, current_ip, &next_ip);
+                break;
+            }
+            operand = instruction.opcode[0].size == 2u ? (double)(int16_t)right : (double)(int32_t)right;
+            st0 = empty ? -NAN : emulator->x87_stack[0];
+            if (empty) exceptions = 0x0041u; /* IE and stack fault. */
+            if (compare) {
+                if (isnan(st0)) exceptions |= 1u;
+            } else switch (instruction.name_id) {
+                case CDISASM_X86_NAME_FIADD: value = st0 + operand; break;
+                case CDISASM_X86_NAME_FIMUL:
+                    if (isinf(st0) && operand == 0.0) { exceptions |= 1u; value = -NAN; }
+                    else value = st0 * operand;
+                    break;
+                case CDISASM_X86_NAME_FISUB: value = st0 - operand; break;
+                case CDISASM_X86_NAME_FISUBR: value = operand - st0; break;
+                default: {
+                    double numerator = instruction.name_id == CDISASM_X86_NAME_FIDIV ? st0 : operand;
+                    double denominator = instruction.name_id == CDISASM_X86_NAME_FIDIV ? operand : st0;
+                    if (denominator == 0.0 && numerator == 0.0) { exceptions |= 1u; value = -NAN; }
+                    else if (denominator == 0.0 && isfinite(numerator) && numerator != 0.0) {
+                        exceptions |= 4u;
+                        value = copysign(INFINITY, signbit(numerator) != signbit(denominator) ? -1.0 : 1.0);
+                    } else value = numerator / denominator;
+                    break;
+                }
+            }
+            emulator->x87_status &= (uint16_t)~0x0200u; /* C1: no modeled upward rounding. */
+            emulator->x87_status |= exceptions;
+            if ((exceptions & (uint16_t)~emulator->x87_control & 0x003fu) != 0u) {
+                emulator->x87_status |= 0x8080u; /* Pending unmasked exception; preserve ST(0)/TOP. */
+                status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                break;
+            }
+            if (compare) {
+                emulator->x87_status &= UINT16_C(0xb8ff);
+                if (isnan(st0)) emulator->x87_status |= 0x4500u;
+                else if (st0 < operand) emulator->x87_status |= 0x0100u;
+                else if (st0 == operand) emulator->x87_status |= 0x4000u;
+                status = instruction.name_id == CDISASM_X86_NAME_FICOMP ? xxemul_x87_pop(emulator) : XXEMUL_STATUS_OK;
+            } else {
+                if (empty) emulator->x87_depth = 1u;
+                emulator->x87_stack[0] = value;
+                emulator->x87_is_int[0] = 0u;
+                status = XXEMUL_STATUS_OK;
+            }
+            break;
+        }
         case CDISASM_X86_NAME_FADD:
         case CDISASM_X86_NAME_FADDP:
         case CDISASM_X86_NAME_FMUL:
@@ -3377,6 +3611,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             else if (status != XXEMUL_STATUS_OK) status = xxemul_x86_dos_page_fault(emulator, status, page_fault_error, current_ip, &next_ip);
             break;
         case CDISASM_X86_NAME_NOP:
+        case CDISASM_X86_NAME_FNOP:
         case CDISASM_X86_NAME_ENDBR32:
         case CDISASM_X86_NAME_ENDBR64:
         case CDISASM_X86_NAME_PAUSE:
@@ -3885,6 +4120,8 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             break;
         case CDISASM_X86_NAME_STI:
             emulator->x86.flags |= XXEMUL_X86_FLAG_IF;
+            if (emulator->dos_mode && (emulator->dos_cr0 & 1u) == 0u)
+                emulator->dos_irq0_shadow = 1u;
             status = XXEMUL_STATUS_OK;
             break;
         case CDISASM_X86_NAME_CLD:
@@ -3928,7 +4165,13 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             page_fault_error = UINT32_MAX;
             status = xxemul_x86_pop_width_tracked(emulator, &right, size, &page_fault_error);
             if (status == XXEMUL_STATUS_OK) {
-                emulator->x86.flags = (right & xxemul_mask_for_size(size)) | UINT64_C(2);
+                if (emulator->dos_mode && !(emulator->dos_cr0 & 1u)) {
+                    uint64_t mask = size == 2u ? UINT64_C(0x7fd5) : UINT64_C(0x247fd5);
+                    /* Real-address 386+ POPF: reserved bits stay clear;
+                     * 16-bit POPF preserves the upper EFLAGS half. RF clears. */
+                    emulator->x86.flags = ((emulator->x86.flags & ~mask) | (right & mask) | UINT64_C(2)) &
+                        ~UINT64_C(0x18028);
+                } else emulator->x86.flags = (right & xxemul_mask_for_size(size)) | UINT64_C(2);
             } else {
                 status = xxemul_x86_dos_page_fault(emulator, status, page_fault_error, current_ip, &next_ip);
             }
@@ -3991,13 +4234,19 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             }
             break;
+        case CDISASM_X86_NAME_INT3:
         case CDISASM_X86_NAME_INT:
-            if (instruction.operand_count < 1u) {
-                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-            }
-            status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[0], next_ip, &right);
-            if (status != XXEMUL_STATUS_OK) {
-                return status;
+            if (instruction.name_id == CDISASM_X86_NAME_INT3) {
+                if (!emulator->dos_mode) {
+                    status = emulator->debug_traps ? XXEMUL_STATUS_BREAKPOINT : XXEMUL_STATUS_HALTED;
+                    if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
+                    break;
+                }
+                right = 3u;
+            } else {
+                if (instruction.operand_count < 1u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[0], next_ip, &right);
+                if (status != XXEMUL_STATUS_OK) return status;
             }
             if (right == 3u && emulator->debug_traps && !emulator->dos_mode) {
                 status = XXEMUL_STATUS_BREAKPOINT;
@@ -4007,16 +4256,8 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                If the IVT entry is zero (no handler installed), treat as NOP. */
             if (emulator->dos_mode && (emulator->dos_cr0 & 1u) != 0u) {
                 if (right > 0xffu) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-                if (emulator->dos_dpmi_next_selector != 0u && right == 0x31u) {
-                    status = xxemul_dpmi_interrupt(emulator);
-                    break;
-                }
-                if (emulator->dos_dpmi_next_selector != 0u && right == 0x21u) {
-                    status = xxemul_msdos_interrupt(emulator, 0x21u);
-                    break;
-                }
-                if (emulator->dos_dpmi_next_selector != 0u && right == 0x1au) {
-                    status = xxemul_bios_interrupt(emulator, 0x1au);
+                if (emulator->dos_dpmi_next_selector != 0u && xxemul_x86_dpmi_default_vector(emulator, (uint8_t)right)) {
+                    status = xxemul_dpmi_reflect_interrupt(emulator, (uint8_t)right);
                     break;
                 }
                 status = xxemul_x86_dos_interrupt_gate(emulator, (uint8_t)right, (uint32_t)next_ip, 0, 0u, &next_ip);
@@ -4067,6 +4308,13 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             if ((emulator->dos_cr0 & 1u) != 0u) {
                 size = instruction.name_id == CDISASM_X86_NAME_IRETD ? 4u : 2u;
                 if (size != 2u && size != 4u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                if (emulator->dos_dpmi_next_selector && emulator->x86.segment[XXEMUL_X86_CS] == XXEMUL_DPMI_HOST_SELECTOR &&
+                    current_ip >= XXEMUL_DPMI_HOST_VECTOR_BASE && current_ip < XXEMUL_DPMI_HOST_VECTOR_BASE + 256u * 4u &&
+                    (current_ip - XXEMUL_DPMI_HOST_VECTOR_BASE) % 4u == 0u) {
+                    status = xxemul_x86_dpmi_host_thunk(emulator, (uint8_t)((current_ip - XXEMUL_DPMI_HOST_VECTOR_BASE) / 4u), size);
+                    if (status != XXEMUL_STATUS_OK) break;
+                    if (emulator->dos_context_transfer) break;
+                }
                 status = xxemul_x86_dos_protected_iret(emulator, size, &next_ip);
                 break;
             }
@@ -4075,6 +4323,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 (current_ip == XXEMUL_DOS_INT21_THUNK_OFFSET || current_ip == XXEMUL_DOS_INT10_THUNK_OFFSET)) {
                 status = xxemul_x86_dos_host_thunk(emulator, current_ip == XXEMUL_DOS_INT21_THUNK_OFFSET ? 0x21u : 0x10u);
                 if (status != XXEMUL_STATUS_OK) break;
+                if (emulator->dos_context_transfer) break;
             }
             status = xxemul_x86_pop_width(emulator, &target, 2u);
             if (status != XXEMUL_STATUS_OK) return status;
@@ -4248,12 +4497,6 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             right = (emulator->x86.gpr[XXEMUL_X86_RAX] & (UINT64_C(1) << (size * 8u - 1u))) != 0u ? xxemul_mask_for_size(size) : 0u;
             status = xxemul_x86_write_register(emulator, size == 2u ? CDISASM_X86_REG_DX : size == 4u ? CDISASM_X86_REG_EDX : CDISASM_X86_REG_RDX, right);
             break;
-        case CDISASM_X86_NAME_INT3:
-            if (emulator->debug_traps) {
-                status = XXEMUL_STATUS_BREAKPOINT;
-                break;
-            }
-            /* fall through */
         case CDISASM_X86_NAME_HLT:
             emulator->halted = 1;
             status = XXEMUL_STATUS_HALTED;
@@ -4581,6 +4824,10 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
     }
 
     if (status == XXEMUL_STATUS_OK || status == XXEMUL_STATUS_HALTED || status == XXEMUL_STATUS_BREAKPOINT) {
+        if (emulator->dos_context_transfer) {
+            next_ip = emulator->x86.ip;
+            emulator->dos_context_transfer = 0u;
+        }
         emulator->x86.ip = next_ip;
         emulator->x86.flags |= UINT64_C(2);
         if (info != NULL) {

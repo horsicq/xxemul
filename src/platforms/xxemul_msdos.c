@@ -5,6 +5,7 @@
 #include "xxemul_internal.h"
 #include "xxemul_dos_files.h"
 
+#include <string.h>
 #include <time.h>
 
 #define XXEMUL_DOS_CF UINT64_C(1)
@@ -13,6 +14,103 @@
 #define XXEMUL_DOS_TRUENAME_SIZE 128u
 
 static void xxemul_dos_set_ax(xxemul *emulator, uint16_t value);
+
+/* MS-DOS 4 FCB.ASM MakeFcb/CharType: blanks are always skipped;
+ * option bit zero additionally skips one nonblank separator. */
+static int xxemul_dos_fcb_separator(uint8_t c)
+{
+    return c == ':' || c == '<' || c == '|' || c == '>' ||
+        c == '+' || c == '=' || c == ';' || c == ',';
+}
+
+static int xxemul_dos_fcb_terminator(uint8_t c)
+{
+    return c <= ' ' || c == '.' || c == '"' || c == '/' ||
+        c == '\\' || c == '[' || c == ']' || xxemul_dos_fcb_separator(c);
+}
+
+static xxemul_status xxemul_dos_fcb_peek(xxemul *emulator, uint16_t si, size_t consumed, uint8_t *c)
+{
+    if (consumed >= 0x10000u) return XXEMUL_STATUS_ADDRESS_FAULT;
+    return xxemul_read_memory(emulator, xxemul_dos_physical(emulator,
+        emulator->x86.segment[XXEMUL_X86_DS], si), c, 1u);
+}
+
+static xxemul_status xxemul_dos_parse_fcb(xxemul *emulator)
+{
+    uint8_t fcb[16], c, options = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX], result = 0;
+    uint16_t si = (uint16_t)emulator->x86.gpr[XXEMUL_X86_RSI];
+    uint16_t di = (uint16_t)emulator->x86.gpr[XXEMUL_X86_RDI];
+    uint16_t es = emulator->x86.segment[XXEMUL_X86_ES];
+    size_t consumed = 0, i;
+    unsigned field;
+    xxemul_status status;
+
+    for (i = 0; i < sizeof(fcb); ++i) {
+        status = xxemul_read_memory(emulator, xxemul_dos_physical(emulator, es, (uint16_t)(di + i)), fcb + i, 1u);
+        if (status != XXEMUL_STATUS_OK) return status;
+    }
+    if (!(options & 2u)) fcb[0] = 0;
+    if (!(options & 4u)) memset(fcb + 1u, ' ', 8u);
+    if (!(options & 8u)) memset(fcb + 9u, ' ', 3u);
+    memset(fcb + 12u, 0, 4u);
+    /* Skip whitespace, optionally one separator, then whitespace again. */
+    for (field = 0; field < 2u; ++field) {
+        for (;;) {
+            status = xxemul_dos_fcb_peek(emulator, si, consumed, &c);
+            if (status != XXEMUL_STATUS_OK) return status;
+            if (c != ' ' && c != '\t') break;
+            ++si; ++consumed;
+        }
+        if (field || !(options & 1u) || !xxemul_dos_fcb_separator(c)) break;
+        ++si; ++consumed;
+    }
+    /* A drive prefix is consumed even when its identifier is invalid. */
+    if (!xxemul_dos_fcb_terminator(c)) {
+        uint8_t next;
+        status = xxemul_dos_fcb_peek(emulator, (uint16_t)(si + 1u), consumed + 1u, &next);
+        if (status != XXEMUL_STATUS_OK) return status;
+        if (next == ':') {
+            if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
+            fcb[0] = (uint8_t)(c - '@');
+            if (c < 'A' || c > 'Z') result = 0xffu;
+            si += 2u; consumed += 2u;
+        }
+    }
+    for (field = 0; field < 2u; ++field) {
+        size_t filled = 0, width = field ? 3u : 8u, offset = field ? 9u : 1u;
+        int present = 0;
+        for (;;) {
+            status = xxemul_dos_fcb_peek(emulator, si, consumed, &c);
+            if (status != XXEMUL_STATUS_OK) return status;
+            if (xxemul_dos_fcb_terminator(c)) break;
+            present = 1;
+            ++si; ++consumed;
+            if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
+            if (filled >= width) continue; /* DOS consumes overlong fields. */
+            if (c == '*') {
+                memset(fcb + offset + filled, '?', width - filled);
+                filled = width;
+                if (result != 0xffu) result = 1u;
+            } else {
+                fcb[offset + filled++] = c;
+                if (c == '?' && result != 0xffu) result = 1u;
+            }
+        }
+        /* A present field replaces its preserved default in full. The dot
+         * explicitly replaces even an empty extension with blanks. */
+        if (present || field) memset(fcb + offset + filled, ' ', width - filled);
+        if (field || c != '.') break;
+        ++si; ++consumed;
+    }
+    for (i = 0; i < sizeof(fcb); ++i) {
+        status = xxemul_write_memory(emulator, xxemul_dos_physical(emulator, es, (uint16_t)(di + i)), fcb + i, 1u);
+        if (status != XXEMUL_STATUS_OK) return status;
+    }
+    emulator->x86.gpr[XXEMUL_X86_RSI] = (emulator->x86.gpr[XXEMUL_X86_RSI] & ~UINT64_C(0xffff)) | si;
+    emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | result;
+    return XXEMUL_STATUS_OK;
+}
 
 static int xxemul_dos_local_time(struct tm *result)
 {
@@ -74,7 +172,7 @@ static void xxemul_dos_result(xxemul *emulator, uint16_t value, int error)
 static xxemul_status xxemul_dos_memory_allocate(xxemul *emulator)
 {
     uint16_t requested = (uint16_t)emulator->x86.gpr[XXEMUL_X86_RBX];
-    uint16_t segment = XXEMUL_DOS_MCB_START;
+    uint16_t segment = xxemul_dos_files_mcb_head(emulator);
     uint16_t largest = 0u;
     uint16_t chosen_segment = 0u;
     uint16_t chosen_size = 0u;
@@ -108,7 +206,9 @@ static xxemul_status xxemul_dos_memory_allocate(xxemul *emulator)
             if (size > largest) {
                 largest = size;
             }
-            if (requested != 0u && size >= requested) {
+            /* DOS permits BX=0: the allocation still reserves its MCB.
+             * DPMI clients use this when the host needs no private data. */
+            if (size >= requested) {
                 if (strategy == 0u) {
                     chosen_segment = segment;
                     chosen_size = size;
@@ -161,7 +261,7 @@ static xxemul_status xxemul_dos_memory_allocate(xxemul *emulator)
 
 static uint8_t *xxemul_dos_owned_mcb(xxemul *emulator, uint16_t block)
 {
-    uint16_t segment = XXEMUL_DOS_MCB_START;
+    uint16_t segment = xxemul_dos_files_mcb_head(emulator);
     uint16_t next;
 
     if (block <= XXEMUL_DOS_MCB_START) {
@@ -435,6 +535,7 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
     xxemul_status status;
 
     if (vector == 0x20u) {
+        if (xxemul_dos_files_return_to_parent(emulator, 0u, &status)) return status;
         emulator->exit_code = 0u;
         emulator->halted = 1;
         return XXEMUL_STATUS_HALTED;
@@ -449,10 +550,12 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
     function = xxemul_dos_ah(emulator);
     switch (function) {
         case 0x00u:
+            if (xxemul_dos_files_return_to_parent(emulator, 0u, &status)) return status;
             emulator->exit_code = 0u;
             emulator->halted = 1;
             return XXEMUL_STATUS_HALTED;
         case 0x4cu:
+            if (xxemul_dos_files_return_to_parent(emulator, (uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX], &status)) return status;
             emulator->exit_code = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX];
             emulator->halted = 1;
             return XXEMUL_STATUS_HALTED;
@@ -491,22 +594,44 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
             }
             break;
         case 0x0bu: emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & 0xff00u) | (emulator->key_count == 0u ? 0x00u : 0xffu); break;
+        case 0x0cu: {
+            uint8_t input_function = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX];
+            status = xxemul_dos_flush_input_begin(emulator, input_function);
+            if (status != XXEMUL_STATUS_OK) return status;
+            if (input_function == 1u || input_function == 6u || input_function == 7u || input_function == 8u || input_function == 0x0au) {
+                emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff00)) | ((uint16_t)input_function << 8u);
+                status = xxemul_msdos_interrupt(emulator, 0x21u);
+                if (status == XXEMUL_STATUS_INPUT_REQUIRED)
+                    emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xffff)) | 0x0c00u | input_function;
+                xxemul_dos_flush_input_end(emulator, status);
+                return status;
+            }
+            xxemul_dos_flush_input_end(emulator, XXEMUL_STATUS_OK);
+            break;
+        }
         case 0x30u: xxemul_dos_set_ax(emulator, 0x0005u); break;
-        case 0x2au:
-        case 0x2cu: {
+        case 0x2au: {
             struct tm local;
             if (!xxemul_dos_local_time(&local)) {
                 xxemul_dos_result(emulator, 1u, 1);
                 return XXEMUL_STATUS_OK;
             }
-            if (function == 0x2au) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = (uint8_t)local.tm_wday;
-                emulator->x86.gpr[XXEMUL_X86_RCX] = (uint16_t)(local.tm_year + 1900);
-                emulator->x86.gpr[XXEMUL_X86_RDX] = ((uint16_t)(local.tm_mon + 1) << 8u) | (uint8_t)local.tm_mday;
-            } else {
-                emulator->x86.gpr[XXEMUL_X86_RCX] = ((uint16_t)local.tm_hour << 8u) | (uint8_t)local.tm_min;
-                emulator->x86.gpr[XXEMUL_X86_RDX] = (uint16_t)local.tm_sec << 8u;
-            }
+            emulator->x86.gpr[XXEMUL_X86_RAX] = (uint8_t)local.tm_wday;
+            emulator->x86.gpr[XXEMUL_X86_RCX] = (uint16_t)(local.tm_year + 1900);
+            emulator->x86.gpr[XXEMUL_X86_RDX] = ((uint16_t)(local.tm_mon + 1) << 8u) | (uint8_t)local.tm_mday;
+            break;
+        }
+        case 0x2cu: {
+            const uint8_t *clock = emulator->region_data + 0x46cu;
+            uint32_t ticks = (uint32_t)clock[0] | ((uint32_t)clock[1] << 8u) |
+                ((uint32_t)clock[2] << 16u) | ((uint32_t)clock[3] << 24u);
+            /* Share INT 1Ah/BDA virtual time, including hundredths used by
+             * DOS polling loops. A host-time second with DL always zero
+             * leaves those loops unable to make progress. */
+            uint32_t hundredths = (uint32_t)(((uint64_t)(ticks % 0x1800b0u) * UINT64_C(8640000)) / 0x1800b0u);
+            uint32_t seconds = hundredths / 100u;
+            emulator->x86.gpr[XXEMUL_X86_RCX] = ((seconds / 3600u) << 8u) | ((seconds / 60u) % 60u);
+            emulator->x86.gpr[XXEMUL_X86_RDX] = ((seconds % 60u) << 8u) | (hundredths % 100u);
             break;
         }
         case 0x19u: emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | 2u; break;
@@ -522,6 +647,7 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
             xxemul_dos_write_word(entry + 2u, emulator->x86.segment[XXEMUL_X86_DS]);
             break;
         }
+        case 0x29u: return xxemul_dos_parse_fcb(emulator);
         case 0x2fu:
             emulator->x86.segment[XXEMUL_X86_ES] = emulator->dos_dta_segment;
             emulator->x86.gpr[XXEMUL_X86_RBX] = emulator->dos_dta_offset;
@@ -592,7 +718,10 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
         case 0x42u:
         case 0x43u:
         case 0x4eu:
+        case 0x4fu:
         case 0x57u:
+        case 0x5au:
+        case 0x5bu:
         case 0x6cu: return xxemul_dos_files_interrupt(emulator, function);
         case 0x40u: return (uint16_t)emulator->x86.gpr[XXEMUL_X86_RBX] <= 2u ? xxemul_dos_write_handle(emulator) : xxemul_dos_files_interrupt(emulator, function);
         case 0x50u: emulator->psp_segment = (uint16_t)emulator->x86.gpr[XXEMUL_X86_RBX]; break;
@@ -610,20 +739,13 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
         case 0x51u:
         case 0x62u: emulator->x86.gpr[XXEMUL_X86_RBX] = emulator->psp_segment; break;
         case 0x0au: {
-            /* Buffered keyboard input - read into DS:DX buffer */
-            uint32_t buf_addr = xxemul_dos_linear(emulator->x86.segment[XXEMUL_X86_DS], (uint16_t)emulator->x86.gpr[XXEMUL_X86_RDX]);
-            uint64_t val = 0;
-            uint8_t max_chars;
-            if (xxemul_load_integer(emulator, buf_addr, 1u, &val) != XXEMUL_STATUS_OK || (max_chars = (uint8_t)val) == 0u) {
-                xxemul_dos_result(emulator, 1u, 1);
-                return XXEMUL_STATUS_OK;
-            }
-            /* Return empty line (just CR) */
-            xxemul_write_memory(emulator, buf_addr + 1u, (const uint8_t *)"\x00\x0d", 2u);
+            status = xxemul_dos_buffered_input(emulator);
+            if (status != XXEMUL_STATUS_OK) return status;
             break;
         }
         case 0x31u:
             /* Terminate and stay resident */
+            if (xxemul_dos_files_child_active(emulator)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             emulator->exit_code = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX];
             emulator->halted = 1;
             return XXEMUL_STATUS_HALTED;
@@ -633,9 +755,10 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
             return XXEMUL_STATUS_OK;
         case 0x4du:
             /* Get return code of subprogram */
-            xxemul_dos_set_ax(emulator, 0u);
+            xxemul_dos_set_ax(emulator, xxemul_dos_files_child_status(emulator));
             emulator->x86.flags &= ~XXEMUL_DOS_CF;
             return XXEMUL_STATUS_OK;
+        case 0x4bu: return xxemul_dos_files_exec(emulator);
         case 0x54u:
             /* Get verify flag */
             emulator->x86.gpr[XXEMUL_X86_RAX] &= ~UINT64_C(0xff);
