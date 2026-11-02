@@ -39,6 +39,22 @@ test assemblies, host callbacks and runtime limitations. The application uses
 the focused xxfclib `dotnet_emul` profile; general native emulator consumers
 can continue using the default full xxfclib profile.
 
+`xxemul/xxemul_dotnet_bcl.h` adds a bounded native CLR/BCL service host:
+UTF-8 Console output, UTF string operations, resources, byte streams, Deflate/GZip,
+SHA-256, assembly loading and entry-point reflection. Structured managed
+catch/finally/fault unwinding and module initialization execute in the CIL VM.
+Child assembly VMs share the instruction budget; unsupported services fail with
+diagnostics. SharpZipLib stream compatibility is an explicit host flag.
+
+When this backend is enabled, the x86 Windows runtime resolves
+`mscoree.dll!_CorExeMain` by executing actual managed CIL with this host. Managed
+return values become process exit codes through normal DLL/TLS shutdown. This
+bridge reopens the host program path, so it requires a matching assembly file;
+edits to the native mapped CIL are ignored. It runs one bounded managed
+invocation, without per-CIL native debugger stepping. `_CorDllMain`, exception
+filters, unrestricted host file access and a full CLR/JIT are not implemented.
+See the XDotNetEmul README for public API budgets and frontend options.
+
 ## Current scope
 
 - x86 16-bit, 32-bit, and 64-bit decode modes

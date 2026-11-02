@@ -173,9 +173,11 @@ if(XXEMUL_ENABLE_DOTNET)
     target_sources(xxemul PRIVATE
         include/xxemul/xxemul_dotnet.h
         include/xxemul/xxemul_dotnet_runtime.h
+        include/xxemul/xxemul_dotnet_bcl.h
         src/xxemul_dotnet_internal.h
         src/formats/xxemul_dotnet.c
-        src/xxemul_dotnet_runtime.c)
+        src/xxemul_dotnet_runtime.c
+        src/xxemul_dotnet_bcl.c)
     target_link_libraries(xxemul PRIVATE xxbyte::xxbyte)
     if(UNIX)
         target_link_libraries(xxemul PRIVATE m)
@@ -627,6 +629,11 @@ endif()
 
 # Local-only Radare2 corpus. Release source packages may omit private_tests,
 # and embedded consumers should opt in explicitly from their integration tree.
+if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND XXEMUL_ENABLE_DOTNET)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/xxemul_dotnet_tests.cmake")
+    xxemul_add_dotnet_tests()
+endif()
+
 if(PROJECT_IS_TOP_LEVEL AND BUILD_TESTING AND
    IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/private_tests")
     add_subdirectory(private_tests)

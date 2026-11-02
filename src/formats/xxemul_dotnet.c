@@ -499,6 +499,40 @@ static const char *dn_primitive_name(uint8_t kind)
     }
 }
 
+/* These BCL enums and runtime handles have defined scalar representations.
+ * Do not turn arbitrary value types into executable scalar signatures. */
+static uint8_t dn_framework_scalar(dn_loader *loader, uint32_t token, const char *name)
+{
+    static const char *const enums[] = {"System.IO.SeekOrigin", "System.IO.Compression.CompressionMode", "System.StringComparison",
+        "System.Reflection.BindingFlags", "System.MidpointRounding", "System.StringSplitOptions", "System.TypeCode"};
+    static const char *const handles[] = {"System.RuntimeTypeHandle", "System.RuntimeFieldHandle", "System.RuntimeMethodHandle"};
+    xxemul_dotnet_program *program = loader->program;
+    uint32_t scope = token;
+    size_t depth, i;
+    const uint8_t *row;
+    char *assembly;
+    int trusted;
+    if ((token >> 24) != 1) return 0;
+    for (depth = 0; depth <= DN_DEPTH_LIMIT && (scope >> 24) == 1; ++depth) {
+        uint32_t rid = scope & 0xffffff;
+        if (!rid || rid > program->type_ref_count) return 0;
+        scope = program->types[program->type_def_count + rid - 1].resolution_scope;
+    }
+    if ((scope >> 24) != 35) return 0;
+    row = dn_row(loader, 35, scope & 0xffffff);
+    if (!row) return 0;
+    row += 12 + loader->cli->nBlobIndexSize;
+    assembly = dn_heap_string(loader, dn_index(&row, loader->cli->nStringIndexSize));
+    if (!assembly) return 0;
+    trusted = !strcmp(assembly, "mscorlib") || !strcmp(assembly, "System") || !strcmp(assembly, "System.Private.CoreLib") || !strcmp(assembly, "System.Runtime") ||
+        !strcmp(assembly, "netstandard") || !strcmp(assembly, "System.IO") || !strcmp(assembly, "System.IO.Compression") || !strcmp(assembly, "System.Reflection");
+    free(assembly);
+    if (!trusted) return 0;
+    for (i = 0; i < sizeof(enums) / sizeof(enums[0]); ++i) if (!strcmp(name, enums[i])) return 8;
+    for (i = 0; i < sizeof(handles) / sizeof(handles[0]); ++i) if (!strcmp(name, handles[i])) return 24;
+    return 0;
+}
+
 static int dn_parse_type(dn_signature_reader *reader, xxemul_dotnet_type *type, unsigned depth, int allow_void)
 {
     dn_loader *loader = reader->loader;
@@ -523,6 +557,11 @@ static int dn_parse_type(dn_signature_reader *reader, xxemul_dotnet_type *type, 
         if (!name) return 0;
         type->token = token;
         type->supported = kind == 0x12;
+        if (kind == 0x11) {
+            uint8_t scalar = dn_framework_scalar(loader, token, name);
+            if (scalar) { type->element_type = scalar; type->supported = 1; }
+            if (loader->status != XXEMUL_STATUS_OK) return 0;
+        }
         type->name = dn_copy(loader, name, strlen(name));
     } else if (kind == 0x0f || kind == 0x10 || kind == 0x1d || kind == 0x45 || kind == 0x1f || kind == 0x20) {
         const char *suffix = kind == 0x0f ? "*" : kind == 0x10 ? "&" : kind == 0x1d ? "[]" : "";
@@ -853,6 +892,169 @@ static int dn_load_fields(dn_loader *loader)
         reader.position = 1;
         reader.budget = DN_SIGNATURE_LIMIT;
         if (!dn_parse_type(&reader, &field->type, 0, 0) || reader.position != size) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+        field->info.token = field->token; field->info.owner_token = field->owner_token; field->info.flags = field->flags;
+        field->info.is_defined = 1; field->info.type_name = program->types[owner].name;
+        field->info.name = field->name; field->info.signature = field->type.name;
+    }
+    return 1;
+}
+
+static size_t dn_field_scalar_size(const xxemul_dotnet_program *program, const xxemul_dotnet_type *type)
+{
+    switch (type->element_type) {
+        case 2: case 4: case 5: return 1;
+        case 3: case 6: case 7: return 2;
+        case 8: case 9: case 12: return 4;
+        case 10: case 11: case 13: return 8;
+        case 24: case 25: return program->pointer_size;
+        default: return 0;
+    }
+}
+static int dn_load_field_data(dn_loader *loader)
+{
+    xxemul_dotnet_program *program = loader->program;
+    const xx_dotnet_inspect_cli *cli = loader->cli;
+    uint32_t *sizes = NULL;
+    uint8_t *seen = NULL;
+    uint32_t rid;
+    int okay = 0;
+    if (!cli->pRows[29]) return 1;
+    sizes = (uint32_t *)calloc(program->type_def_count, sizeof(*sizes));
+    seen = (uint8_t *)calloc(program->field_count, 1);
+    if (!sizes || !seen) { dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY); goto done; }
+    for (rid = 1; rid <= cli->pRows[15]; ++rid) {
+        const uint8_t *row = dn_row(loader, 15, rid);
+        uint32_t size, owner;
+        if (!row) goto done;
+        size = xxemul_dotnet_u32(row + 2); row += 6;
+        owner = dn_index(&row, cli->pIndexSize[2]);
+        if (!owner || owner > program->type_def_count || size > DN_IMAGE_LIMIT || sizes[owner - 1]) {
+            dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done;
+        }
+        sizes[owner - 1] = size;
+    }
+    for (rid = 1; rid <= cli->pRows[29]; ++rid) {
+        const uint8_t *row = dn_row(loader, 29, rid);
+        xxemul_dotnet_field *field;
+        uint32_t field_rid, rva;
+        size_t size, offset;
+        if (!row) goto done;
+        rva = xxemul_dotnet_u32(row); row += 4;
+        field_rid = dn_index(&row, cli->pIndexSize[4]);
+        if (!field_rid || field_rid > program->field_count || seen[field_rid - 1]) { dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done; }
+        seen[field_rid - 1] = 1;
+        field = program->fields + field_rid - 1;
+        if ((field->flags & 0x110u) != 0x110u || !rva) { dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done; }
+        field->initial_data_rva = rva;
+        size = dn_field_scalar_size(program, &field->type);
+        if (!size && field->type.element_type == 0x11 && (field->type.token >> 24) == 2 && (field->type.token & 0xffffff))
+            size = sizes[(field->type.token & 0xffffff) - 1];
+        if (!dn_rva(loader, rva, size ? size : 1, &offset, NULL)) goto done;
+        if (size) { field->initial_data = program->data + offset; field->initial_data_size = size; }
+    }
+    okay = 1;
+done:
+    free(sizes); free(seen); return okay;
+}
+
+static int dn_load_assembly_info(dn_loader *loader, unsigned table, uint32_t rid, xxemul_dotnet_assembly_info *identity)
+{
+    const uint8_t *row = dn_row(loader, table, rid), *key;
+    size_t key_size;
+    uint32_t key_index, name_index, culture_index;
+    if (!row || (table != 32 && table != 35)) return 0;
+    identity->token = DN_TOKEN(table, rid);
+    if (table == 32) { identity->hash_algorithm = xxemul_dotnet_u32(row); row += 4; }
+    identity->major = xxemul_dotnet_u16(row); identity->minor = xxemul_dotnet_u16(row + 2);
+    identity->build = xxemul_dotnet_u16(row + 4); identity->revision = xxemul_dotnet_u16(row + 6); row += 8;
+    identity->flags = xxemul_dotnet_u32(row); row += 4;
+    key_index = dn_index(&row, loader->cli->nBlobIndexSize);
+    name_index = dn_index(&row, loader->cli->nStringIndexSize);
+    culture_index = dn_index(&row, loader->cli->nStringIndexSize);
+    identity->name = dn_heap_string(loader, name_index);
+    identity->culture = dn_heap_string(loader, culture_index);
+    if (!identity->name || !*identity->name || !identity->culture || !dn_blob(loader, key_index, &key, &key_size)) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+    identity->public_key_or_token = key; identity->public_key_size = key_size;
+    return 1;
+}
+static const char *dn_scope_assembly(const xxemul_dotnet_program *program, uint32_t scope)
+{
+    size_t depth;
+    for (depth = 0; depth <= DN_DEPTH_LIMIT; ++depth) {
+        size_t index;
+        if ((scope >> 24) == 2 || (scope >> 24) == 0) return program->assembly_name;
+        if ((scope >> 24) == 35) {
+            uint32_t rid = scope & 0xffffff;
+            return rid && rid <= program->assembly_ref_count ? program->assembly_refs[rid - 1].name : NULL;
+        }
+        index = dn_type_index(program, scope);
+        if (index == SIZE_MAX || (scope >> 24) != 1) return NULL;
+        scope = program->types[index].resolution_scope;
+    }
+    return NULL;
+}
+static int dn_load_assembly_metadata(dn_loader *loader)
+{
+    xxemul_dotnet_program *program = loader->program;
+    const xx_dotnet_inspect_cli *cli = loader->cli;
+    const uint8_t *row;
+    size_t i;
+    if (cli->pRows[0] != 1 || cli->pRows[32] > 1) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+    row = dn_row(loader, 0, 1); if (!row) return 0; row += 2;
+    program->module_name = dn_heap_string(loader, dn_index(&row, cli->nStringIndexSize));
+    if (!program->module_name) return 0;
+    if (cli->pRows[32] && !dn_load_assembly_info(loader, 32, 1, &program->assembly_identity)) return 0;
+    program->assembly_name = dn_copy(loader, program->assembly_identity.name ? program->assembly_identity.name : "",
+        program->assembly_identity.name ? strlen(program->assembly_identity.name) : 0);
+    if (!program->assembly_name) return 0;
+    program->assembly_ref_count = cli->pRows[35];
+    if (program->assembly_ref_count) {
+        program->assembly_refs = (xxemul_dotnet_assembly_info *)calloc(program->assembly_ref_count, sizeof(*program->assembly_refs));
+        if (!program->assembly_refs) return dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY);
+        for (i = 0; i < program->assembly_ref_count; ++i)
+            if (!dn_load_assembly_info(loader, 35, (uint32_t)i + 1, program->assembly_refs + i)) return 0;
+    }
+    for (i = 0; i < program->method_count; ++i) {
+        xxemul_dotnet_method *method = program->methods + i;
+        method->info.assembly_name = dn_scope_assembly(program, method->owner_token);
+    }
+    for (i = 0; i < program->field_count; ++i) program->fields[i].info.assembly_name = program->assembly_name;
+    for (i = 0; i < program->field_ref_count; ++i) program->field_refs[i].info.assembly_name = dn_scope_assembly(program, program->field_refs[i].owner_token);
+    return 1;
+}
+static int dn_load_resources(dn_loader *loader)
+{
+    xxemul_dotnet_program *program = loader->program;
+    const xx_dotnet_inspect_cli *cli = loader->cli;
+    const uint8_t *cor;
+    size_t region = 0, i;
+    uint32_t region_rva, region_size;
+    if (cli->nCliOffset < 0 || !dn_range(program->size, (size_t)cli->nCliOffset, 32)) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+    cor = program->data + cli->nCliOffset;
+    region_rva = xxemul_dotnet_u32(cor + 24); region_size = xxemul_dotnet_u32(cor + 28);
+    if (region_size && !dn_rva(loader, region_rva, region_size, &region, NULL)) return 0;
+    program->resource_count = cli->pRows[40];
+    if (!program->resource_count) return 1;
+    program->resources = (xxemul_dotnet_resource_info *)calloc(program->resource_count, sizeof(*program->resources));
+    if (!program->resources) return dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY);
+    for (i = 0; i < program->resource_count; ++i) {
+        xxemul_dotnet_resource_info *resource = program->resources + i;
+        const uint8_t *row = dn_row(loader, 40, (uint32_t)i + 1);
+        uint32_t offset, name_index;
+        if (!row) return 0;
+        resource->token = DN_TOKEN(40, (uint32_t)i + 1);
+        offset = xxemul_dotnet_u32(row); resource->flags = xxemul_dotnet_u32(row + 4); row += 8;
+        name_index = dn_index(&row, cli->nStringIndexSize);
+        resource->name = dn_heap_string(loader, name_index);
+        if (!resource->name || !*resource->name ||
+            !dn_coded_token(loader, 11, dn_index(&row, cli->nImplementationSize), &resource->implementation)) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+        if (!resource->implementation) {
+            uint32_t size;
+            if (!region_size || offset > region_size || region_size - offset < 4) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+            size = xxemul_dotnet_u32(program->data + region + offset);
+            if (size > region_size - offset - 4) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+            resource->data = program->data + region + offset + 4; resource->size = size;
+        }
     }
     return 1;
 }
@@ -911,6 +1113,71 @@ static int dn_load_local_signature(dn_loader *loader, xxemul_dotnet_method *meth
     return 1;
 }
 
+static int dn_load_exception_clauses(dn_loader *loader, xxemul_dotnet_method *method, const xx_dotnet_method_body *body)
+{
+    const uint8_t *data = loader->program->data;
+    size_t start, end, offset, sections = 0;
+    int more = (body->flags & 8u) != 0;
+    if (!body->has_exception_handlers) return 1;
+    if (body->header_offset < 0 || body->code_offset < body->header_offset ||
+        (uint64_t)body->header_offset > SIZE_MAX ||
+        !dn_range(loader->program->size, (size_t)body->header_offset, body->total_size))
+        return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+    start = (size_t)body->header_offset;
+    end = start + body->total_size;
+    offset = (size_t)body->code_offset + body->code_size;
+    while (more) {
+        const uint8_t *header;
+        xxemul_dotnet_exception_clause *clauses;
+        size_t length, width, count, i, old = method->clause_count;
+        int fat;
+        offset = start + ((offset - start + 3u) & ~(size_t)3u);
+        if (++sections > 64 || !dn_range(end, offset, 4)) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+        header = data + offset;
+        if ((header[0] & 0x3fu) != 1u) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+        fat = (header[0] & 0x40u) != 0;
+        more = (header[0] & 0x80u) != 0;
+        length = fat ? (size_t)header[1] | (size_t)header[2] << 8 | (size_t)header[3] << 16 : header[1];
+        width = fat ? 24u : 12u;
+        if ((!fat && (header[2] || header[3])) || length < 4 || !dn_range(end, offset, length) || (length - 4) % width)
+            return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+        count = (length - 4) / width;
+        if (count > 4096u - old || !dn_work(loader, count * sizeof(*clauses))) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+        if (count) {
+            clauses = (xxemul_dotnet_exception_clause *)realloc(method->clauses, (old + count) * sizeof(*clauses));
+            if (!clauses) return dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY);
+            method->clauses = clauses;
+            method->clause_count += count;
+            for (i = 0; i < count; ++i) {
+                const uint8_t *p = header + 4 + i * width;
+                xxemul_dotnet_exception_clause *clause = clauses + old + i;
+                if (fat) {
+                    clause->flags = xxemul_dotnet_u32(p);
+                    clause->try_offset = xxemul_dotnet_u32(p + 4);
+                    clause->try_length = xxemul_dotnet_u32(p + 8);
+                    clause->handler_offset = xxemul_dotnet_u32(p + 12);
+                    clause->handler_length = xxemul_dotnet_u32(p + 16);
+                    clause->class_token_or_filter_offset = xxemul_dotnet_u32(p + 20);
+                } else {
+                    clause->flags = xxemul_dotnet_u16(p);
+                    clause->try_offset = xxemul_dotnet_u16(p + 2);
+                    clause->try_length = p[4];
+                    clause->handler_offset = xxemul_dotnet_u16(p + 5);
+                    clause->handler_length = p[7];
+                    clause->class_token_or_filter_offset = xxemul_dotnet_u32(p + 8);
+                }
+                if ((clause->flags != 0 && clause->flags != 1 && clause->flags != 2 && clause->flags != 4) ||
+                    clause->try_offset > body->code_size || clause->try_length > body->code_size - clause->try_offset ||
+                    clause->handler_offset > body->code_size || clause->handler_length > body->code_size - clause->handler_offset ||
+                    (clause->flags == 1 && clause->class_token_or_filter_offset >= body->code_size))
+                    return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+            }
+        }
+        offset += length;
+    }
+    return offset == end ? 1 : dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+}
+
 static int dn_load_body(dn_loader *loader, xxemul_dotnet_method *method)
 {
     xx_dotnet_method_body body;
@@ -925,8 +1192,8 @@ static int dn_load_body(dn_loader *loader, xxemul_dotnet_method *method)
     method->info.max_stack = body.max_stack;
     method->info.init_locals = body.init_locals;
     method->info.has_exception_handlers = body.has_exception_handlers;
-    method->info.is_executable = method->signature.supported && !body.has_exception_handlers && !(method->info.flags & (0x400u | 0x2000u));
-    if (!dn_load_local_signature(loader, method, body.local_signature_token)) return 0;
+    method->info.is_executable = method->signature.supported && !(method->info.flags & (0x400u | 0x2000u));
+    if (!dn_load_local_signature(loader, method, body.local_signature_token) || !dn_load_exception_clauses(loader, method, &body)) return 0;
     if ((method->owner_token >> 24) == 2 && loader->program->types[(method->owner_token & 0xffffff) - 1].is_generic) method->info.is_executable = 0;
     return 1;
 }
@@ -948,8 +1215,10 @@ static int dn_load_methods(dn_loader *loader)
     }
     if (program->memberref_count) {
         program->memberref_map = (size_t *)malloc(program->memberref_count * sizeof(*program->memberref_map));
-        if (!program->memberref_map) return dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY);
-        for (count = 0; count < program->memberref_count; ++count) program->memberref_map[count] = SIZE_MAX;
+        program->fieldref_map = (size_t *)malloc(program->memberref_count * sizeof(*program->fieldref_map));
+        program->field_refs = (xxemul_dotnet_field *)calloc(program->memberref_count, sizeof(*program->field_refs));
+        if (!program->memberref_map || !program->fieldref_map || !program->field_refs) return dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY);
+        for (count = 0; count < program->memberref_count; ++count) { program->memberref_map[count] = SIZE_MAX; program->fieldref_map[count] = SIZE_MAX; }
     }
     count = 0;
     for (rid = 1; rid <= program->method_def_count + program->memberref_count; ++rid) {
@@ -985,7 +1254,7 @@ static int dn_load_methods(dn_loader *loader)
             if ((parent >> 24) == 6) {
                 method->owner_token = program->methods[(parent & 0xffffff) - 1].owner_token;
                 method->info.type_name = program->methods[(parent & 0xffffff) - 1].info.type_name;
-            } else if ((parent >> 24) == 26) method->info.type_name = "<external-module>";
+            } else if ((parent >> 24) == 26) { method->owner_token = parent; method->info.type_name = "<external-module>"; }
             else {
                 size_t type_index = dn_type_index(program, parent);
                 if (type_index == SIZE_MAX) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
@@ -997,18 +1266,20 @@ static int dn_load_methods(dn_loader *loader)
         if (!dn_blob(loader, blob_index, &blob, &size) || !size || size > DN_SIGNATURE_LIMIT) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
         /* MemberRef also represents fields; those are not callable methods. */
         if (!defined && blob[0] == 6) {
-            xxemul_dotnet_type field_type;
-            memset(&field_type, 0, sizeof(field_type));
+            xxemul_dotnet_field *field = program->field_refs + program->field_ref_count++;
+            if ((parent >> 24) == 6) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+            field->token = method->info.token; field->owner_token = method->owner_token;
+            field->name = dn_heap_string(loader, name_index);
+            if (!field->name || !*field->name) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
             reader.loader = loader;
             reader.data = blob;
             reader.size = size;
             reader.position = 1;
             reader.budget = DN_SIGNATURE_LIMIT;
-            if (!dn_parse_type(&reader, &field_type, 0, 0) || reader.position != size) {
-                dn_type_free(&field_type);
-                return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
-            }
-            dn_type_free(&field_type);
+            if (!dn_parse_type(&reader, &field->type, 0, 0) || reader.position != size) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+            field->info.token = field->token; field->info.owner_token = field->owner_token;
+            field->info.type_name = method->info.type_name; field->info.name = field->name; field->info.signature = field->type.name;
+            program->fieldref_map[table_rid - 1] = program->field_ref_count - 1;
             memset(method, 0, sizeof(*method));
             continue;
         }
@@ -1112,6 +1383,7 @@ void xxemul_dotnet_destroy(xxemul_dotnet_program *program)
             if (method->locals)
                 for (j = 0; j < method->local_count; ++j) dn_type_free(method->locals + j);
             free(method->locals);
+            free(method->clauses);
         }
     if (program->types)
         for (i = 0; i < program->type_count; ++i) free(program->types[i].name);
@@ -1120,13 +1392,32 @@ void xxemul_dotnet_destroy(xxemul_dotnet_program *program)
             free(program->fields[i].name);
             dn_type_free(&program->fields[i].type);
         }
+    if (program->field_refs)
+        for (i = 0; i < program->field_ref_count; ++i) {
+            free(program->field_refs[i].name);
+            dn_type_free(&program->field_refs[i].type);
+        }
     if (program->user_strings)
         for (i = 0; i < program->user_string_count; ++i) free(program->user_strings[i].text);
+    if (program->resources)
+        for (i = 0; i < program->resource_count; ++i) free((char *)program->resources[i].name);
+    if (program->assembly_refs)
+        for (i = 0; i < program->assembly_ref_count; ++i) {
+            free((char *)program->assembly_refs[i].name);
+            free((char *)program->assembly_refs[i].culture);
+        }
     free(program->methods);
     free(program->memberref_map);
     free(program->types);
     free(program->fields);
+    free(program->field_refs);
+    free(program->fieldref_map);
     free(program->user_strings);
+    free(program->resources);
+    free(program->assembly_refs);
+    free((char *)program->assembly_identity.name);
+    free((char *)program->assembly_identity.culture);
+    free(program->module_name);
     free(program->assembly_name);
     free(program->data);
     free(program);
@@ -1137,7 +1428,6 @@ xxemul_dotnet_program *xxemul_dotnet_create(const void *data, size_t size, xxemu
     dn_loader loader;
     xxemul_dotnet_program *program = NULL;
     xx_io_device *device = NULL;
-    char *assembly_name = NULL;
     if (status) *status = XXEMUL_STATUS_INVALID_ARGUMENT;
     if (!data || !size) return NULL;
     memset(&loader, 0, sizeof(loader));
@@ -1170,20 +1460,12 @@ xxemul_dotnet_program *xxemul_dotnet_create(const void *data, size_t size, xxemu
         loader.status = XXEMUL_STATUS_INVALID_IMAGE;
         goto done;
     }
-    if (!dn_validate_image(&loader) || !dn_validate_tables(&loader) || !dn_load_types(&loader) || !dn_load_fields(&loader) || !dn_load_methods(&loader) ||
-        !dn_load_user_strings(&loader)) {
+    if (!dn_validate_image(&loader) || !dn_validate_tables(&loader) || !dn_load_types(&loader) || !dn_load_fields(&loader) || !dn_load_field_data(&loader) ||
+        !dn_load_methods(&loader) || !dn_load_user_strings(&loader) || !dn_load_assembly_metadata(&loader) || !dn_load_resources(&loader)) {
         if (loader.status == XXEMUL_STATUS_OK) loader.status = XXEMUL_STATUS_INVALID_IMAGE;
         goto done;
     }
-    assembly_name = xx_dotnet_inspect_net_assembly_name(&loader.inspection);
-    if (!assembly_name) {
-        loader.status = XXEMUL_STATUS_OUT_OF_MEMORY;
-        goto done;
-    }
-    program->assembly_name = dn_copy(&loader, assembly_name, strlen(assembly_name));
-    if (!program->assembly_name) goto done;
 done:
-    xx_mem_free(assembly_name);
     free(loader.type_visiting);
     xx_dotnet_inspect_free(&loader.inspection);
     if (device) xx_io_close(device);
@@ -1236,6 +1518,69 @@ const char *xxemul_dotnet_assembly_name(const xxemul_dotnet_program *program)
 {
     return program ? program->assembly_name : NULL;
 }
+const char *xxemul_dotnet_module_name(const xxemul_dotnet_program *program)
+{
+    return program ? program->module_name : NULL;
+}
+const xxemul_dotnet_assembly_info *xxemul_dotnet_assembly_identity(const xxemul_dotnet_program *program)
+{
+    return program && program->assembly_identity.token ? &program->assembly_identity : NULL;
+}
+size_t xxemul_dotnet_assembly_ref_count(const xxemul_dotnet_program *program)
+{
+    return program ? program->assembly_ref_count : 0;
+}
+const xxemul_dotnet_assembly_info *xxemul_dotnet_assembly_ref_at(const xxemul_dotnet_program *program, size_t index)
+{
+    return program && index < program->assembly_ref_count ? program->assembly_refs + index : NULL;
+}
+const uint8_t *xxemul_dotnet_data(const xxemul_dotnet_program *program, size_t *size)
+{
+    if (size) *size = program ? program->size : 0;
+    return program ? program->data : NULL;
+}
+size_t xxemul_dotnet_resource_count(const xxemul_dotnet_program *program)
+{
+    return program ? program->resource_count : 0;
+}
+const xxemul_dotnet_resource_info *xxemul_dotnet_resource_at(const xxemul_dotnet_program *program, size_t index)
+{
+    return program && index < program->resource_count ? program->resources + index : NULL;
+}
+const xxemul_dotnet_resource_info *xxemul_dotnet_resource_find(const xxemul_dotnet_program *program, const char *name)
+{
+    size_t i;
+    const xxemul_dotnet_resource_info *found = NULL;
+    if (!program || !name) return NULL;
+    for (i = 0; i < program->resource_count; ++i) if (!strcmp(program->resources[i].name, name)) {
+        /* Duplicate resource names are ambiguous rather than silently taking
+         * an attacker-controlled earlier/later payload. */
+        if (found) return NULL;
+        found = program->resources + i;
+    }
+    return found;
+}
+const uint8_t *xxemul_dotnet_field_data(const xxemul_dotnet_program *program, uint32_t token, size_t *size)
+{
+    uint32_t rid = token & 0xffffff;
+    const xxemul_dotnet_field *field;
+    if (size) *size = 0;
+    if (!program || (token >> 24) != 4 || !rid || rid > program->field_count) return NULL;
+    field = program->fields + rid - 1;
+    if (!field->initial_data) return NULL;
+    if (size) *size = field->initial_data_size;
+    return field->initial_data;
+}
+const xxemul_dotnet_field_info *xxemul_dotnet_field_info_token(const xxemul_dotnet_program *program, uint32_t token)
+{
+    uint32_t rid = token & 0xffffff;
+    size_t index;
+    if (!program || !rid) return NULL;
+    if ((token >> 24) == 4) return rid <= program->field_count ? &program->fields[rid - 1].info : NULL;
+    if ((token >> 24) != 10 || rid > program->memberref_count) return NULL;
+    index = program->fieldref_map[rid - 1];
+    return index < program->field_ref_count ? &program->field_refs[index].info : NULL;
+}
 uint32_t xxemul_dotnet_entry_point_token(const xxemul_dotnet_program *program)
 {
     return program ? program->entry_point_token : 0;
@@ -1251,6 +1596,14 @@ size_t xxemul_dotnet_method_count(const xxemul_dotnet_program *program)
 const xxemul_dotnet_method_info *xxemul_dotnet_method_info_at(const xxemul_dotnet_program *program, size_t index)
 {
     return program && index < program->method_count ? &program->methods[index].info : NULL;
+}
+size_t xxemul_dotnet_exception_clause_count(const xxemul_dotnet_program *program, size_t index)
+{
+    return program && index < program->method_count ? program->methods[index].clause_count : 0;
+}
+const xxemul_dotnet_exception_clause *xxemul_dotnet_exception_clause_at(const xxemul_dotnet_program *program, size_t method, size_t index)
+{
+    return program && method < program->method_count && index < program->methods[method].clause_count ? program->methods[method].clauses + index : NULL;
 }
 size_t xxemul_dotnet_find_method(const xxemul_dotnet_program *program, const char *selector)
 {

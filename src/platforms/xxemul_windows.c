@@ -15,6 +15,9 @@
 #include "xxemul_windows.h"
 #include "xxemul_internal.h"
 #include <xxfclib/formats/executable/pe/xx_pe_make.h>
+#if XXEMUL_ENABLE_DOTNET
+#include "xxemul/xxemul_dotnet_bcl.h"
+#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -328,6 +331,7 @@ struct xxemul_windows {
     uint64_t envp_address;
     uint32_t argc;
     uint32_t app_type;
+    uint8_t managed_invoked;
     uint64_t matherr_handler;
     uint32_t last_error;
     uint32_t exit_code;
@@ -981,6 +985,9 @@ static const char *const win_extra_export_names[] = {
     "strtoull", "time", "tolower", "toupper",
     "ungetc", "vfprintf", "wcrtomb", "wcscmp",
     "wcslen", "wcsnlen",
+#if XXEMUL_ENABLE_DOTNET
+    "_CorExeMain",
+#endif
 };
 
 static const char *const win_crt_names[] = {"_controlfp", "_except_handler3", "_filelength", "_filelengthi64", "_chsize", "_access", "__p___initenv", "_adjust_fdiv", "atexit", "atoi",
@@ -2099,6 +2106,9 @@ static int win_loadable_module(xxemul_windows *process, const char *name)
     }
     for (index = 0; index < sizeof(modules) / sizeof(modules[0]); ++index)
         if (win_equal(normalized, modules[index])) return 1;
+#if XXEMUL_ENABLE_DOTNET
+    if (win_equal(normalized, "mscoree.dll")) return 1;
+#endif
     return win_suffix(normalized, ".dll") &&
         (win_prefix(normalized, "api-ms-win-") || win_prefix(normalized, "ext-ms-win-") ||
          win_prefix(normalized, "msvcr") || win_prefix(normalized, "msvcp") || win_prefix(normalized, "vcruntime"));
@@ -5155,6 +5165,86 @@ static xxemul_status win_gui_message(xxemul_windows *process,uint64_t handle,uin
 
 static xxemul_status win_thread_create(xxemul_windows *process, const uint64_t *arg, uint64_t *result);
 
+#if XXEMUL_ENABLE_DOTNET
+static void win_managed_output(void *context, unsigned stream, const char *data, size_t size)
+{
+    xxemul_windows *process = context;
+    size_t i;
+    if (xxemul_emit_output(process->emulator, stream == 2 ? 2 : 1, data, size)) return;
+    if (process->emulator->output_callback) {
+        for (i = 0; i < size; ++i) process->emulator->output_callback(process->emulator->output_context, (uint8_t)data[i]);
+    } else {
+        FILE *out = stream == 2 ? stderr : stdout;
+        (void)fwrite(data, 1, size, out);
+        (void)fflush(out);
+    }
+}
+
+/* This CLR bootstrap executes the managed entry through the CIL interpreter.
+ * It does not return a fabricated success from an unresolved mscoree import. */
+static xxemul_status win_managed_entry(xxemul_windows *process, uint64_t *return_value)
+{
+    xxemul_dotnet_program *program = NULL;
+    xxemul_dotnet_bcl_host *host = NULL;
+    xxemul_dotnet_bcl_config config = {0};
+    xxemul_dotnet_result result = {0};
+    xxemul_status status = XXEMUL_STATUS_INVALID_ARGUMENT;
+    char **arguments = NULL;
+    size_t count = process->argc ? process->argc - 1u : 0, i;
+    unsigned word_size = win_word_size(process->emulator);
+    if (process->managed_invoked || count > 0x100) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    process->managed_invoked = 1;
+    arguments = calloc(count ? count : 1, sizeof(*arguments));
+    if (!arguments) return XXEMUL_STATUS_OUT_OF_MEMORY;
+    for (i = 0; i < count; ++i) {
+        uint64_t address; size_t length;
+        if (!win_load(process, process->argv_address + (i + 1) * word_size, (uint8_t)word_size, &address)) {
+            status = XXEMUL_STATUS_ADDRESS_FAULT; goto done;
+        }
+        status = win_crt_read_string(process, address, &arguments[i], &length);
+        if (status != XXEMUL_STATUS_OK || length > 0x10000) {
+            if (status == XXEMUL_STATUS_OK) status = XXEMUL_STATUS_LIMIT_REACHED;
+            goto done;
+        }
+    }
+    program = xxemul_dotnet_create_file(process->program_path, &status);
+    if (!program) goto done;
+    config.max_instructions = UINT64_C(0x100000);
+    config.max_heap_bytes = 0x4000000;
+    config.max_native_bytes = 0x4000000;
+    config.max_image_bytes = 0x1000000;
+    config.max_output_bytes = 0x400000;
+    config.flags = XXEMUL_DOTNET_BCL_SHARPZIP_STREAMS;
+    config.logical_entry_path = process->program_path;
+    config.output_callback = win_managed_output;
+    config.output_context = process;
+    host = xxemul_dotnet_bcl_host_create(&config, &status);
+    if (!host) goto done;
+    status = xxemul_dotnet_bcl_execute(host, program, (int)count, (const char *const *)arguments, &result);
+    if (status == XXEMUL_STATUS_OK) {
+        if (result.value.kind != XXEMUL_DOTNET_VALUE_VOID && result.value.kind != XXEMUL_DOTNET_VALUE_I4) {
+            status = XXEMUL_STATUS_INVALID_ARGUMENT; goto done;
+        }
+        /* Return through the native entry sentinel so normal DLL/TLS process
+         * detach notifications also run for managed executables. */
+        *return_value = result.value.kind == XXEMUL_DOTNET_VALUE_I4 ? (uint32_t)result.value.bits : 0;
+    } else {
+        const char *diagnostic = xxemul_dotnet_bcl_diagnostic(host);
+        if (!diagnostic || !*diagnostic) diagnostic = result.diagnostic;
+        if (diagnostic && *diagnostic) {
+            win_managed_output(process, 2, diagnostic, strlen(diagnostic));
+            win_managed_output(process, 2, "\n", 1);
+        }
+    }
+done:
+    if (host) xxemul_dotnet_bcl_host_destroy(host);
+    if (program) xxemul_dotnet_destroy(program);
+    for (i = 0; i < count; ++i) free(arguments[i]);
+    free(arguments);
+    return status;
+}
+#endif
+
 static xxemul_status win_call(xxemul_windows *process, const win_api *api, const uint64_t *arg, uint64_t *result)
 {
     const char *name = api->name;
@@ -5165,6 +5255,9 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     int wide;
 
     *result = 0;
+#if XXEMUL_ENABLE_DOTNET
+    if (win_equal(api->module, "mscoree.dll") && !strcmp(name, "_CorExeMain")) return win_managed_entry(process, result);
+#endif
     if(win_equal(name,"CheckSumMappedFile")){
         uint64_t nt,signature,magic,header;uint32_t sum;const uint8_t *raw;
         uint32_t length=(uint32_t)arg[1];

@@ -26,6 +26,8 @@ typedef struct xxemul_dotnet_method {
     size_t local_count;
     uint32_t owner_token;
     int local_reference;
+    xxemul_dotnet_exception_clause *clauses;
+    size_t clause_count;
 } xxemul_dotnet_method;
 
 typedef struct xxemul_dotnet_class {
@@ -37,9 +39,13 @@ typedef struct xxemul_dotnet_class {
 } xxemul_dotnet_class;
 
 typedef struct xxemul_dotnet_field {
+    xxemul_dotnet_field_info info;
     uint32_t token, owner_token, flags;
     char *name;
     xxemul_dotnet_type type;
+    uint32_t initial_data_rva;
+    const uint8_t *initial_data;
+    size_t initial_data_size;
 } xxemul_dotnet_field;
 
 typedef struct xxemul_dotnet_string {
@@ -53,6 +59,12 @@ struct xxemul_dotnet_program {
     size_t size;
     unsigned pointer_size;
     char *assembly_name;
+    char *module_name;
+    xxemul_dotnet_assembly_info assembly_identity;
+    xxemul_dotnet_assembly_info *assembly_refs;
+    size_t assembly_ref_count;
+    xxemul_dotnet_resource_info *resources;
+    size_t resource_count;
     uint32_t entry_point_token;
     xxemul_dotnet_method *methods;
     size_t method_count, method_def_count;
@@ -63,6 +75,9 @@ struct xxemul_dotnet_program {
     size_t type_ref_count, type_spec_count;
     xxemul_dotnet_field *fields;
     size_t field_count;
+    xxemul_dotnet_field *field_refs;
+    size_t field_ref_count;
+    size_t *fieldref_map;
     xxemul_dotnet_string *user_strings;
     size_t user_string_count;
 };
