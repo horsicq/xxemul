@@ -67,8 +67,8 @@ can continue using the default full xxfclib profile.
   mapping, including zero-filled BSS and a minimal empty stack
 - Separate bounded ELF32/ELF64 `ET_DYN` API with shared-object relocations,
   explicit version-aware guest import resolution and constructor inventory
-- Primary Linux i386/AMD64 shared objects through the image API, with SysV
-  DT_INIT/DT_INIT_ARRAY execution and retained initialized exports
+- Primary Linux i386/AMD64, ARM/Thumb and AArch64 shared objects through the
+  image API, with SysV/AAPCS initialization and retained initialized exports
 - ARM BX/BLX interworking and Thumb call/return address handling
 - Thin Mach-O executable segment mapping with `LC_MAIN` entry points and
   ARM64 UPX `LC_UNIXTHREAD` startup; compatible arm64/arm64e universal slices
@@ -268,7 +268,8 @@ creation. ARM function addresses retain their Thumb bit.
 
 Unsupported relocations, TLS, IFUNC and packed relocations fail explicitly.
 
-The ordinary ELF image constructors also load little-endian i386 and AMD64
+The ordinary ELF image constructors also load little-endian i386, AMD64,
+ARM32 EABI and AArch64
 shared libraries with PT_DYNAMIC, without PT_INTERP, DF_1_PIE or DT_NEEDED
 dependencies. Their ELF entry may be zero, or may alias DT_INIT when a valid
 SONAME identifies the library, as in the tested UPX shared-library wrapper.
@@ -281,8 +282,13 @@ are ignored. `xxemul_elf_primary_get_info`, `find_export` and `get_entry`
 expose the layout, dynamic exports and first initializer to analysis clients.
 The analysis entry is zero when no initializer exists. ELF e_entry remains
 metadata and is not used to invoke the library as an executable.
+ARM32 initializers and exports retain their Thumb function-pointer tags;
+debugger entry breakpoints use physical instruction addresses. ARM32 calls
+use AAPCS registers and an aligned SP, and AArch64 calls use x0-x2 and LR.
 Linux `/proc/self/auxv` exposes the same guest-width auxiliary vector as the
 initial stack, with biased addresses for shared objects.
+Guest O_TMPFILE opens in `/dev/shm` create bounded anonymous in-memory files,
+including ARM EABI's architecture-specific O_DIRECTORY flag.
 
 XAPKEmul's native bridge supplies Android import models, executes initialization
 and JNI_OnLoad, and binds DEX native declarations to JNI exports. See its README

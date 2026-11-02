@@ -771,6 +771,23 @@ static uint64_t linux_open(xxemul_linux_process *process, const char *guest, uin
     file = &process->files[fd];
     file->writable = memfd || (flags & 3u) != 0u;
     if (memfd) return (uint64_t)fd;
+    if (flags & UINT64_C(0x400000)) { /* __O_TMPFILE */
+        /* ARM EABI uses a different O_DIRECTORY bit from asm-generic.
+         * /dev/shm is a guest-only temporary directory: unnamed files use
+         * the same bounded in-memory descriptor storage as memfd_create. */
+        uint64_t directory = process->emulator->arch == XXEMUL_ARCH_ARM && !process->is_64
+                                 ? UINT64_C(0x4000) : UINT64_C(0x10000);
+        uint64_t access = flags & 3u;
+        if (!(flags & directory) || access == 0u || access == 3u) {
+            memset(file, 0, sizeof(*file));
+            return linux_error(LINUX_EINVAL);
+        }
+        if (strcmp(guest, "/dev/shm") != 0) {
+            memset(file, 0, sizeof(*file));
+            return linux_error(LINUX_EPERM);
+        }
+        return (uint64_t)fd;
+    }
     if (strcmp(guest, "/proc/self/exe") == 0 || strcmp(guest, process->self_path) == 0) {
         file->data = (uint8_t *)malloc(process->self_size + 1u);
         if (file->data == NULL) goto no_memory;

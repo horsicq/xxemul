@@ -432,6 +432,29 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
     target_compile_features(xxemul_elf_shared_tests PRIVATE c_std_11)
     target_link_libraries(xxemul_elf_shared_tests PRIVATE xxemul::xxemul)
     add_test(NAME xxemul_elf_shared_tests COMMAND xxemul_elf_shared_tests)
+    add_executable(xxemul_arm_thumb_state_tests tests/test_arm_thumb_state.c)
+    target_link_libraries(xxemul_arm_thumb_state_tests PRIVATE xxemul::xxemul)
+    target_compile_features(xxemul_arm_thumb_state_tests PRIVATE c_std_11)
+    add_test(NAME xxemul_arm_thumb_state_tests COMMAND xxemul_arm_thumb_state_tests)
+    set_tests_properties(xxemul_arm_thumb_state_tests PROPERTIES TIMEOUT 30)
+    set(XXEMUL_TEST_ARM_C_COMPILER "" CACHE FILEPATH "Existing ARM Linux GCC cross compiler for shared-library tests")
+    set(XXEMUL_TEST_ARM64_C_COMPILER "" CACHE FILEPATH "Existing AArch64 Linux GCC cross compiler for shared-library tests")
+    if(Python3_Interpreter_FOUND AND EXISTS "${XXEMUL_TEST_ARM_C_COMPILER}" AND EXISTS "${XXEMUL_TEST_ARM64_C_COMPILER}")
+        add_executable(xxemul_elf_primary_arm_tests tests/test_elf_primary_arm.c)
+        target_link_libraries(xxemul_elf_primary_arm_tests PRIVATE xxemul::xxemul)
+        target_compile_features(xxemul_elf_primary_arm_tests PRIVATE c_std_11)
+        add_executable(xxemul_linux_tmpfile_tests tests/test_linux_tmpfile.c)
+        target_link_libraries(xxemul_linux_tmpfile_tests PRIVATE xxemul::xxemul)
+        target_compile_features(xxemul_linux_tmpfile_tests PRIVATE c_std_11)
+        add_test(NAME xxemul_elf_primary_arm_tests
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_elf_primary_arm_tests.py"
+                --test $<TARGET_FILE:xxemul_elf_primary_arm_tests>
+                --tmpfile-test $<TARGET_FILE:xxemul_linux_tmpfile_tests>
+                --work "${CMAKE_CURRENT_BINARY_DIR}/elf-primary-arm"
+                --arm-compiler "${XXEMUL_TEST_ARM_C_COMPILER}"
+                --arm64-compiler "${XXEMUL_TEST_ARM64_C_COMPILER}")
+        set_tests_properties(xxemul_elf_primary_arm_tests PROPERTIES TIMEOUT 180)
+    endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND Python3_Interpreter_FOUND AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i[3-6]86)$" AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         add_executable(xxemul_elf_primary_tests tests/test_elf_primary.c)
         target_compile_features(xxemul_elf_primary_tests PRIVATE c_std_11)

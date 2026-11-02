@@ -1083,6 +1083,30 @@ xxemul_status xxemul_elf_shared_initializer_at(const xxemul_elf_shared *module, 
 
 enum { PRIMARY_BEFORE_INIT = 1, PRIMARY_WAIT_INIT, PRIMARY_ARRAY, PRIMARY_WAIT_ARRAY, PRIMARY_COMPLETE, PRIMARY_FAILED };
 
+static uint64_t primary_pc(const xxemul *emulator)
+{
+    return emulator->arch == XXEMUL_ARCH_ARM ? emulator->arm.pc : emulator->x86.ip;
+}
+
+static uint64_t primary_sp(const xxemul *emulator)
+{
+    return emulator->arch == XXEMUL_ARCH_ARM ? emulator->arm.sp : emulator->x86.gpr[XXEMUL_X86_RSP];
+}
+
+static void primary_loader_pc(xxemul_elf_shared *module)
+{
+    xxemul *emulator = module->emulator;
+    if (emulator->arch == XXEMUL_ARCH_ARM) {
+        if (module->width == 4u) {
+            /* The abstract loader's return address is an ARM-state address.
+             * Each subsequent callback selects its own ARM/Thumb state. */
+            emulator->mode = XXEMUL_MODE_ARM_A32;
+            emulator->arm.pstate &= ~UINT32_C(0x0600fc20);
+        }
+        emulator->arm.pc = module->primary_return;
+    } else emulator->x86.ip = module->primary_return;
+}
+
 static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t *image, size_t size,
                                       uint64_t image_base, xxemul_status *status)
 {
@@ -1098,7 +1122,8 @@ static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t
     if (size < (width == 8u ? 64u : 52u) || image[4] != (width == 8u ? 2u : 1u) || image[5] != 1u) return NULL;
     entry = shared_word(image + 24u, width);
     if ((image[7] != 0u && image[7] != 3u) ||
-        shared_u16(image + 18u) != (width == 8u ? 62u : 3u)) {
+        (width == 8u ? shared_u16(image + 18u) != 62u && shared_u16(image + 18u) != 183u
+                     : shared_u16(image + 18u) != 3u && shared_u16(image + 18u) != 40u)) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }
@@ -1136,7 +1161,8 @@ static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t
     /* Some library packers publish their DT_INIT wrapper in e_entry too.
      * Require a self-named library and an exact initializer alias; this does
      * not admit arbitrary nonzero-entry ET_DYN executables. */
-    if (entry && (entry != init || soname == UINT64_MAX)) {
+    if (entry && (!init || soname == UINT64_MAX ||
+        (shared_u16(image + 18u) == 40u ? (entry & ~UINT64_C(1)) != (init & ~UINT64_C(1)) : entry != init))) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }
@@ -1156,7 +1182,7 @@ static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t
     }
     module->primary_return = module->info.auxiliary_address + 0x80u;
     module->emulator->elf_primary = module;
-    module->emulator->x86.ip = module->primary_return;
+    primary_loader_pc(module);
     *status = XXEMUL_STATUS_OK;
     return module->emulator;
 }
@@ -1212,7 +1238,7 @@ static int primary_word(xxemul_elf_shared *module, uint64_t address, uint64_t *v
 xxemul_status xxemul_elf_primary_start(xxemul *emulator)
 {
     xxemul_elf_shared *module = emulator->elf_primary;
-    uint64_t sp = emulator->x86.gpr[XXEMUL_X86_RSP], argc;
+    uint64_t sp = primary_sp(emulator), argc;
     if (!module || module->primary_stage) return XXEMUL_STATUS_INVALID_ARGUMENT;
     if (sp < module->info.stack_address + 0x100u || !primary_word(module, sp, &argc) || argc > 128u ||
         sp > UINT64_MAX - (argc + 3u) * module->width)
@@ -1222,7 +1248,7 @@ xxemul_status xxemul_elf_primary_start(xxemul *emulator)
     module->primary_envp = sp + (argc + 2u) * module->width;
     module->primary_stack = (sp - 0x100u) & ~UINT64_C(15);
     module->primary_stage = PRIMARY_BEFORE_INIT;
-    emulator->x86.ip = module->primary_return;
+    primary_loader_pc(module);
     return XXEMUL_STATUS_OK;
 }
 
@@ -1258,9 +1284,30 @@ static xxemul_status primary_call(xxemul_elf_shared *module, uint64_t target)
 {
     xxemul *emulator = module->emulator;
     uint64_t sp = module->primary_stack - module->width;
+    uint64_t physical = module->info.machine == 40u ? target & ~UINT64_C(1) : target;
     uint8_t frame[16];
-    if (target < module->info.load_bias || !shared_mapped(module, target - module->info.load_bias, 1u, 1))
+    if (physical < module->info.load_bias || !shared_mapped(module, physical - module->info.load_bias, 1u, 1))
         return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "ELF initializer is outside executable PT_LOAD");
+    if (emulator->arch == XXEMUL_ARCH_ARM) {
+        if ((module->width == 8u && (target & 3u)) ||
+            (module->width == 4u && (target > UINT32_MAX || (target & 3u) == 2u)))
+            return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "ELF initializer violates ARM instruction alignment");
+        /* AAPCS passes argc/argv/envp in r0-r2 or x0-x2. The return
+         * address is in LR, and no synthetic x86-style frame is pushed. */
+        sp = module->primary_stack;
+        emulator->arm.gpr[0] = module->primary_argc;
+        emulator->arm.gpr[1] = module->primary_argv;
+        emulator->arm.gpr[2] = module->primary_envp;
+        emulator->arm.gpr[module->width == 8u ? 30u : 14u] = module->primary_return;
+        emulator->arm.sp = sp;
+        if (module->width == 4u) {
+            emulator->mode = (target & 1u) ? XXEMUL_MODE_ARM_T32 : XXEMUL_MODE_ARM_A32;
+            emulator->arm.pstate = (emulator->arm.pstate & ~UINT32_C(0x0600fc20)) | ((target & 1u) ? UINT32_C(0x20) : 0u);
+        }
+        emulator->arm.pc = physical;
+        module->primary_expected_sp = sp;
+        return XXEMUL_STATUS_OK;
+    }
     if (module->width == 8u) {
         uint64_t value = module->primary_return;
         unsigned i;
@@ -1290,17 +1337,18 @@ int xxemul_elf_primary_try_step(xxemul *emulator, xxemul_step_info *info, xxemul
 {
     xxemul_elf_shared *module = emulator->elf_primary;
     uint64_t target;
-    if (!module || !module->primary_stage || module->primary_stage >= PRIMARY_COMPLETE || emulator->x86.ip != module->primary_return) return 0;
+    if (!module || !module->primary_stage || module->primary_stage >= PRIMARY_COMPLETE || primary_pc(emulator) != module->primary_return) return 0;
     if (info) info->address = module->primary_return;
     if ((module->primary_stage == PRIMARY_WAIT_INIT || module->primary_stage == PRIMARY_WAIT_ARRAY) &&
-        emulator->x86.gpr[XXEMUL_X86_RSP] != module->primary_expected_sp) {
-        *status = primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "ELF initializer violates guest SysV stack cleanup");
+        primary_sp(emulator) != module->primary_expected_sp) {
+        *status = primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "ELF initializer violates guest ABI stack restoration");
         return 1;
     }
+    primary_loader_pc(module);
     if (module->primary_stage == PRIMARY_BEFORE_INIT && module->init) {
         module->primary_stage = PRIMARY_WAIT_INIT;
         *status = primary_call(module, module->info.load_bias + module->init);
-        if (info) info->next_address = emulator->x86.ip;
+        if (info) info->next_address = primary_pc(emulator);
         return 1;
     }
     if (module->primary_stage == PRIMARY_BEFORE_INIT || module->primary_stage == PRIMARY_WAIT_INIT) {
@@ -1318,7 +1366,7 @@ int xxemul_elf_primary_try_step(xxemul *emulator, xxemul_step_info *info, xxemul
         if (!target || target == (module->width == 8u ? UINT64_MAX : UINT32_MAX)) { ++module->primary_array_index; continue; }
         module->primary_stage = PRIMARY_WAIT_ARRAY;
         *status = primary_call(module, target);
-        if (info) info->next_address = emulator->x86.ip;
+        if (info) info->next_address = primary_pc(emulator);
         return 1;
     }
     module->primary_stage = PRIMARY_COMPLETE;
