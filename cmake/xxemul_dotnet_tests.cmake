@@ -1,0 +1,79 @@
+# Reusable managed-runtime tests for the library and its standalone frontend.
+function(xxemul_add_dotnet_tests)
+    if(TARGET xxemul_dotnet_loader_service_tests)
+        return()
+    endif()
+    get_filename_component(_managed_root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." ABSOLUTE)
+    add_executable(xxemul_dotnet_loader_service_tests "${_managed_root}/tests/test_dotnet_loader_services.c")
+    target_include_directories(xxemul_dotnet_loader_service_tests PRIVATE "${_managed_root}/src")
+    target_link_libraries(xxemul_dotnet_loader_service_tests PRIVATE xxemul::xxemul xxfclib::xxfclib)
+    add_test(NAME xxemul_dotnet_loader_services COMMAND xxemul_dotnet_loader_service_tests)
+
+    if(EXISTS "${XXEMUL_XXFCLIB_SOURCE_DIR}/tests/test_dotnet_resources.c")
+        add_executable(xxemul_dotnet_resource_tests "${XXEMUL_XXFCLIB_SOURCE_DIR}/tests/test_dotnet_resources.c")
+        target_link_libraries(xxemul_dotnet_resource_tests PRIVATE xxfclib::xxfclib)
+        add_test(NAME xxemul_dotnet_resource_reader COMMAND xxemul_dotnet_resource_tests)
+    endif()
+
+    find_program(XXEMUL_DOTNET_CSC NAMES csc csc.exe mcs mcs.exe
+        DOC "Optional C# compiler for owned managed runtime regression fixtures")
+    if(XXEMUL_DOTNET_CSC)
+        get_filename_component(_compiler_name "${XXEMUL_DOTNET_CSC}" NAME)
+        set(_eh_assembly "${CMAKE_CURRENT_BINARY_DIR}/dotnet-fixtures/ExceptionCases.dll")
+        file(TO_NATIVE_PATH "${_eh_assembly}" _eh_native)
+        file(TO_NATIVE_PATH "${_managed_root}/tests/dotnet/ExceptionCases.cs" _eh_source)
+        if(_compiler_name MATCHES "^mcs(\\.exe)?$")
+            set(_compiler_options -nologo -target:library -optimize+ -debug- "-out:${_eh_native}")
+        else()
+            set(_compiler_options /nologo /target:library /optimize+ /debug- "/out:${_eh_native}")
+        endif()
+        add_custom_command(OUTPUT "${_eh_assembly}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/dotnet-fixtures"
+            COMMAND ${CMAKE_COMMAND} -E env --unset=LIB "${XXEMUL_DOTNET_CSC}" ${_compiler_options} "${_eh_source}"
+            DEPENDS "${_managed_root}/tests/dotnet/ExceptionCases.cs" VERBATIM)
+        add_custom_target(xxemul_dotnet_eh_fixture DEPENDS "${_eh_assembly}")
+        add_executable(xxemul_dotnet_eh_tests "${_managed_root}/tests/test_dotnet_eh.c")
+        target_include_directories(xxemul_dotnet_eh_tests PRIVATE "${_managed_root}/src")
+        target_link_libraries(xxemul_dotnet_eh_tests PRIVATE xxemul::xxemul xxfclib::xxfclib)
+        add_dependencies(xxemul_dotnet_eh_tests xxemul_dotnet_eh_fixture)
+        add_test(NAME xxemul_dotnet_exception_runtime COMMAND xxemul_dotnet_eh_tests "${_eh_assembly}")
+
+        set(_bcl_assembly "${CMAKE_CURRENT_BINARY_DIR}/dotnet-fixtures/BclCases.exe")
+        file(TO_NATIVE_PATH "${_bcl_assembly}" _bcl_native)
+        file(TO_NATIVE_PATH "${_managed_root}/tests/dotnet/BclCases.cs" _bcl_source)
+        if(_compiler_name MATCHES "^mcs(\\.exe)?$")
+            set(_bcl_options -nologo -target:exe -optimize+ -debug- "-out:${_bcl_native}")
+        else()
+            set(_bcl_options /nologo /target:exe /optimize+ /debug- "/out:${_bcl_native}")
+        endif()
+        add_custom_command(OUTPUT "${_bcl_assembly}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/dotnet-fixtures"
+            COMMAND ${CMAKE_COMMAND} -E env --unset=LIB "${XXEMUL_DOTNET_CSC}" ${_bcl_options} "${_bcl_source}"
+            DEPENDS "${_managed_root}/tests/dotnet/BclCases.cs" VERBATIM)
+        add_custom_target(xxemul_dotnet_bcl_fixture DEPENDS "${_bcl_assembly}")
+        add_executable(xxemul_dotnet_bcl_tests "${_managed_root}/tests/test_dotnet_bcl.c")
+        target_link_libraries(xxemul_dotnet_bcl_tests PRIVATE xxemul::xxemul xxfclib::xxfclib)
+        add_dependencies(xxemul_dotnet_bcl_tests xxemul_dotnet_bcl_fixture)
+        add_test(NAME xxemul_dotnet_bcl_services COMMAND xxemul_dotnet_bcl_tests "${_bcl_assembly}")
+
+        add_executable(xxemul_dotnet_windows_bridge_tests "${_managed_root}/tests/test_dotnet_windows_bridge.c")
+        target_link_libraries(xxemul_dotnet_windows_bridge_tests PRIVATE xxemul::xxemul xxfclib::xxfclib)
+        foreach(_platform IN ITEMS x86 x64)
+            set(_bridge_assembly "${CMAKE_CURRENT_BINARY_DIR}/dotnet-fixtures/BridgeCases-${_platform}.exe")
+            file(TO_NATIVE_PATH "${_bridge_assembly}" _bridge_native)
+            file(TO_NATIVE_PATH "${_managed_root}/tests/dotnet/BridgeCases.cs" _bridge_source)
+            if(_compiler_name MATCHES "^mcs(\\.exe)?$")
+                set(_bridge_options -nologo -target:exe -optimize+ -debug- "-platform:${_platform}" "-out:${_bridge_native}")
+            else()
+                set(_bridge_options /nologo /target:exe /optimize+ /debug- "/platform:${_platform}" "/out:${_bridge_native}")
+            endif()
+            add_custom_command(OUTPUT "${_bridge_assembly}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/dotnet-fixtures"
+                COMMAND ${CMAKE_COMMAND} -E env --unset=LIB "${XXEMUL_DOTNET_CSC}" ${_bridge_options} "${_bridge_source}"
+                DEPENDS "${_managed_root}/tests/dotnet/BridgeCases.cs" VERBATIM)
+            add_custom_target(xxemul_dotnet_bridge_fixture_${_platform} DEPENDS "${_bridge_assembly}")
+            add_dependencies(xxemul_dotnet_windows_bridge_tests xxemul_dotnet_bridge_fixture_${_platform})
+            add_test(NAME xxemul_dotnet_windows_bridge_${_platform} COMMAND xxemul_dotnet_windows_bridge_tests "${_bridge_assembly}")
+        endforeach()
+    endif()
+endfunction()
