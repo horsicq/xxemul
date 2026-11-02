@@ -1,6 +1,6 @@
 # xxemul
 
-`xxemul` is a pure C11 instruction emulator for x86, ARM, MIPS32 and Dalvik. It accepts a
+`xxemul` is a pure C11 instruction emulator for x86, ARM, MIPS32/MIPS64 and Dalvik. It accepts a
 caller-supplied flat region, or explicitly loads COM, MZ, PE32, PE64, ELF32,
 ELF64, Mach-O 32, and Mach-O 64 images. The loaders use format parsers from
 the sibling `xxfclib`.
@@ -253,7 +253,7 @@ execution are unsupported. Unsupported APIs and execution faults remain errors.
 ## Shared ELF API
 
 `xxemul/xxemul_elf.h` owns a guest CPU and mapped `ET_DYN` image for i386,
-x86-64, ARM32, AArch64 or MIPS32 o32. MIPS supports little and big endian;
+x86-64, ARM32, AArch64, MIPS32 o32 or MIPS64 n64. MIPS supports little and big endian;
 the other machines use little endian. `xxemul_elf_shared_create` maps PT_LOAD
 segments/BSS, allocates bounded auxiliary/stack arenas, and applies supported
 REL/RELA relocations. An explicit resolver receives each undefined symbol and
@@ -268,9 +268,17 @@ remain valid until `xxemul_elf_shared_destroy`. The input bytes need not outlive
 creation. ARM function addresses retain their Thumb bit.
 
 Unsupported relocations, TLS, IFUNC and packed relocations fail explicitly.
+The n64 profile supports 8-byte GOT entries, R_MIPS_64 and the common
+R_MIPS_REL32+R_MIPS_64 chain, with full-width registers and addresses. It uses
+`xxemul_mips64_state` and `xxemul_get_mips64_state` / `xxemul_set_mips64_state`;
+the MIPS32 state ABI remains unchanged. Linux n64 uses eight argument
+registers for function calls, a 16-byte aligned stack and 8-byte stack words.
+Only n64 shared objects are supported; static MIPS64 ET_EXEC is rejected.
+Official UPX 3.96, 4.2.4 and 5.2.1 reject ELF64 MIPS, so tests cover clean
+reconstruction and fresh execution separately from the unavailable UPX cycle.
 
 The ordinary ELF image constructors also load i386, AMD64, ARM32 EABI,
-AArch64 and both byte orders of MIPS32 o32
+AArch64 and both byte orders of MIPS32 o32 and MIPS64 n64
 shared libraries with PT_DYNAMIC, without PT_INTERP, DF_1_PIE or DT_NEEDED
 dependencies. Their ELF entry may be zero, or may alias DT_INIT when a valid
 SONAME identifies the library, as in the tested UPX shared-library wrapper.

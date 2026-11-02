@@ -120,6 +120,7 @@ add_library(xxemul
     src/xxemul_x86.c
     src/xxemul_arm.c
     src/xxemul_mips.c
+    src/xxemul_mips64.c
     src/xxemul_arm_simd.h
     src/xxemul_arm_auth.h
     src/xxemul_arm_auth_exec.h
@@ -392,6 +393,10 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
     add_executable(xxemul_mips_tests tests/test_mips.c)
     target_link_libraries(xxemul_mips_tests PRIVATE xxemul::xxemul)
     add_test(NAME xxemul_mips_tests COMMAND xxemul_mips_tests)
+
+    add_executable(xxemul_mips64_tests tests/test_mips64.c)
+    target_link_libraries(xxemul_mips64_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_mips64_tests COMMAND xxemul_mips64_tests)
     add_executable(xxemul_arm_memory_hook_tests tests/test_arm_memory_hooks.c)
     target_link_libraries(xxemul_arm_memory_hook_tests PRIVATE xxemul::xxemul)
     add_test(NAME xxemul_arm_memory_hook_tests COMMAND xxemul_arm_memory_hook_tests)
@@ -447,6 +452,21 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
                 --work "${CMAKE_CURRENT_BINARY_DIR}/elf-primary-mips"
                 --compiler "${XXEMUL_TEST_MIPS_C_COMPILER}")
         set_tests_properties(xxemul_elf_primary_mips_tests PROPERTIES TIMEOUT 180)
+    endif()
+    set(XXEMUL_TEST_MIPS64_C_COMPILER "${XXEMUL_TEST_MIPS_C_COMPILER}" CACHE FILEPATH "Existing MIPS Linux GCC supporting n64 LE/BE shared libraries")
+    if(Python3_Interpreter_FOUND AND EXISTS "${XXEMUL_TEST_MIPS64_C_COMPILER}")
+        add_executable(xxemul_elf_primary_mips64_tests tests/test_elf_primary_mips64.c)
+        target_link_libraries(xxemul_elf_primary_mips64_tests PRIVATE xxemul::xxemul)
+        add_executable(xxemul_linux_mips64_tests tests/test_linux_mips64.c)
+        target_include_directories(xxemul_linux_mips64_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(xxemul_linux_mips64_tests PRIVATE xxemul::xxemul)
+        add_test(NAME xxemul_elf_primary_mips64_tests
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_elf_primary_mips64_tests.py"
+                --test $<TARGET_FILE:xxemul_elf_primary_mips64_tests>
+                --kernel-test $<TARGET_FILE:xxemul_linux_mips64_tests>
+                --work "${CMAKE_CURRENT_BINARY_DIR}/elf-primary-mips64"
+                --compiler "${XXEMUL_TEST_MIPS64_C_COMPILER}")
+        set_tests_properties(xxemul_elf_primary_mips64_tests PROPERTIES TIMEOUT 180)
     endif()
     add_executable(xxemul_arm_thumb_state_tests tests/test_arm_thumb_state.c)
     target_link_libraries(xxemul_arm_thumb_state_tests PRIVATE xxemul::xxemul)
