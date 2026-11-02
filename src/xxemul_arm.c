@@ -1694,7 +1694,8 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
             if (status == XXEMUL_STATUS_OK) {
                 status = xxemul_arm_write_register(emulator, instruction.operand[0].reg, value);
             }
-            if (status == XXEMUL_STATUS_OK && instruction.name_id == CDISASM_ARM_NAME_MOVS) {
+            if (status == XXEMUL_STATUS_OK && (instruction.name_id == CDISASM_ARM_NAME_MOVS ||
+                (instruction.instruction_flags & CDISASM_ARM_INSTRUCTION_FLAG_SETS_FLAGS))) {
                 size = instruction.operand[0].size == 0u ? 4u : instruction.operand[0].size;
                 xxemul_arm_set_nz(emulator, value, size);
                 if (shift_carry_valid) {

@@ -67,8 +67,8 @@ can continue using the default full xxfclib profile.
   mapping, including zero-filled BSS and a minimal empty stack
 - Separate bounded ELF32/ELF64 `ET_DYN` API with shared-object relocations,
   explicit version-aware guest import resolution and constructor inventory
-- Primary Linux i386/AMD64, ARM/Thumb and AArch64 shared objects through the
-  image API, with SysV/AAPCS initialization and retained initialized exports
+- Primary Linux i386/AMD64, ARM/Thumb, AArch64 and MIPS32 o32 shared objects
+  through the image API, with native guest calling conventions and retained exports
 - ARM BX/BLX interworking and Thumb call/return address handling
 - Thin Mach-O executable segment mapping with `LC_MAIN` entry points and
   ARM64 UPX `LC_UNIXTHREAD` startup; compatible arm64/arm64e universal slices
@@ -252,8 +252,9 @@ execution are unsupported. Unsupported APIs and execution faults remain errors.
 
 ## Shared ELF API
 
-`xxemul/xxemul_elf.h` owns a guest CPU and mapped little-endian `ET_DYN` image
-for i386, x86-64, ARM32 or AArch64. `xxemul_elf_shared_create` maps PT_LOAD
+`xxemul/xxemul_elf.h` owns a guest CPU and mapped `ET_DYN` image for i386,
+x86-64, ARM32, AArch64 or MIPS32 o32. MIPS supports little and big endian;
+the other machines use little endian. `xxemul_elf_shared_create` maps PT_LOAD
 segments/BSS, allocates bounded auxiliary/stack arenas, and applies supported
 REL/RELA relocations. An explicit resolver receives each undefined symbol and
 its ELF version name and returns a guest address. Dependencies are never loaded
@@ -268,8 +269,8 @@ creation. ARM function addresses retain their Thumb bit.
 
 Unsupported relocations, TLS, IFUNC and packed relocations fail explicitly.
 
-The ordinary ELF image constructors also load little-endian i386, AMD64,
-ARM32 EABI and AArch64
+The ordinary ELF image constructors also load i386, AMD64, ARM32 EABI,
+AArch64 and both byte orders of MIPS32 o32
 shared libraries with PT_DYNAMIC, without PT_INTERP, DF_1_PIE or DT_NEEDED
 dependencies. Their ELF entry may be zero, or may alias DT_INIT when a valid
 SONAME identifies the library, as in the tested UPX shared-library wrapper.
@@ -285,6 +286,11 @@ metadata and is not used to invoke the library as an executable.
 ARM32 initializers and exports retain their Thumb function-pointer tags;
 debugger entry breakpoints use physical instruction addresses. ARM32 calls
 use AAPCS registers and an aligned SP, and AArch64 calls use x0-x2 and LR.
+MIPS calls use a0-a2, t9 for PIC entry, GP, ra and an aligned SP with o32
+argument home space. Return delay slots finish before the next constructor
+is scheduled. MIPS GOT dimensions and implicit local/global fixups are
+validated in the ELF byte order. Optional stale section headers do not block
+loading an otherwise valid shared image with complete runtime metadata.
 Linux `/proc/self/auxv` exposes the same guest-width auxiliary vector as the
 initial stack, with biased addresses for shared objects.
 Guest O_TMPFILE opens in `/dev/shm` create bounded anonymous in-memory files,

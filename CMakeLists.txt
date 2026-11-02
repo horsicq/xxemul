@@ -432,6 +432,22 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
     target_compile_features(xxemul_elf_shared_tests PRIVATE c_std_11)
     target_link_libraries(xxemul_elf_shared_tests PRIVATE xxemul::xxemul)
     add_test(NAME xxemul_elf_shared_tests COMMAND xxemul_elf_shared_tests)
+    set(XXEMUL_TEST_MIPS_C_COMPILER "" CACHE FILEPATH "Existing MIPS Linux GCC cross compiler supporting both o32 byte orders")
+    if(Python3_Interpreter_FOUND AND EXISTS "${XXEMUL_TEST_MIPS_C_COMPILER}")
+        add_executable(xxemul_elf_primary_mips_tests tests/test_elf_primary_mips.c)
+        target_link_libraries(xxemul_elf_primary_mips_tests PRIVATE xxemul::xxemul)
+        target_compile_features(xxemul_elf_primary_mips_tests PRIVATE c_std_11)
+        add_executable(xxemul_elf_shared_mips_imports_tests tests/test_elf_shared_mips_imports.c)
+        target_link_libraries(xxemul_elf_shared_mips_imports_tests PRIVATE xxemul::xxemul)
+        target_compile_features(xxemul_elf_shared_mips_imports_tests PRIVATE c_std_11)
+        add_test(NAME xxemul_elf_primary_mips_tests
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_elf_primary_mips_tests.py"
+                --test $<TARGET_FILE:xxemul_elf_primary_mips_tests>
+                --imports-test $<TARGET_FILE:xxemul_elf_shared_mips_imports_tests>
+                --work "${CMAKE_CURRENT_BINARY_DIR}/elf-primary-mips"
+                --compiler "${XXEMUL_TEST_MIPS_C_COMPILER}")
+        set_tests_properties(xxemul_elf_primary_mips_tests PROPERTIES TIMEOUT 180)
+    endif()
     add_executable(xxemul_arm_thumb_state_tests tests/test_arm_thumb_state.c)
     target_link_libraries(xxemul_arm_thumb_state_tests PRIVATE xxemul::xxemul)
     target_compile_features(xxemul_arm_thumb_state_tests PRIVATE c_std_11)

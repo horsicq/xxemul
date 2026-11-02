@@ -53,8 +53,10 @@ typedef struct xxemul_elf_result {
     char diagnostic[256];
 } xxemul_elf_result;
 
-/** Loads little-endian ET_DYN PT_LOAD segments and BSS, applies supported
+/** Loads supported ET_DYN PT_LOAD segments and BSS, applies supported
  * REL/RELA relocations, and owns its CPU. The input need not outlive this call.
+ * MIPS32 o32 and MIPS64 n64 support both byte orders and bounded primary-GOT
+ * relocations. Other supported machines use little-endian ELF.
  * Dependencies are supplied through the import resolver, never auto-loaded.
  * TLS, used IFUNC symbols, packed relocations and unknown relocation types
  * fail explicitly. Constructors are only
@@ -73,12 +75,15 @@ XXEMUL_API xxemul_status xxemul_elf_shared_find_export(const xxemul_elf_shared *
 XXEMUL_API size_t xxemul_elf_shared_initializer_count(const xxemul_elf_shared *module);
 XXEMUL_API xxemul_status xxemul_elf_shared_initializer_at(const xxemul_elf_shared *module, size_t index, uint64_t *address);
 
-/** Ordinary ELF image loading also admits bounded i386/amd64/ARM/AArch64
+/** Ordinary ELF image loading also admits bounded i386/amd64/ARM/AArch64/MIPS
  * ET_DYN libraries: no PT_INTERP, DF_1_PIE or DT_NEEDED. A self-named library
  * may also alias its DT_INIT in e_entry (as library packers do). Startup runs
  * DT_INIT before reading the live DT_INIT_ARRAY, with guest SysV or AAPCS
  * arguments. ARM callbacks select ARM/Thumb state from their address tag;
  * ARM/AArch64 use LR and an aligned SP for each initializer.
+ * MIPS o32 uses a0-a2, t9, ra and an aligned SP with argument home space;
+ * MIPS n64 uses 64-bit argument/PIC registers and a sixteen-byte aligned SP;
+ * returns are consumed only after their delay slot has executed.
  * Completion halts with load-result zero and retains initialized exports.
  * The borrowed info is NULL for ordinary executable/non-ELF images. */
 XXEMUL_API const xxemul_elf_shared_info *xxemul_elf_primary_get_info(const xxemul *emulator);

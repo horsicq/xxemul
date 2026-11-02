@@ -156,6 +156,12 @@ struct xxemul {
     uint8_t dos_dpmi_transition_depth;
     uint8_t dos_dpmi_resume_host;
     xxemul_elf_shared *elf_primary;
+    xxemul_mips64_state mips64;
+    uint64_t mips64_branch_target;
+    uint64_t mips64_reservation;
+    int mips64_delay_pending;
+    int mips64_reservation_valid;
+    unsigned mips64_reservation_size;
 };
 
 xxemul *xxemul_create_empty(xxemul_arch arch, xxemul_mode mode, uint64_t region_address, size_t region_size, xxemul_status *status);
@@ -205,5 +211,7 @@ size_t xxemul_arm_format_current(xxemul *emulator, char *buffer, size_t buffer_s
 
 xxemul_status xxemul_mips_step(xxemul *emulator, xxemul_step_info *info);
 size_t xxemul_mips_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
+xxemul_status xxemul_mips64_step(xxemul *emulator, xxemul_step_info *info);
+size_t xxemul_mips64_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
 
 #endif

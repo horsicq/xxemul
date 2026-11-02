@@ -28,7 +28,8 @@ static int xxemul_mode_matches_arch(xxemul_arch arch, xxemul_mode mode)
     if (arch == XXEMUL_ARCH_ARM) {
         return mode == XXEMUL_MODE_ARM_A32 || mode == XXEMUL_MODE_ARM_T32 || mode == XXEMUL_MODE_ARM_A64;
     }
-    if (arch == XXEMUL_ARCH_MIPS) return mode == XXEMUL_MODE_MIPS32 || mode == XXEMUL_MODE_MIPS32_BE;
+    if (arch == XXEMUL_ARCH_MIPS) return mode == XXEMUL_MODE_MIPS32 || mode == XXEMUL_MODE_MIPS32_BE ||
+        mode == XXEMUL_MODE_MIPS64 || mode == XXEMUL_MODE_MIPS64_BE;
     return 0;
 }
 
@@ -62,7 +63,7 @@ static int xxemul_config_addressable(const xxemul_config *config)
     last_address = config->region_address + (uint64_t)(config->region_size - 1);
     if ((config->mode == XXEMUL_MODE_X86_16 && last_address > UINT16_MAX) ||
         ((config->mode == XXEMUL_MODE_X86_32 || config->mode == XXEMUL_MODE_ARM_A32 || config->mode == XXEMUL_MODE_ARM_T32 ||
-          config->arch == XXEMUL_ARCH_MIPS) && last_address > UINT32_MAX)) {
+          config->mode == XXEMUL_MODE_MIPS32 || config->mode == XXEMUL_MODE_MIPS32_BE) && last_address > UINT32_MAX)) {
         return 0;
     }
     return config->entry_address >= config->region_address && config->entry_address <= last_address;
@@ -136,7 +137,7 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
     }
     xx_mem_copy(emulator->region_data, config->code, config->code_size);
 
-    stack_alignment = config->arch == XXEMUL_ARCH_ARM ? 16u : (config->arch == XXEMUL_ARCH_MIPS ? 8u :
+    stack_alignment = config->arch == XXEMUL_ARCH_ARM || config->mode == XXEMUL_MODE_MIPS64 || config->mode == XXEMUL_MODE_MIPS64_BE ? 16u : (config->arch == XXEMUL_ARCH_MIPS ? 8u :
         (config->mode == XXEMUL_MODE_X86_16 ? 2u : (config->mode == XXEMUL_MODE_X86_32 ? 4u : 8u)));
     stack_top = config->region_address + (uint64_t)config->region_size;
     stack_top &= ~((uint64_t)stack_alignment - UINT64_C(1));
@@ -146,8 +147,13 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
         emulator->x86.flags = UINT64_C(2);
         emulator->x86.gpr[XXEMUL_X86_RSP] = stack_top;
     } else if (config->arch == XXEMUL_ARCH_MIPS) {
-        emulator->mips.pc = (uint32_t)config->entry_address;
-        emulator->mips.gpr[29] = (uint32_t)stack_top;
+        if (config->mode == XXEMUL_MODE_MIPS64 || config->mode == XXEMUL_MODE_MIPS64_BE) {
+            emulator->mips64.pc = config->entry_address;
+            emulator->mips64.gpr[29] = stack_top;
+        } else {
+            emulator->mips.pc = (uint32_t)config->entry_address;
+            emulator->mips.gpr[29] = (uint32_t)stack_top;
+        }
     } else {
         emulator->arm.pc = config->entry_address;
         emulator->arm.sp = stack_top;
@@ -359,7 +365,10 @@ xxemul_status xxemul_write_memory(xxemul *emulator, uint64_t address, const void
     }
     /* Host/debugger writes and guest stores conservatively invalidate an
      * outstanding MIPS LL/SC reservation, including writes through mmap. */
-    if (emulator != NULL && emulator->arch == XXEMUL_ARCH_MIPS) emulator->mips_reservation_valid = 0;
+    if (emulator != NULL && emulator->arch == XXEMUL_ARCH_MIPS) {
+        emulator->mips_reservation_valid = 0;
+        emulator->mips64_reservation_valid = 0;
+    }
     if (emulator != NULL && buffer != NULL && emulator->linux_process != NULL) {
         mapped = xxemul_linux_mapping_write(emulator->linux_process, address, buffer, size);
         if (mapped != 0) return mapped > 0 ? XXEMUL_STATUS_OK : XXEMUL_STATUS_ADDRESS_FAULT;
@@ -486,7 +495,8 @@ xxemul_status xxemul_set_arm_state(xxemul *emulator, const xxemul_arm_state *sta
 
 xxemul_status xxemul_get_mips_state(const xxemul *emulator, xxemul_mips_state *state)
 {
-    if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_MIPS) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_MIPS ||
+        (emulator->mode != XXEMUL_MODE_MIPS32 && emulator->mode != XXEMUL_MODE_MIPS32_BE)) return XXEMUL_STATUS_INVALID_ARGUMENT;
     *state = emulator->mips;
     state->gpr[0] = 0;
     return XXEMUL_STATUS_OK;
@@ -494,12 +504,35 @@ xxemul_status xxemul_get_mips_state(const xxemul *emulator, xxemul_mips_state *s
 
 xxemul_status xxemul_set_mips_state(xxemul *emulator, const xxemul_mips_state *state)
 {
-    if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_MIPS || (state->pc & 3u))
+    if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_MIPS ||
+        (emulator->mode != XXEMUL_MODE_MIPS32 && emulator->mode != XXEMUL_MODE_MIPS32_BE) || (state->pc & 3u))
         return XXEMUL_STATUS_INVALID_ARGUMENT;
     if (emulator->mips.pc != state->pc) emulator->mips_delay_pending = 0;
     emulator->mips = *state;
     emulator->mips.gpr[0] = 0;
     emulator->mips_reservation_valid = 0;
+    emulator->halted = 0;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_get_mips64_state(const xxemul *emulator, xxemul_mips64_state *state)
+{
+    if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_MIPS ||
+        (emulator->mode != XXEMUL_MODE_MIPS64 && emulator->mode != XXEMUL_MODE_MIPS64_BE)) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    *state = emulator->mips64;
+    state->gpr[0] = 0;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_set_mips64_state(xxemul *emulator, const xxemul_mips64_state *state)
+{
+    if (emulator == NULL || state == NULL || emulator->arch != XXEMUL_ARCH_MIPS ||
+        (emulator->mode != XXEMUL_MODE_MIPS64 && emulator->mode != XXEMUL_MODE_MIPS64_BE) || (state->pc & 3u))
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (emulator->mips64.pc != state->pc) emulator->mips64_delay_pending = 0;
+    emulator->mips64 = *state;
+    emulator->mips64.gpr[0] = 0;
+    emulator->mips64_reservation_valid = 0;
     emulator->halted = 0;
     return XXEMUL_STATUS_OK;
 }
@@ -559,7 +592,9 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
             xxemul_windows_try_exception(emulator->windows, &emulator->x86, XXEMUL_WINDOWS_SINGLE_STEP_FAULT, info)) return XXEMUL_STATUS_OK;
         return status;
     }
-    if (emulator->arch == XXEMUL_ARCH_MIPS) return xxemul_mips_step(emulator, info);
+    if (emulator->arch == XXEMUL_ARCH_MIPS)
+        return emulator->mode == XXEMUL_MODE_MIPS64 || emulator->mode == XXEMUL_MODE_MIPS64_BE
+            ? xxemul_mips64_step(emulator, info) : xxemul_mips_step(emulator, info);
     if (emulator->darwin != NULL && xxemul_darwin_try_step(emulator->darwin, info, &status)) {
         if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
         return status;
@@ -605,7 +640,9 @@ size_t xxemul_format_current(xxemul *emulator, char *buffer, size_t buffer_size)
     if (emulator->arch == XXEMUL_ARCH_X86) {
         return xxemul_x86_format_current(emulator, buffer, buffer_size);
     }
-    if (emulator->arch == XXEMUL_ARCH_MIPS) return xxemul_mips_format_current(emulator, buffer, buffer_size);
+    if (emulator->arch == XXEMUL_ARCH_MIPS)
+        return emulator->mode == XXEMUL_MODE_MIPS64 || emulator->mode == XXEMUL_MODE_MIPS64_BE
+            ? xxemul_mips64_format_current(emulator, buffer, buffer_size) : xxemul_mips_format_current(emulator, buffer, buffer_size);
     return xxemul_arm_format_current(emulator, buffer, buffer_size);
 }
 
@@ -658,7 +695,10 @@ xxemul_status xxemul_get_current_address(const xxemul *emulator, uint64_t *addre
         *address = emulator->arm.pc;
         return XXEMUL_STATUS_OK;
     }
-    if (emulator->arch == XXEMUL_ARCH_MIPS) { *address = emulator->mips.pc; return XXEMUL_STATUS_OK; }
+    if (emulator->arch == XXEMUL_ARCH_MIPS) {
+        *address = emulator->mode == XXEMUL_MODE_MIPS64 || emulator->mode == XXEMUL_MODE_MIPS64_BE ? emulator->mips64.pc : emulator->mips.pc;
+        return XXEMUL_STATUS_OK;
+    }
     return xxemul_x86_linear_address(emulator, XXEMUL_X86_CS, emulator->x86.ip, address);
 }
 
@@ -672,7 +712,10 @@ xxemul_status xxemul_get_stack_address(const xxemul *emulator, uint64_t *address
         *address = emulator->arm.sp & (emulator->mode == XXEMUL_MODE_ARM_A64 ? UINT64_MAX : UINT32_MAX);
         return XXEMUL_STATUS_OK;
     }
-    if (emulator->arch == XXEMUL_ARCH_MIPS) { *address = emulator->mips.gpr[29]; return XXEMUL_STATUS_OK; }
+    if (emulator->arch == XXEMUL_ARCH_MIPS) {
+        *address = emulator->mode == XXEMUL_MODE_MIPS64 || emulator->mode == XXEMUL_MODE_MIPS64_BE ? emulator->mips64.gpr[29] : emulator->mips.gpr[29];
+        return XXEMUL_STATUS_OK;
+    }
     mask = emulator->mode == XXEMUL_MODE_X86_16 ? UINT16_MAX
         : emulator->mode == XXEMUL_MODE_X86_32 ? UINT32_MAX : UINT64_MAX;
     /* Match xxemul_x86_stack_mask: SS.B controls protected-mode stack

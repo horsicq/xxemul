@@ -37,6 +37,9 @@ typedef uint32_t xxemul_mode;
 #define XXEMUL_MODE_MIPS32 UINT32_C(0x201)
 #define XXEMUL_MODE_MIPS32_LE XXEMUL_MODE_MIPS32
 #define XXEMUL_MODE_MIPS32_BE UINT32_C(0x202)
+#define XXEMUL_MODE_MIPS64 UINT32_C(0x203)
+#define XXEMUL_MODE_MIPS64_LE XXEMUL_MODE_MIPS64
+#define XXEMUL_MODE_MIPS64_BE UINT32_C(0x204)
 
 typedef uint32_t xxemul_status;
 #define XXEMUL_STATUS_OK UINT32_C(0)
@@ -133,6 +136,15 @@ typedef struct xxemul_mips_state {
     uint32_t hi;
     uint32_t lo;
 } xxemul_mips_state;
+
+/* Separate n64 state preserves the existing MIPS32 public structure ABI.
+ * PC, integer registers and HI/LO retain all 64 bits in either byte order. */
+typedef struct xxemul_mips64_state {
+    uint64_t gpr[XXEMUL_MIPS_GPR_COUNT];
+    uint64_t pc;
+    uint64_t hi;
+    uint64_t lo;
+} xxemul_mips64_state;
 
 /**
  * Configuration for the initial flat-region backend.
@@ -238,6 +250,10 @@ XXEMUL_API xxemul_status xxemul_get_mips_state(const xxemul *emulator, xxemul_mi
 /* Changing PC cancels a pending delayed branch. Scalar register changes at
  * the same PC preserve it so a debugger can stop inside the delay slot. */
 XXEMUL_API xxemul_status xxemul_set_mips_state(xxemul *emulator, const xxemul_mips_state *state);
+XXEMUL_API xxemul_status xxemul_get_mips64_state(const xxemul *emulator, xxemul_mips64_state *state);
+/* As for MIPS32, a PC change cancels a delayed branch, while scalar changes
+ * at the same PC preserve it. Any state write invalidates LL/SC reservations. */
+XXEMUL_API xxemul_status xxemul_set_mips64_state(xxemul *emulator, const xxemul_mips64_state *state);
 
 XXEMUL_API xxemul_status xxemul_step(xxemul *emulator, xxemul_step_info *info);
 XXEMUL_API xxemul_status xxemul_run(xxemul *emulator, uint64_t instruction_limit, uint64_t *instructions_executed);
