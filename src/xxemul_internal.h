@@ -93,6 +93,11 @@ struct xxemul {
     unsigned fault_access;
     int fault_address_valid;
     xxemul_x86_state x86;
+    /* Deterministic virtual TSC: one tick per retired native x86 instruction.
+     * Starts at zero on creation, wraps modulo 2^64, and is independent of
+     * host time and debugger register/IP writes. OS-service dispatch and
+     * failed/undecoded instructions do not retire native instructions. */
+    uint64_t x86_tsc;
     double x87_stack[8];
     uint64_t x87_int_val[8];
     uint8_t x87_is_int[8];

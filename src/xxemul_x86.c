@@ -2639,6 +2639,15 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 status = XXEMUL_STATUS_OK;
             }
             break;
+        case CDISASM_X86_NAME_RDTSC:
+            if ((instruction.opcode_flags & CDISASM_PREFIX_LOCK) != 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            /* RDTSC always writes the full EDX:EAX pair, independently of
+             * operand size. 32-bit writes clear their upper register halves.
+             * This virtual CPU counts retired instructions, not host cycles. */
+            emulator->x86.gpr[XXEMUL_X86_RAX] = (uint32_t)emulator->x86_tsc;
+            emulator->x86.gpr[XXEMUL_X86_RDX] = (uint32_t)(emulator->x86_tsc >> 32);
+            status = XXEMUL_STATUS_OK;
+            break;
         case CDISASM_X86_NAME_CPUID: {
             uint32_t leaf = (uint32_t)emulator->x86.gpr[XXEMUL_X86_RAX];
             uint32_t eax = 0u, ebx = 0u, ecx = 0u, edx = 0u;
@@ -2649,7 +2658,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 ecx = UINT32_C(0x6c65746e);
             } else if (leaf == 1u) {
                 eax = UINT32_C(0x00000400);
-                edx = 1u;
+                edx = UINT32_C(0x11); /* FPU and virtual timestamp counter. */
             } else if (leaf == UINT32_C(0x80000000)) {
                 eax = UINT32_C(0x80000000);
             }
@@ -4824,6 +4833,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
     }
 
     if (status == XXEMUL_STATUS_OK || status == XXEMUL_STATUS_HALTED || status == XXEMUL_STATUS_BREAKPOINT) {
+        ++emulator->x86_tsc;
         if (emulator->dos_context_transfer) {
             next_ip = emulator->x86.ip;
             emulator->dos_context_transfer = 0u;

@@ -42,8 +42,9 @@
 #endif
 #endif
 
-#define WIN_RUNTIME_SIZE UINT64_C(0x100000)
-#define WIN_THUNK_OFFSET UINT64_C(0xe0000)
+#define WIN_RUNTIME_SIZE UINT64_C(0x200000)
+#define WIN_ALLOCATION_GRANULARITY UINT64_C(0x10000)
+#define WIN_THUNK_OFFSET UINT64_C(0x1e0000)
 #define WIN_THUNK_STRIDE UINT64_C(16)
 #define WIN_MAX_APIS 2048u
 #define WIN_MAX_THREADS 8u
@@ -51,7 +52,8 @@
 #define WIN_STATIC_TLS_SLOTS (WIN_MAX_MODULES + 1u)
 #define WIN_MAX_TLS_CALLBACKS 64u
 #define WIN_MODULE_OFFSET UINT64_C(0x20000)
-#define WIN_MODULE_STRIDE UINT64_C(0x8000)
+#define WIN_MODULE_STRIDE WIN_ALLOCATION_GRANULARITY
+#define WIN_BOOTSTRAP_SEH_OFFSET UINT64_C(0x1f000)
 #define WIN_MAX_HANDLES 64u
 #define WIN_MAX_ALLOCATIONS 4096u
 #define WIN_MAX_VECTORED_HANDLERS 64u
@@ -67,11 +69,11 @@
 #define WIN_INVALID_HANDLE UINT64_MAX
 #define WIN_CONSOLE_WIDTH 80
 #define WIN_CONSOLE_HEIGHT 25
-#define WIN_CRT_ARGV_OFFSET UINT64_C(0xf2000)
-#define WIN_CRT_ENVP_OFFSET UINT64_C(0xf2800)
-#define WIN_CRT_DATA_OFFSET UINT64_C(0xf1000)
-#define WIN_CRT_LOCALE_OFFSET UINT64_C(0xf3000)
-#define WIN_CRT_STRINGS_OFFSET UINT64_C(0xf4000)
+#define WIN_CRT_ARGV_OFFSET UINT64_C(0x1f2000)
+#define WIN_CRT_ENVP_OFFSET UINT64_C(0x1f2800)
+#define WIN_CRT_DATA_OFFSET UINT64_C(0x1f1000)
+#define WIN_CRT_LOCALE_OFFSET UINT64_C(0x1f3000)
+#define WIN_CRT_STRINGS_OFFSET UINT64_C(0x1f4000)
 #define WIN_QSORT_RETURN_OFFSET UINT64_C(0x8fe0)
 #define WIN_PROCESS_RETURN_OFFSET UINT64_C(0x8fd0)
 #define WIN_SEH_RETURN_OFFSET UINT64_C(0x8fc0)
@@ -1521,6 +1523,23 @@ static int win_main_program_name(const xxemul_windows *process, const char *name
     return win_equal(normalized, program) || win_equal(normalized, program + 3u) || win_equal(name, process->program_path);
 }
 
+/* Model the OS thread-start registration above the user entry stack. Its
+ * handler is ordinary mapped kernel32 code returning ExceptionContinueSearch;
+ * it never turns an unhandled guest exception into successful execution. */
+static int win_bootstrap_seh(xxemul_windows *process, win_thread_context *thread)
+{
+    win_module *kernel;
+    uint64_t record;
+    if (process->emulator->arch != XXEMUL_ARCH_X86 || win_word_size(process->emulator) != 4u) return 1;
+    kernel = win_find_module(process, "kernel32.dll", 1);
+    if (!kernel || kernel->real || thread->stack_base < thread->stack_limit + 0x100u) return 0;
+    record = (thread->stack_base & ~UINT64_C(15)) - 0x20u;
+    if (!win_store(process, record, 4u, UINT32_MAX) ||
+        !win_store(process, record + 4u, 4u, kernel->base + WIN_BOOTSTRAP_SEH_OFFSET)) return 0;
+    thread->seh_head = record;
+    return 1;
+}
+
 static int win_prepare_runtime(xxemul_windows *process, const char *const *arguments, size_t argument_count)
 {
     xxemul *emulator = process->emulator;
@@ -1541,7 +1560,7 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
     process->command_line_a = process->runtime_base + 0x6000u;
     process->command_line_w = process->runtime_base + 0x6800u;
     process->environment_a = process->runtime_base + 0x7800u;
-    process->iob_address = process->runtime_base + 0xf0000u;
+    process->iob_address = process->runtime_base + 0x1f0000u;
     process->argv_address = process->runtime_base + WIN_CRT_ARGV_OFFSET;
     process->envp_address = process->runtime_base + WIN_CRT_ENVP_OFFSET;
     memcpy(process->environment_data, "PATH=.\0", 8u);
@@ -1588,8 +1607,13 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
     process->loader_ready = 1u;
     if (!win_loader_lists(process)) return 0;
 
+    process->threads[0].stack_base = process->runtime_base;
+    process->threads[0].stack_limit = process->runtime_base - 0x40000u;
+    process->threads[0].seh_head = word_size == 4u ? UINT32_MAX : UINT64_MAX;
+    if (!win_bootstrap_seh(process, &process->threads[0])) return 0;
+
     if (word_size == 4u) {
-        if (!win_store(process, process->runtime_base, 4u, UINT32_MAX) ||
+        if (!win_store(process, process->runtime_base, 4u, process->threads[0].seh_head) ||
             !win_store(process, process->runtime_base + 0x04u, 4u, process->runtime_base) ||
             !win_store(process, process->runtime_base + 0x08u, 4u, process->runtime_base - 0x40000u) ||
             !win_store(process, process->runtime_base + 0x18u, 4u, process->runtime_base) ||
@@ -1698,7 +1722,13 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
             process->resource_size = win_le32(optional + dir_off + 20u);
         }
     }
-    process->runtime_base = emulator->region_address + emulator->region_size - WIN_RUNTIME_SIZE;
+    process->runtime_base = (emulator->region_address + emulator->region_size - WIN_RUNTIME_SIZE) &
+        ~(WIN_ALLOCATION_GRANULARITY - 1u);
+    if (process->runtime_base < emulator->region_address ||
+        process->runtime_base - emulator->region_address < (uint64_t)image_size + 0x80000u) {
+        free(process);
+        return NULL;
+    }
     process->threads[0].active = 1u;
     process->threads[0].id = 1u;
     process->threads[0].notify_started = 1u;
@@ -1908,10 +1938,13 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
 {
     static const char *const data_names[] = {"_iob", "__initenv", "__mb_cur_max", "_acmdln", "_commode", "_fmode", "_adjust_fdiv"};
     struct { const char *name; uint64_t address; } entries[WIN_MAX_APIS + 7u];
-    uint8_t *image = (uint8_t *)calloc(1u, (size_t)WIN_MODULE_STRIDE);
+    uint8_t *image;
     size_t order[WIN_MAX_APIS + 7u], count = 0u, i, j, cursor;
     uint32_t optional, directories, section, thunk_rva;
     int wide = win_word_size(process->emulator) == 8u;
+    int bootstrap = process->emulator->arch == XXEMUL_ARCH_X86 && !wide && win_equal(module->name, "kernel32.dll");
+    size_t slot_size = (size_t)WIN_MODULE_STRIDE * (bootstrap ? 2u : 1u);
+    image = (uint8_t *)calloc(1u, slot_size);
     if (image == NULL) return 0;
     for (i = 0u; i < process->api_count; ++i) {
         if (!win_equal(process->apis[i].module, module->name)) continue;
@@ -1936,7 +1969,7 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
     image[0] = 'M'; image[1] = 'Z'; win_put32(image + 0x3cu, 0x80u);
     memcpy(image + 0x80u, "PE\0\0", 4u);
     win_put16(image + 0x84u, process->emulator->arch == XXEMUL_ARCH_ARM ? (wide ? 0xaa64u : 0x1c0u) : (wide ? 0x8664u : 0x14cu));
-    win_put16(image + 0x86u, 2u);
+    win_put16(image + 0x86u, (uint16_t)(bootstrap ? 3u : 2u));
     win_put16(image + 0x94u, (uint16_t)(wide ? 0xf0u : 0xe0u));
     win_put16(image + 0x96u, 0x2022u);
     optional = 0x98u; directories = optional + (wide ? 112u : 96u);
@@ -1953,8 +1986,19 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
     section = optional + (wide ? 0xf0u : 0xe0u);
     memcpy(image + section, ".edata", 6u); win_put32(image + section + 8u, 0x7000u);
     win_put32(image + section + 12u, 0x1000u); win_put32(image + section + 36u, 0x40000040u);
-    memcpy(image + section + 40u, ".text", 5u); win_put32(image + section + 48u, WIN_MAX_APIS * 16u);
-    win_put32(image + section + 52u, thunk_rva); win_put32(image + section + 76u, 0x60000020u);
+    {
+        uint32_t text_section = section + (bootstrap ? 80u : 40u);
+        memcpy(image + text_section, ".text", 5u); win_put32(image + text_section + 8u, WIN_MAX_APIS * 16u);
+        win_put32(image + text_section + 12u, thunk_rva); win_put32(image + text_section + 36u, 0x60000020u);
+    }
+    if (bootstrap) {
+        static const uint8_t handler[] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3};
+        memcpy(image + section + 40u, ".seh", 4u);
+        win_put32(image + section + 48u, 0x1000u);
+        win_put32(image + section + 52u, (uint32_t)WIN_BOOTSTRAP_SEH_OFFSET);
+        win_put32(image + section + 76u, 0x60000020u);
+        memcpy(image + WIN_BOOTSTRAP_SEH_OFFSET, handler, sizeof(handler));
+    }
     win_put32(image + 0x100cu, 0x1040u); win_put32(image + 0x1010u, 1u);
     win_put32(image + 0x1014u, (uint32_t)count); win_put32(image + 0x1018u, (uint32_t)count);
     win_put32(image + 0x101cu, 0x1100u); win_put32(image + 0x1020u, 0x1900u); win_put32(image + 0x1024u, 0x2100u);
@@ -1969,7 +2013,7 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
         win_put16(image + 0x2100u + i * 2u, (uint16_t)i);
         memcpy(image + cursor, name, bytes); cursor += bytes;
     }
-    i = (size_t)win_write(process, module->base, image, (size_t)WIN_MODULE_STRIDE);
+    i = (size_t)win_write(process, module->base, image, slot_size);
     free(image); return i != 0u;
 }
 
@@ -2058,6 +2102,13 @@ static win_module *win_find_module(xxemul_windows *process, const char *name, in
     module = &process->modules[process->module_count];
     memcpy(module->name, normalized, strlen(normalized) + 1u);
     module->base = process->runtime_base + WIN_MODULE_OFFSET + process->module_count * WIN_MODULE_STRIDE;
+    /* kernel32's internal x86 thread-start handler has its own second code
+     * page. Keep all later modeled DLL reservations disjoint and 64-K aligned. */
+    if (process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u) {
+        for (i = 0u; i < process->module_count; ++i)
+            if (process->modules[i].live && !process->modules[i].real && win_equal(process->modules[i].name, "kernel32.dll"))
+                module->base += WIN_MODULE_STRIDE;
+    }
     module->building = 1u; module->live = 1u; ++process->module_count; checkpoint = process->api_count;
     for (i = 0u; i < sizeof(win_export_names) / sizeof(win_export_names[0]); ++i)
         if (win_export_for_module(module->name, win_export_names[i]) && !win_resolve(process, module->name, win_export_names[i])) goto failed;
@@ -5258,6 +5309,9 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
 #if XXEMUL_ENABLE_DOTNET
     if (win_equal(api->module, "mscoree.dll") && !strcmp(name, "_CorExeMain")) return win_managed_entry(process, result);
 #endif
+    /* The bounded CIL host does not implement the desktop CLR hosting/JIT
+     * contract. Unknown mscoree services must not fall through as S_OK. */
+    if (win_equal(api->module, "mscoree.dll")) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     if(win_equal(name,"CheckSumMappedFile")){
         uint64_t nt,signature,magic,header;uint32_t sum;const uint8_t *raw;
         uint32_t length=(uint32_t)arg[1];
@@ -5502,6 +5556,8 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
             else{
                 for(index=0u;index<process->module_count;++index){win_module *candidate=&process->modules[index];
                     uint64_t size=candidate->real?candidate->image_size:WIN_MODULE_STRIDE;
+                    if(!candidate->real && process->emulator->arch==XXEMUL_ARCH_X86 && win_word_size(process->emulator)==4u &&
+                        win_equal(candidate->name,"kernel32.dll"))size=WIN_MODULE_STRIDE*2u;
                     if(candidate->live&&address>=candidate->base&&address-candidate->base<size){module=candidate;break;}}
                 if(!module&&address>=process->runtime_base+WIN_THUNK_OFFSET&&
                    address-process->runtime_base-WIN_THUNK_OFFSET<process->api_count*WIN_THUNK_STRIDE){
@@ -9228,10 +9284,15 @@ static xxemul_status win_thread_create(xxemul_windows *process, const uint64_t *
     }
     thread->stack_base = stack + stack_size; thread->stack_limit = stack;
     thread->seh_head = width == 4u ? UINT32_MAX : UINT64_MAX;
+    if (!win_bootstrap_seh(process, thread)) {
+        win_thread_release_guest(process, thread);
+        process->last_error = 8u; return XXEMUL_STATUS_OK;
+    }
     thread->x87_control = 0x37fu;
     thread->cpu.flags = 0x202u;
     memcpy(thread->cpu.segment, process->emulator->x86.segment, sizeof(thread->cpu.segment));
     sp = (thread->stack_base & ~UINT64_C(15)) - (width == 8u ? 40u : 8u);
+    if (width == 4u) sp -= 0x40u; /* keep the OS registration above user pushes */
     thread->cpu.gpr[XXEMUL_X86_RSP] = sp;
     thread->start_address = arg[2];
     thread->cpu.ip = process->runtime_base + WIN_THREAD_START_OFFSET;
