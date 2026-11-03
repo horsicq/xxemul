@@ -384,6 +384,20 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
                     --test $<TARGET_FILE:xxemul_windows_find_window_tests>
                     --work "${CMAKE_CURRENT_BINARY_DIR}/windows-find-window-tests" --dialogs)
             set_tests_properties(xxemul_windows_find_window_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_toolhelp_tests tests/test_windows_toolhelp.c)
+            target_link_libraries(xxemul_windows_toolhelp_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_toolhelp_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_toolhelp_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-toolhelp-tests" --processes)
+            set_tests_properties(xxemul_windows_toolhelp_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_pointer_checks_tests tests/test_windows_pointer_checks.c)
+            target_link_libraries(xxemul_windows_pointer_checks_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_pointer_checks_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_pointer_checks_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-pointer-checks-tests")
+            set_tests_properties(xxemul_windows_pointer_checks_tests PROPERTIES TIMEOUT 60)
             add_executable(xxemul_windows_gui_abi_tests tests/test_windows_gui_abi.c)
             target_link_libraries(xxemul_windows_gui_abi_tests PRIVATE xxemul::xxemul)
             add_test(NAME xxemul_windows_gui_abi_tests

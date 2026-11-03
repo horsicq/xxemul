@@ -159,6 +159,18 @@ typedef struct win_find_state {
 } win_find_state;
 static void win_find_destroy(win_find_state *state);
 
+#define WIN_TOOLHELP_PROCESSES 8u
+typedef struct win_toolhelp_process {
+    uint32_t id,parent,threads;
+    uint8_t is64;
+    char name[260];
+} win_toolhelp_process;
+typedef struct win_toolhelp_snapshot {
+    win_toolhelp_process processes[WIN_TOOLHELP_PROCESSES];
+    size_t count,cursor;
+    uint32_t flags;
+} win_toolhelp_snapshot;
+
 #define WIN_FILE_ATTRIBUTE_SLOTS 128u
 typedef struct win_file_attribute {
     char path[2048];
@@ -176,6 +188,7 @@ typedef struct win_handle {
     uint16_t thread_slot;
     xx_io_device *io;
     win_find_state *find;
+    win_toolhelp_snapshot *snapshot;
     uint8_t *mapping_data;
     uint64_t mapping_size, view_address, view_allocation, view_size, view_offset, view_reference;
     uint32_t mapping_protect, view_access;
@@ -203,7 +216,8 @@ enum {
     WIN_HANDLE_THREAD = 6,
     WIN_HANDLE_HEAP = 7,
     WIN_HANDLE_MAPPING = 8,
-    WIN_HANDLE_FIND = 9
+    WIN_HANDLE_FIND = 9,
+    WIN_HANDLE_SNAPSHOT = 10
 };
 
 typedef struct win_allocation {
@@ -314,7 +328,7 @@ typedef struct win_thread_context {
 
 #define WIN_MAX_CHILDREN 8u
 #define WIN_CHILD_WAIT_OFFSET UINT64_C(0x8f60)
-typedef struct win_process_tree { uint32_t next_id, processes; uint64_t memory; } win_process_tree;
+typedef struct win_process_tree { uint32_t next_id, processes; uint64_t memory; xxemul_windows *root; } win_process_tree;
 typedef struct win_child_process {
     xxemul *emulator;
     uint32_t process_id, thread_id, exit_code, suspended;
@@ -902,7 +916,9 @@ static const char *const win_export_names[] = {"LoadLibraryA",
                                         "GetShortPathNameW"};
 
 static const char *const win_extra_export_names[] = {
-    "DisableThreadLibraryCalls", "lstrcmpiA", "lstrcmpiW", "CheckSumMappedFile",
+    "DisableThreadLibraryCalls", "lstrcmpi", "lstrcmpiA", "lstrcmpiW", "CheckSumMappedFile",
+    "CreateToolhelp32Snapshot", "Process32First", "Process32FirstW", "Process32Next", "Process32NextW",
+    "IsBadReadPtr",
     "MoveFileA",
     "FindResourceW", "FindResourceExW",
     "GetEnvironmentVariableA", "GetEnvironmentVariableW", "SetEnvironmentVariableA", "SetCurrentDirectoryA",
@@ -1123,10 +1139,13 @@ static int win_crt_api(const char *name)
 
 static uint8_t win_argument_count(const char *name)
 {
+    if(win_equal(name,"IsBadReadPtr"))return 2u;
+    if(win_equal(name,"CreateToolhelp32Snapshot") || win_equal(name,"Process32First") || win_equal(name,"Process32FirstW") ||
+       win_equal(name,"Process32Next") || win_equal(name,"Process32NextW"))return 2u;
     if (win_equal(name, "FindWindowA") || win_equal(name, "FindWindowW")) return 2u;
     if (win_equal(name, "NtQuerySystemInformation")) return 4u;
     if(win_equal(name,"DisableThreadLibraryCalls"))return 1u;
-    if(win_equal(name,"lstrcmpiA") || win_equal(name,"lstrcmpiW"))return 2u;
+    if(win_equal(name,"lstrcmpi") || win_equal(name,"lstrcmpiA") || win_equal(name,"lstrcmpiW"))return 2u;
     if(win_equal(name,"CheckSumMappedFile"))return 4u;
     if (win_equal(name,"MoveFileA") || win_equal(name,"MoveFileW")) return 2u;
     if (win_equal(name,"FindResourceA") || win_equal(name,"FindResourceW")) return 3u;
@@ -1871,6 +1890,7 @@ void xxemul_windows_destroy(xxemul_windows *process)
             (void)win_mapping_flush(process, &process->handles[i], process->handles[i].view_address, 0u);
         if (process->handles[i].in_use && process->handles[i].io != NULL) xx_io_close(process->handles[i].io);
         win_find_destroy(process->handles[i].find);
+        free(process->handles[i].snapshot);
         free(process->handles[i].mapping_data);
     }
     for (i = 0u; i < process->registry_value_count; ++i) free(process->registry_values[i].data);
@@ -3159,6 +3179,7 @@ static int win_close_handle(xxemul_windows *process, uint64_t handle)
     if (--root->references == 0u) {
         if (root->io != NULL) xx_io_close(root->io);
         win_find_destroy(root->find);
+        free(root->snapshot);
         free(root->mapping_data);
         memset(root, 0, sizeof(*root));
     }
@@ -3167,6 +3188,79 @@ static int win_close_handle(xxemul_windows *process, uint64_t handle)
 
 #include "xxemul_windows_mapping.inc"
 #include "xxemul_windows_process.inc"
+
+static int win_toolhelp_collect(win_toolhelp_snapshot *snapshot,const xxemul_windows *process,uint32_t parent,unsigned depth)
+{
+    size_t i;const char *name,*at;
+    if(depth>WIN_MAX_CHILDREN)return 0;
+    if(!process->process_terminated){
+        win_toolhelp_process *record;
+        if(snapshot->count>=WIN_TOOLHELP_PROCESSES)return 0;
+        record=&snapshot->processes[snapshot->count++];record->id=process->process_id;record->parent=parent;
+        record->is64=win_word_size(process->emulator)==8u;
+        for(i=0u;i<WIN_MAX_THREADS;++i)if(process->threads[i].active)++record->threads;
+        name=process->program_path;
+        for(at=name;*at;++at)if(*at=='/'||*at=='\\')name=at+1;
+        if(strlen(name)>=sizeof(record->name))return 0;
+        memcpy(record->name,name,strlen(name)+1u);
+    }
+    /* A retained exited parent's descendants can still be alive. */
+    for(i=0u;i<WIN_MAX_CHILDREN;++i){const win_child_process *child=&process->children[i];
+        if(child->active&&child->emulator&&child->emulator->windows &&
+           !win_toolhelp_collect(snapshot,child->emulator->windows,process->process_id,depth+1u))return 0;
+    }
+    return 1;
+}
+static uint64_t win_toolhelp_create(xxemul_windows *process,uint32_t flags,uint32_t id)
+{
+    win_toolhelp_snapshot *snapshot;win_handle *entry;size_t slot,i;
+    const xxemul_windows *root=process->process_tree?process->process_tree->root:process;
+    /* Other Toolhelp enumerators are not exported by this bounded model.
+     * Combined flags retain the actual process list without inventing heap,
+     * thread, or module enumeration records. */
+    if((flags&~UINT32_C(0x8000001f)) || !(flags&0x1fu)){process->last_error=87u;return WIN_INVALID_HANDLE;}
+    for(slot=0u;slot<WIN_MAX_HANDLES&&process->handles[slot].in_use;++slot){}
+    if(slot==WIN_MAX_HANDLES){process->last_error=4u;return WIN_INVALID_HANDLE;}
+    snapshot=(win_toolhelp_snapshot*)calloc(1,sizeof(*snapshot));
+    if(!snapshot){process->last_error=8u;return WIN_INVALID_HANDLE;}
+    if(!root || !win_toolhelp_collect(snapshot,root,0u,0u)){free(snapshot);process->last_error=8u;return WIN_INVALID_HANDLE;}
+    if(flags&0x19u){
+        uint32_t selected=id?id:process->process_id;
+        for(i=0u;i<snapshot->count&&snapshot->processes[i].id!=selected;++i){}
+        if(i==snapshot->count){free(snapshot);process->last_error=87u;return WIN_INVALID_HANDLE;}
+        if((flags&0x18u)&&win_word_size(process->emulator)==4u&&snapshot->processes[i].is64){free(snapshot);process->last_error=299u;return WIN_INVALID_HANDLE;}
+    }
+    snapshot->flags=flags;
+    if(!(flags&2u))snapshot->count=0u;
+    entry=&process->handles[slot];memset(entry,0,sizeof(*entry));
+    entry->kind=WIN_HANDLE_SNAPSHOT;entry->snapshot=snapshot;entry->references=1u;
+    entry->root_slot=(uint16_t)slot;entry->in_use=1u;entry->flags=(flags>>31u)&1u;
+    return 0x100u+slot;
+}
+static xxemul_status win_toolhelp_process_entry(xxemul_windows *process,const uint64_t *arg,int wide,int first,uint64_t *result)
+{
+    win_handle *entry=win_handle_at(process,arg[0]);win_toolhelp_snapshot *snapshot;
+    uint8_t output[0x238]={0};uint64_t declared;size_t index,i,name_offset,size;
+    int is64=win_word_size(process->emulator)==8u;
+    if(!entry||entry->kind!=WIN_HANDLE_SNAPSHOT||!entry->snapshot){process->last_error=6u;return XXEMUL_STATUS_OK;}
+    size=is64?(wide?0x238u:0x130u):(wide?0x22cu:0x128u);name_offset=is64?44u:36u;
+    if(!win_load(process,arg[1],4u,&declared)){process->last_error=998u;return XXEMUL_STATUS_OK;}
+    if(declared!=size){process->last_error=24u;return XXEMUL_STATUS_OK;}
+    snapshot=entry->snapshot;index=first?0u:snapshot->cursor;
+    if(index>=snapshot->count){process->last_error=18u;return XXEMUL_STATUS_OK;}
+    if(!win_memory_span(process,arg[1],size)){process->last_error=998u;return XXEMUL_STATUS_OK;}
+    win_put32(output,(uint32_t)size);win_put32(output+8u,snapshot->processes[index].id);
+    win_put32(output+(is64?28u:20u),snapshot->processes[index].threads);
+    win_put32(output+(is64?32u:24u),snapshot->processes[index].parent);
+    /* The virtual process model uses NORMAL_PRIORITY_CLASS (base priority 8). */
+    win_put32(output+(is64?36u:28u),8u);
+    for(i=0u;i<259u&&snapshot->processes[index].name[i];++i){
+        uint8_t ch=(uint8_t)snapshot->processes[index].name[i];
+        if(wide)win_put16(output+name_offset+i*2u,win_reg_ansi(ch));else output[name_offset+i]=ch;
+    }
+    if(!win_write(process,arg[1],output,size)){process->last_error=998u;return XXEMUL_STATUS_OK;}
+    snapshot->cursor=index+1u;*result=1u;return XXEMUL_STATUS_OK;
+}
 
 static uint64_t win_create_sync(xxemul_windows *process, uint8_t kind, uint64_t first, uint64_t second, uint64_t name_pointer)
 {
@@ -5412,7 +5506,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         (void)win_store(process,arg[2],4u,header);(void)win_store(process,arg[3],4u,sum);
         *result=arg[0]+nt;return XXEMUL_STATUS_OK;
     }
-    if(win_equal(name,"lstrcmpiA") || win_equal(name,"lstrcmpiW")){
+    if(win_equal(name,"lstrcmpi") || win_equal(name,"lstrcmpiA") || win_equal(name,"lstrcmpiW")){
         size_t position;uint8_t width=win_suffix(name,"W")?2u:1u;
         /* The process locale is en-US. The observed codec export identifiers
          * use ASCII letters/digits/underscore, whose case-insensitive ordering
@@ -5444,6 +5538,19 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         process->last_error = 120u;
         return XXEMUL_STATUS_OK;
     }
+    if(strcmp(name,"IsBadReadPtr")==0){
+        uint64_t maximum=word_size==8u?UINT64_MAX:UINT32_MAX;
+        /* The current Windows memory model exposes a flat readable mapping;
+         * page protections are not enforced by VirtualProtect or CPU reads.
+         * Test that real mapping without dereferencing guest/host addresses,
+         * consuming a guard page, or changing LastError. */
+        *result=arg[1] && (arg[0]>maximum || arg[1]-1u>maximum-arg[0] ||
+                           !win_memory_span(process,arg[0],arg[1]));
+        return XXEMUL_STATUS_OK;
+    }
+    if(strcmp(name,"CreateToolhelp32Snapshot")==0){*result=win_toolhelp_create(process,(uint32_t)arg[0],(uint32_t)arg[1]);return XXEMUL_STATUS_OK;}
+    if(strcmp(name,"Process32First")==0 || strcmp(name,"Process32FirstW")==0 || strcmp(name,"Process32Next")==0 || strcmp(name,"Process32NextW")==0)
+        return win_toolhelp_process_entry(process,arg,win_suffix(name,"W"),win_prefix(name,"Process32First"),result);
     if (strcmp(name,"FindWindowA")==0 || strcmp(name,"FindWindowW")==0)
         return win_gui_find_window(process,arg,win_suffix(name,"W"),result);
     if (strcmp(name,"DialogBoxParamA")==0 || strcmp(name,"DialogBoxParamW")==0) {

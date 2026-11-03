@@ -61,7 +61,7 @@ static void win_child_finish(win_child_process *child, uint32_t code)
         if(entry->kind==WIN_HANDLE_MAPPING && entry->view_address)
             (void)win_mapping_flush(process,entry,entry->view_address,0u);
         if(entry->io)xx_io_close(entry->io);
-        win_find_destroy(entry->find);free(entry->mapping_data);
+        win_find_destroy(entry->find);free(entry->snapshot);free(entry->mapping_data);
     }
     memset(process->handles,0,sizeof(process->handles));
     for(i=0u;i<WIN_MAX_THREADS;++i) {
@@ -282,7 +282,7 @@ static xxemul_status win_create_process(xxemul_windows *process, const uint64_t 
     if(!process->process_tree) {
         process->process_tree=(win_process_tree*)calloc(1,sizeof(*process->process_tree));
         if(!process->process_tree) { process->last_error=8u;return XXEMUL_STATUS_OK; }
-        process->tree_owner=1u;process->process_tree->processes=1u;
+        process->tree_owner=1u;process->process_tree->processes=1u;process->process_tree->root=process;
         process->process_tree->memory=process->emulator->region_size;
         process->process_tree->next_id=process->next_thread_id>0x1000u?process->next_thread_id:0x1000u;
     }
