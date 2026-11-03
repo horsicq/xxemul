@@ -51,7 +51,7 @@
 #define WIN_THUNK_STRIDE UINT64_C(16)
 #define WIN_MAX_APIS 2048u
 #define WIN_MAX_MODULE_APIS 512u
-#define WIN_MAX_THREADS 8u
+#define WIN_MAX_THREADS 32u
 #define WIN_MAX_MODULES 24u
 #define WIN_STATIC_TLS_SLOTS (WIN_MAX_MODULES + 1u)
 #define WIN_MAX_TLS_CALLBACKS 64u
@@ -1000,6 +1000,7 @@ static const char *const win_extra_export_names[] = {
     "GetNativeSystemInfo",
     "RegOpenKeyA", "RegOpenKeyW",
     "GetSystemDirectoryA", "GetWindowsDirectoryW",
+    "timeGetTime", "NtQuerySystemInformation",
 };
 
 static const char *const win_crt_names[] = {"_controlfp", "_except_handler3", "_filelength", "_filelengthi64", "_chsize", "_access", "__p___initenv", "_adjust_fdiv", "atexit", "atoi",
@@ -1122,6 +1123,7 @@ static int win_crt_api(const char *name)
 
 static uint8_t win_argument_count(const char *name)
 {
+    if (win_equal(name, "NtQuerySystemInformation")) return 4u;
     if(win_equal(name,"DisableThreadLibraryCalls"))return 1u;
     if(win_equal(name,"lstrcmpiA") || win_equal(name,"lstrcmpiW"))return 2u;
     if(win_equal(name,"CheckSumMappedFile"))return 4u;
@@ -1935,6 +1937,7 @@ static const char *win_export_owner(const char *name)
     if (win_equal(name, "LoadBitmapA") || win_equal(name, "DialogBoxParamA")) return "user32.dll";
     if (win_equal(name, "KillTimer") || win_equal(name, "wsprintfA") || win_equal(name, "wsprintfW") ||
         win_equal(name, "wvsprintfA") || win_equal(name, "wvsprintfW")) return "user32.dll";
+    if (win_equal(name, "timeGetTime")) return "winmm.dll";
     if (win_crt_api(name) || name[0] == '_' ||
         (islower((unsigned char)name[0]) && !win_prefix(name, "lstr"))) return "msvcrt.dll";
     if (win_prefix(name, "Rtl") || win_prefix(name, "Nt") || win_prefix(name, "Zw")) return "ntdll.dll";
@@ -7712,7 +7715,14 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         *result = 1u;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "GetTickCount") == 0 || strcmp(name, "GetTickCount64") == 0) {
+    if (strcmp(name, "NtQuerySystemInformation") == 0) {
+        /* No virtual kernel-module inventory/system-information classes are
+         * implemented yet. Report the real unsupported-service NTSTATUS;
+         * never claim success with untouched or invented kernel data. */
+        *result = UINT32_C(0xc0000002); /* STATUS_NOT_IMPLEMENTED */
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetTickCount") == 0 || strcmp(name, "GetTickCount64") == 0 || strcmp(name, "timeGetTime") == 0) {
         process->scheduler_tick += 10u;
         process->virtual_tick = (uint32_t)process->scheduler_tick;
         *result = strcmp(name, "GetTickCount64") == 0 ? process->scheduler_tick : process->virtual_tick;
