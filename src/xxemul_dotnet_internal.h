@@ -35,7 +35,7 @@ typedef struct xxemul_dotnet_class {
     uint32_t resolution_scope;
     int is_generic, has_method_impl;
     char *name;
-    uint32_t field_begin, field_end, method_begin, method_end; /* 1-based RIDs */
+    uint32_t field_begin, field_end, method_begin, method_end; /* 1-based list slots (Ptr rows when present). */
 } xxemul_dotnet_class;
 
 typedef struct xxemul_dotnet_field {

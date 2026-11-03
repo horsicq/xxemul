@@ -2643,7 +2643,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             if ((instruction.opcode_flags & CDISASM_PREFIX_LOCK) != 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             /* RDTSC always writes the full EDX:EAX pair, independently of
              * operand size. 32-bit writes clear their upper register halves.
-             * This virtual CPU counts retired instructions, not host cycles. */
+             * This virtual CPU counts completed native steps, not host cycles. */
             emulator->x86.gpr[XXEMUL_X86_RAX] = (uint32_t)emulator->x86_tsc;
             emulator->x86.gpr[XXEMUL_X86_RDX] = (uint32_t)(emulator->x86_tsc >> 32);
             status = XXEMUL_STATUS_OK;
@@ -4431,27 +4431,44 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             break;
         case CDISASM_X86_NAME_LGDT:
         case CDISASM_X86_NAME_LIDT:
-        case CDISASM_X86_NAME_SGDT:
-        case CDISASM_X86_NAME_SIDT:
             if (!emulator->dos_mode || instruction.operand_count != 1u || instruction.opcode[0].type != CDISASM_OPERAND_MEMORY || instruction.opcode[0].size != 6u)
                 return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-            if (instruction.name_id == CDISASM_X86_NAME_LGDT || instruction.name_id == CDISASM_X86_NAME_LIDT) {
-                status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[0], next_ip, &right);
-                if (status != XXEMUL_STATUS_OK) return status;
-                if ((instruction.opcode_flags & CDISASM_PREFIX_OPERAND_SIZE) == 0u && emulator->mode == XXEMUL_MODE_X86_16) right &= UINT64_C(0xffffffffff);
-                if (instruction.name_id == CDISASM_X86_NAME_LGDT) {
-                    emulator->dos_gdtr_limit = (uint16_t)right;
-                    emulator->dos_gdtr_base = (uint32_t)(right >> 16u);
-                } else {
-                    emulator->dos_idtr_limit = (uint16_t)right;
-                    emulator->dos_idtr_base = (uint32_t)(right >> 16u);
-                }
+            status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[0], next_ip, &right);
+            if (status != XXEMUL_STATUS_OK) return status;
+            if ((instruction.opcode_flags & CDISASM_PREFIX_OPERAND_SIZE) == 0u && emulator->mode == XXEMUL_MODE_X86_16) right &= UINT64_C(0xffffffffff);
+            if (instruction.name_id == CDISASM_X86_NAME_LGDT) {
+                emulator->dos_gdtr_limit = (uint16_t)right;
+                emulator->dos_gdtr_base = (uint32_t)(right >> 16u);
             } else {
-                right = instruction.name_id == CDISASM_X86_NAME_SGDT ? ((uint64_t)emulator->dos_gdtr_base << 16u) | emulator->dos_gdtr_limit
-                                                                     : ((uint64_t)emulator->dos_idtr_base << 16u) | emulator->dos_idtr_limit;
-                status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, right);
+                emulator->dos_idtr_limit = (uint16_t)right;
+                emulator->dos_idtr_base = (uint32_t)(right >> 16u);
             }
             break;
+        case CDISASM_X86_NAME_SGDT:
+        case CDISASM_X86_NAME_SIDT: {
+            cdisasm_x86_operand destination;
+            uint64_t address;
+            uint8_t bytes[10] = {0};
+            uint32_t base;
+            uint16_t limit;
+            unsigned i;
+            if ((instruction.opcode_flags & CDISASM_PREFIX_LOCK) != 0u || instruction.operand_count != 1u ||
+                instruction.opcode[0].type != CDISASM_OPERAND_MEMORY) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            /* The flat native CPU shares the stored virtual descriptor state
+             * with DOS. A fresh instance has zero tables; no host addresses or
+             * protector-specific values are synthesized. Bases are currently
+             * 32-bit, zero-extended in the architectural 10-byte long-mode form.
+             * Legacy stores retain the existing six-byte DOS behavior. */
+            base = instruction.name_id == CDISASM_X86_NAME_SGDT ? emulator->dos_gdtr_base : emulator->dos_idtr_base;
+            limit = instruction.name_id == CDISASM_X86_NAME_SGDT ? emulator->dos_gdtr_limit : emulator->dos_idtr_limit;
+            destination = instruction.opcode[0];
+            destination.size = emulator->mode == XXEMUL_MODE_X86_64 ? 10u : 6u;
+            bytes[0] = (uint8_t)limit;
+            bytes[1] = (uint8_t)(limit >> 8u);
+            for (i = 0u; i < 4u; ++i) bytes[i + 2u] = (uint8_t)(base >> (i * 8u));
+            status = xxemul_x86_effective_address(emulator, &instruction, &destination, next_ip, &address);
+            if (status == XXEMUL_STATUS_OK) status = xxemul_x86_guest_memory(emulator, address, bytes, destination.size, 1);
+        } break;
         case CDISASM_X86_NAME_LMSW:
             if (!emulator->dos_mode || instruction.operand_count != 1u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[0], next_ip, &right);
@@ -4492,10 +4509,23 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 emulator->dos_tr_base = (uint32_t)descriptor[2] | ((uint32_t)descriptor[3] << 8u) | ((uint32_t)descriptor[4] << 16u) | ((uint32_t)descriptor[7] << 24u);
             }
             break;
-        case CDISASM_X86_NAME_STR:
-            if (!emulator->dos_mode || instruction.operand_count != 1u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-            status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, emulator->dos_tr_selector);
-            break;
+        case CDISASM_X86_NAME_SLDT:
+        case CDISASM_X86_NAME_STR: {
+            cdisasm_x86_operand destination;
+            if ((instruction.opcode_flags & CDISASM_PREFIX_LOCK) != 0u || instruction.operand_count != 1u ||
+                (instruction.opcode[0].type != CDISASM_OPERAND_REGISTER && instruction.opcode[0].type != CDISASM_OPERAND_MEMORY))
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            if (instruction.name_id == CDISASM_X86_NAME_SLDT && emulator->dos_mode &&
+                ((emulator->dos_cr0 & 1u) == 0u || (emulator->x86.flags & XXEMUL_X86_FLAG_VM) != 0u))
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            destination = instruction.opcode[0];
+            /* Memory always receives exactly a selector word. Register writes
+             * follow the decoded width: AX preserves upper bits; EAX and RAX
+             * zero-extend, choosing deterministic modern-CPU semantics. */
+            if (destination.type == CDISASM_OPERAND_MEMORY) destination.size = 2u;
+            status = xxemul_x86_write_operand(emulator, &instruction, &destination, next_ip,
+                                              instruction.name_id == CDISASM_X86_NAME_SLDT ? emulator->dos_ldtr_selector : emulator->dos_tr_selector);
+        } break;
         case CDISASM_X86_NAME_CBW: status = xxemul_x86_write_register(emulator, CDISASM_X86_REG_AX, xxemul_sign_extend(emulator->x86.gpr[XXEMUL_X86_RAX], 1u)); break;
         case CDISASM_X86_NAME_CWDE: status = xxemul_x86_write_register(emulator, CDISASM_X86_REG_EAX, xxemul_sign_extend(emulator->x86.gpr[XXEMUL_X86_RAX], 2u)); break;
         case CDISASM_X86_NAME_CDQE: status = xxemul_x86_write_register(emulator, CDISASM_X86_REG_RAX, xxemul_sign_extend(emulator->x86.gpr[XXEMUL_X86_RAX], 4u)); break;

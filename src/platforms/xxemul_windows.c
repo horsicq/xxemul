@@ -44,9 +44,13 @@
 
 #define WIN_RUNTIME_SIZE UINT64_C(0x200000)
 #define WIN_ALLOCATION_GRANULARITY UINT64_C(0x10000)
-#define WIN_THUNK_OFFSET UINT64_C(0x1e0000)
+#define WIN_OS_VERSION_MAJOR 10u
+#define WIN_OS_VERSION_MINOR 0u
+#define WIN_OS_VERSION_BUILD 19045u
+#define WIN_MODULE_THUNK_RVA UINT64_C(0x8000)
 #define WIN_THUNK_STRIDE UINT64_C(16)
 #define WIN_MAX_APIS 2048u
+#define WIN_MAX_MODULE_APIS 512u
 #define WIN_MAX_THREADS 8u
 #define WIN_MAX_MODULES 24u
 #define WIN_STATIC_TLS_SLOTS (WIN_MAX_MODULES + 1u)
@@ -107,6 +111,7 @@ typedef struct win_api {
     char module[48];
     char name[96];
     char qualified[145];
+    uint64_t address;
     uint8_t argument_count;
     uint8_t caller_cleans;
 } win_api;
@@ -122,6 +127,8 @@ typedef struct win_tls_image {
 typedef struct win_module {
     char name[48];
     uint64_t base;
+    uint16_t api_indices[WIN_MAX_MODULE_APIS];
+    uint16_t api_count;
     uint8_t building;
     uint64_t image_size, allocation, init_order;
     uint32_t generation, references, entry_rva, export_rva, export_size, resource_rva, resource_size, dependencies;
@@ -990,6 +997,9 @@ static const char *const win_extra_export_names[] = {
 #if XXEMUL_ENABLE_DOTNET
     "_CorExeMain",
 #endif
+    "GetNativeSystemInfo",
+    "RegOpenKeyA", "RegOpenKeyW",
+    "GetSystemDirectoryA", "GetWindowsDirectoryW",
 };
 
 static const char *const win_crt_names[] = {"_controlfp", "_except_handler3", "_filelength", "_filelengthi64", "_chsize", "_access", "__p___initenv", "_adjust_fdiv", "atexit", "atoi",
@@ -1223,7 +1233,7 @@ static uint8_t win_argument_count(const char *name)
         win_equal(name, "FileTimeToDosDateTime") || win_equal(name, "DosDateTimeToFileTime") || win_equal(name, "GetShortPathNameA") || win_equal(name, "OpenThread") ||
         win_equal(name, "SafeArrayCreate") || win_equal(name, "SafeArrayGetElement") || win_equal(name, "SafeArrayGetLBound") || win_equal(name, "SafeArrayGetUBound") ||
         win_equal(name, "SafeArrayPtrOfIndex") || win_equal(name, "SafeArrayPutElement") || win_equal(name, "GetWindowTextA") || win_equal(name, "OemToCharBuffA") ||
-        win_equal(name, "fseek"))
+        win_equal(name, "fseek") || win_equal(name, "RegOpenKeyA") || win_equal(name, "RegOpenKeyW"))
         return 3u;
     if (win_equal(name, "GetProcAddress") || win_equal(name, "AddVectoredExceptionHandler") || win_equal(name, "WaitForSingleObject") ||
         win_equal(name, "GetCurrentDirectoryA") || win_equal(name, "GetCurrentDirectoryW") || win_equal(name, "GetFileSize") || win_equal(name, "GetFileSizeEx") ||
@@ -1242,7 +1252,8 @@ static uint8_t win_argument_count(const char *name)
         win_equal(name, "ConvertStringSidToSidW") || win_equal(name, "ConvertSidToStringSidW") || win_equal(name, "CharToOemA") || win_equal(name, "OemToCharA") ||
         win_equal(name, "ExitWindowsEx") || win_equal(name, "SHGetPathFromIDListW") || win_equal(name, "FileTimeToSystemTime") ||
         win_equal(name, "SystemTimeToFileTime") || win_equal(name, "CreateDirectoryW") || win_equal(name, "MoveFileW") || win_equal(name, "SetEnvironmentVariableW") ||
-        win_equal(name, "GetCPInfo") || win_equal(name, "GetExitCodeProcess") || win_equal(name, "GetWindowsDirectoryA") || win_equal(name, "GetSystemDirectoryW") ||
+        win_equal(name, "GetCPInfo") || win_equal(name, "GetExitCodeProcess") || win_equal(name, "GetWindowsDirectoryA") || win_equal(name, "GetWindowsDirectoryW") ||
+        win_equal(name, "GetSystemDirectoryA") || win_equal(name, "GetSystemDirectoryW") ||
         win_equal(name, "LocalFileTimeToFileTime") || win_equal(name, "FileTimeToLocalFileTime") || win_equal(name, "LoadResource") ||
         win_equal(name, "SizeofResource") || win_equal(name, "SetStdHandle") || win_equal(name, "SleepEx") || win_equal(name, "TerminateProcess") ||
         win_equal(name, "TerminateThread") || win_equal(name, "SafeArrayAccessData") || win_equal(name, "SafeArrayRedim") || win_equal(name, "VariantCopy") ||
@@ -1268,7 +1279,7 @@ static uint8_t win_argument_count(const char *name)
         win_equal(name, "GetVersionExW") || win_equal(name, "GetSystemTime") || win_equal(name, "GetShortPathNameW") || win_equal(name, "IsDBCSLeadByte") ||
         win_equal(name, "SetDllDirectoryW") || win_equal(name, "SetDllDirectoryA") || win_equal(name, "AreFileApisANSI") || win_equal(name, "GetCPInfo") ||
         win_equal(name, "OutputDebugStringA") || win_equal(name, "SetEvent") || win_equal(name, "ResetEvent") || win_equal(name, "SetLastError") ||
-        win_equal(name, "GetStartupInfoA") || win_equal(name, "GetSystemInfo") || win_equal(name, "GetActiveProcessorGroupCount") ||
+        win_equal(name, "GetStartupInfoA") || win_equal(name, "GetSystemInfo") || win_equal(name, "GetNativeSystemInfo") || win_equal(name, "GetActiveProcessorGroupCount") ||
         win_equal(name, "GetActiveProcessorCount") || win_equal(name, "ResumeThread") || win_equal(name, "SuspendThread") || win_equal(name, "Sleep") ||
         win_equal(name, "__set_app_type") || win_equal(name, "__setusermatherr") || win_equal(name, "malloc") || win_equal(name, "free") || win_equal(name, "strlen") ||
         win_equal(name, "wcslen") || win_equal(name, "_strdup") || win_equal(name, "_onexit") || win_equal(name, "_time64") || win_equal(name, "time") ||
@@ -1316,6 +1327,27 @@ static const char *win_data_symbol(const xxemul_windows *process, uint64_t addre
     return NULL;
 }
 
+/* Function addresses belong to the PE that exports them. Guest loaders may
+ * discover a module by scanning backwards from an imported function. */
+static size_t win_api_index(const xxemul_windows *process, uint64_t address)
+{
+    size_t i;
+    if (address < process->runtime_base + WIN_MODULE_OFFSET) return SIZE_MAX;
+    for (i = 0u; i < process->module_count; ++i) {
+        const win_module *module = &process->modules[i];
+        uint64_t first, offset;
+        size_t index;
+        if (!module->live || module->real) continue;
+        first = module->base + WIN_MODULE_THUNK_RVA;
+        if (address < first) continue;
+        offset = address - first;
+        if (offset >= (uint64_t)module->api_count * WIN_THUNK_STRIDE || offset % WIN_THUNK_STRIDE) continue;
+        index = module->api_indices[offset / WIN_THUNK_STRIDE];
+        if (index < process->api_count && process->apis[index].address == address) return index;
+    }
+    return SIZE_MAX;
+}
+
 static uint64_t win_resolve(xxemul_windows *process, const char *module, const char *name)
 {
     size_t i;
@@ -1342,9 +1374,9 @@ static uint64_t win_resolve(xxemul_windows *process, const char *module, const c
     }
     for (i = 0; i < process->api_count; ++i) {
         if (win_equal(process->apis[i].module, module) && strcmp(process->apis[i].name, name) == 0)
-            return process->runtime_base + WIN_THUNK_OFFSET + i * WIN_THUNK_STRIDE;
+            return process->apis[i].address;
     }
-    if (process->api_count >= WIN_MAX_APIS) return 0;
+    if (process->api_count >= WIN_MAX_APIS || mapped->api_count >= WIN_MAX_MODULE_APIS) return 0;
     api = &process->apis[process->api_count];
     if (!win_copy(api->module, sizeof(api->module), module) || !win_copy(api->name, sizeof(api->name), name)) return 0;
     snprintf(api->qualified, sizeof(api->qualified), "%s!%s", api->module, api->name);
@@ -1353,12 +1385,16 @@ static uint64_t win_resolve(xxemul_windows *process, const char *module, const c
     if (process->emulator->mode == XXEMUL_MODE_X86_64 && strcmp(name, "_lseeki64") == 0) api->argument_count = 3u;
     if (process->emulator->mode == XXEMUL_MODE_X86_64 && strcmp(name, "_chsize_s") == 0) api->argument_count = 2u;
     api->caller_cleans = (uint8_t)(is_crt || win_equal(name, "wsprintfA") || win_equal(name, "wsprintfW"));
-    address = process->runtime_base + WIN_THUNK_OFFSET + process->api_count * WIN_THUNK_STRIDE;
+    address = mapped->base + WIN_MODULE_THUNK_RVA + mapped->api_count * WIN_THUNK_STRIDE;
     /* Dispatch is address based; an INT3 byte would falsely trip guest
      * anti-debug checks that inspect the imported function's prologue. */
     if (!win_store(process, address, 1u, 0x90u) || !win_store(process, address + 1u, 1u, 0xc3u)) return 0;
+    api->address = address;
+    mapped->api_indices[mapped->api_count++] = (uint16_t)process->api_count;
     ++process->api_count;
-    if (!mapped->building && !win_module_exports(process, mapped)) return 0;
+    if (!mapped->building && !win_module_exports(process, mapped)) {
+        --mapped->api_count; --process->api_count; memset(api, 0, sizeof(*api)); return 0;
+    }
     return address;
 }
 
@@ -1859,41 +1895,36 @@ uint32_t xxemul_windows_exit_code(const xxemul_windows *process)
 const char *xxemul_windows_thunk_name(const xxemul *emulator, uint64_t address)
 {
     const xxemul_windows *process;
-    uint64_t offset, index;
+    size_t index;
     if (emulator == NULL || emulator->windows == NULL) return NULL;
     process = emulator->windows;
     {
         const char *data_name = win_data_symbol(process, address, 0);
         if (data_name) return data_name;
     }
-    if (address < process->runtime_base + WIN_THUNK_OFFSET) return NULL;
-    offset = address - process->runtime_base - WIN_THUNK_OFFSET;
-    if (offset % WIN_THUNK_STRIDE != 0u) return NULL;
-    index = offset / WIN_THUNK_STRIDE;
+    index = win_api_index(process, address);
     return index < process->api_count ? process->apis[index].name : NULL;
 }
 
 const char *xxemul_windows_thunk_qualified_name(const xxemul *emulator, uint64_t address)
 {
     const xxemul_windows *process;
-    uint64_t offset, index;
+    size_t index;
     if (emulator == NULL || emulator->windows == NULL) return NULL;
     process = emulator->windows;
     {
         const char *data_name = win_data_symbol(process, address, 1);
         if (data_name) return data_name;
     }
-    if (address < process->runtime_base + WIN_THUNK_OFFSET) return NULL;
-    offset = address - process->runtime_base - WIN_THUNK_OFFSET;
-    if (offset % WIN_THUNK_STRIDE != 0u) return NULL;
-    index = offset / WIN_THUNK_STRIDE;
+    index = win_api_index(process, address);
     return index < process->api_count ? process->apis[index].qualified : NULL;
 }
 
-/* These are readable modeled modules, not copies of host DLLs. Their export
- * RVAs point into the same runtime's address-dispatched API thunk pool. */
+/* These are readable modeled modules, not copies of host DLLs. Each module
+ * contains its own address-dispatched API thunks in its .text section. */
 static const char *win_export_owner(const char *name)
 {
+    if (win_equal(name, "GetWindowsDirectoryA") || win_equal(name, "GetWindowsDirectoryW")) return "kernel32.dll";
     if(win_equal(name,"CheckSumMappedFile"))return "imagehlp.dll";
     if (win_equal(name, "SetTimer") || win_equal(name, "MoveWindow")) return "user32.dll";
     if (win_prefix(name,"DialogBox") || win_prefix(name,"EndDialog") || win_prefix(name,"GetDlgItem") || win_prefix(name,"SetDlgItem") || win_prefix(name,"SendDlgItem") || win_prefix(name,"SendMessage") || win_prefix(name,"LoadIcon")) return "user32.dll";
@@ -1944,17 +1975,23 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
     int wide = win_word_size(process->emulator) == 8u;
     int bootstrap = process->emulator->arch == XXEMUL_ARCH_X86 && !wide && win_equal(module->name, "kernel32.dll");
     size_t slot_size = (size_t)WIN_MODULE_STRIDE * (bootstrap ? 2u : 1u);
+    uint64_t image_size = slot_size;
     image = (uint8_t *)calloc(1u, slot_size);
     if (image == NULL) return 0;
     for (i = 0u; i < process->api_count; ++i) {
         if (!win_equal(process->apis[i].module, module->name)) continue;
         entries[count].name = process->apis[i].name;
-        entries[count].address = process->runtime_base + WIN_THUNK_OFFSET + i * WIN_THUNK_STRIDE;
+        entries[count].address = process->apis[i].address;
+        image[entries[count].address - module->base] = 0x90u;
+        image[entries[count].address - module->base + 1u] = 0xc3u;
         ++count;
     }
     for (i = 0u; i < sizeof(data_names) / sizeof(data_names[0]); ++i) {
         if (!win_export_for_module(module->name, data_names[i])) continue;
         entries[count].name = data_names[i]; entries[count].address = win_resolve(process, module->name, data_names[i]);
+        /* CRT globals retain their existing shared mutable arena. Other
+         * modeled DLLs describe only their own reserved PE allocation. */
+        image_size = process->runtime_base + WIN_RUNTIME_SIZE - module->base;
         ++count;
     }
     for (i = 0u; i < count; ++i) {
@@ -1978,25 +2015,31 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
     else win_put32(image + optional + 28u, (uint32_t)module->base);
     win_put32(image + optional + 32u, 0x1000u); win_put32(image + optional + 36u, 0x200u);
     win_put16(image + optional + 40u, 6u); win_put16(image + optional + 48u, 6u);
-    thunk_rva = (uint32_t)(process->runtime_base + WIN_THUNK_OFFSET - module->base);
-    win_put32(image + optional + 56u, (uint32_t)(process->runtime_base + WIN_RUNTIME_SIZE - module->base));
+    thunk_rva = (uint32_t)WIN_MODULE_THUNK_RVA;
+    win_put32(image + optional + 56u, (uint32_t)image_size);
     win_put32(image + optional + 60u, 0x400u); win_put16(image + optional + 68u, 3u);
     win_put32(image + directories - 4u, 16u);
     win_put32(image + directories, 0x1000u); win_put32(image + directories + 4u, 0x100u);
     section = optional + (wide ? 0xf0u : 0xe0u);
     memcpy(image + section, ".edata", 6u); win_put32(image + section + 8u, 0x7000u);
     win_put32(image + section + 12u, 0x1000u); win_put32(image + section + 36u, 0x40000040u);
+    /* Synthetic PE storage is an identity raw/RVA layout. All declared raw
+     * bytes are present in the mapped slot, including initialized zeros. */
+    win_put32(image + section + 16u, 0x7000u); win_put32(image + section + 20u, 0x1000u);
     {
-        uint32_t text_section = section + (bootstrap ? 80u : 40u);
-        memcpy(image + text_section, ".text", 5u); win_put32(image + text_section + 8u, WIN_MAX_APIS * 16u);
+        uint32_t text_section = section + 40u;
+        memcpy(image + text_section, ".text", 5u); win_put32(image + text_section + 8u, WIN_MAX_MODULE_APIS * 16u);
         win_put32(image + text_section + 12u, thunk_rva); win_put32(image + text_section + 36u, 0x60000020u);
+        win_put32(image + text_section + 16u, WIN_MAX_MODULE_APIS * 16u); win_put32(image + text_section + 20u, thunk_rva);
     }
     if (bootstrap) {
         static const uint8_t handler[] = {0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3};
-        memcpy(image + section + 40u, ".seh", 4u);
-        win_put32(image + section + 48u, 0x1000u);
-        win_put32(image + section + 52u, (uint32_t)WIN_BOOTSTRAP_SEH_OFFSET);
-        win_put32(image + section + 76u, 0x60000020u);
+        memcpy(image + section + 80u, ".seh", 4u);
+        win_put32(image + section + 88u, 0x1000u);
+        win_put32(image + section + 92u, (uint32_t)WIN_BOOTSTRAP_SEH_OFFSET);
+        win_put32(image + section + 96u, 0x1000u);
+        win_put32(image + section + 100u, (uint32_t)WIN_BOOTSTRAP_SEH_OFFSET);
+        win_put32(image + section + 116u, 0x60000020u);
         memcpy(image + WIN_BOOTSTRAP_SEH_OFFSET, handler, sizeof(handler));
     }
     win_put32(image + 0x100cu, 0x1040u); win_put32(image + 0x1010u, 1u);
@@ -2007,13 +2050,14 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
     for (i = 0u; i < count; ++i) {
         const char *name = entries[order[i]].name;
         size_t bytes = strlen(name) + 1u;
-        if (bytes > (size_t)WIN_MODULE_STRIDE - cursor) { free(image); return 0; }
+        if (cursor > (size_t)WIN_MODULE_THUNK_RVA || bytes > (size_t)WIN_MODULE_THUNK_RVA - cursor) { free(image); return 0; }
         win_put32(image + 0x1100u + i * 4u, (uint32_t)(entries[order[i]].address - module->base));
         win_put32(image + 0x1900u + i * 4u, (uint32_t)cursor);
         win_put16(image + 0x2100u + i * 2u, (uint16_t)i);
         memcpy(image + cursor, name, bytes); cursor += bytes;
     }
     i = (size_t)win_write(process, module->base, image, slot_size);
+    if (i) module->image_size = image_size;
     free(image); return i != 0u;
 }
 
@@ -2036,7 +2080,7 @@ static int win_loader_lists(xxemul_windows *process)
         size_t length = strlen(name);
         if (!win_store(process, entry + (word == 8u ? 0x30u : 0x18u), word, base) ||
             !win_store(process, entry + (word == 8u ? 0x40u : 0x20u), 4u,
-                       i == 0u ? process->image_size : (process->modules[order[i - 1u]].real ? process->modules[order[i - 1u]].image_size : process->runtime_base + WIN_RUNTIME_SIZE - base)) ||
+                       i == 0u ? process->image_size : process->modules[order[i - 1u]].image_size) ||
             !win_write_wide(process, i == 0u ? process->runtime_base + 0x17000u : text, name, i == 0u ? 1024u : 128u)) return 0;
         for (list = 0u; list < 2u; ++list) {
             uint64_t descriptor = entry + name_offset + list * (word == 8u ? 16u : 8u);
@@ -2382,6 +2426,21 @@ static uint32_t win_registry_call(xxemul_windows *process, const char *name, con
     uint16_t value_name[WIN_REG_NAME] = {0}, path[WIN_REG_PATH];
     size_t i, slot;
     uint32_t error;
+    if (strcmp(name, "RegOpenKeyA") == 0 || strcmp(name, "RegOpenKeyW") == 0) {
+        uint64_t first = 0u;
+        uint64_t expanded[5] = {arg[0], arg[1], 0u, 0xf003fu, arg[2]};
+        if (!arg[2]) return 87u;
+        if (!win_memory_span(process, arg[2], win_word_size(process->emulator))) return 998u;
+        if (win_reg_key_for_handle(process, arg[0], 0u) < 0) return 6u;
+        if (arg[1] && !win_load(process, arg[1], (uint8_t)(wide ? 2u : 1u), &first)) return 998u;
+        /* The legacy API preserves the original handle for an empty subkey.
+         * The process-local registry has no ACLs; maximum allowed access is
+         * the existing modeled key-access mask. No key is created here. */
+        if (!first) {
+            return win_store(process, arg[2], win_word_size(process->emulator), arg[0]) ? 0u : 998u;
+        }
+        return win_registry_call(process, wide ? "RegOpenKeyExW" : "RegOpenKeyExA", expanded);
+    }
     if (strcmp(name, "RegCloseKey") == 0) {
         if (win_reg_root(arg[0]) >= 0) return 0u;
         for (i = 0u; i < WIN_REG_HANDLES; ++i) if (process->registry_handles[i].id == arg[0] && arg[0] != 0u) {
@@ -5559,11 +5618,6 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
                     if(!candidate->real && process->emulator->arch==XXEMUL_ARCH_X86 && win_word_size(process->emulator)==4u &&
                         win_equal(candidate->name,"kernel32.dll"))size=WIN_MODULE_STRIDE*2u;
                     if(candidate->live&&address>=candidate->base&&address-candidate->base<size){module=candidate;break;}}
-                if(!module&&address>=process->runtime_base+WIN_THUNK_OFFSET&&
-                   address-process->runtime_base-WIN_THUNK_OFFSET<process->api_count*WIN_THUNK_STRIDE){
-                    size_t api_index=(size_t)((address-process->runtime_base-WIN_THUNK_OFFSET)/WIN_THUNK_STRIDE);
-                    module=win_find_module(process,process->apis[api_index].module,0);
-                }
             }
         }else if(!arg[1])handle=process->image_base;
         else{
@@ -7242,10 +7296,26 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "RegCreateKeyExA") == 0 || strcmp(name, "RegCreateKeyExW") == 0 ||
+        strcmp(name, "RegOpenKeyA") == 0 || strcmp(name, "RegOpenKeyW") == 0 ||
         strcmp(name, "RegOpenKeyExA") == 0 || strcmp(name, "RegOpenKeyExW") == 0 ||
         strcmp(name, "RegQueryValueExA") == 0 || strcmp(name, "RegQueryValueExW") == 0 ||
         strcmp(name, "RegSetValueExA") == 0 || strcmp(name, "RegSetValueExW") == 0 || strcmp(name, "RegCloseKey") == 0) {
         *result = win_registry_call(process, name, arg);
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetSystemDirectoryA") == 0 || strcmp(name, "GetSystemDirectoryW") == 0 ||
+        strcmp(name, "GetWindowsDirectoryA") == 0 || strcmp(name, "GetWindowsDirectoryW") == 0) {
+        const char *path = win_prefix(name, "GetSystemDirectory") ? "C:\\Windows\\System32" : "C:\\Windows";
+        uint8_t bytes[40] = {0};
+        size_t length = strlen(path), width = win_suffix(name, "W") ? 2u : 1u, i;
+        size_t written = (length + 1u) * width;
+        if ((uint32_t)arg[1] <= length) { *result = length + 1u; return XXEMUL_STATUS_OK; }
+        if (!arg[0] || !win_memory_span(process, arg[0], written)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        /* These are virtual guest paths, consistent with modeled DLL names;
+         * querying them neither accesses the host nor creates system files. */
+        for (i = 0u; i < length; ++i) bytes[i * width] = (uint8_t)path[i];
+        if (!win_write(process, arg[0], bytes, written)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = length;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetTempPathA") == 0 || strcmp(name, "GetTempPathW") == 0 ||
@@ -7666,7 +7736,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetVersion") == 0) {
-        *result = 0x0a000006u;
+        *result = (WIN_OS_VERSION_BUILD << 16u) | (WIN_OS_VERSION_MINOR << 8u) | WIN_OS_VERSION_MAJOR;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetFileVersionInfoSizeA") == 0 || strcmp(name, "GetFileVersionInfoA") == 0) {
@@ -7787,13 +7857,19 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetVersionExA") == 0 || strcmp(name, "GetVersionExW") == 0) {
-        if (arg[0] == 0) return XXEMUL_STATUS_ADDRESS_FAULT;
-        win_store(process, arg[0] + 4u, 4u, 10u);
-        win_store(process, arg[0] + 8u, 4u, 0u);
-        win_store(process, arg[0] + 12u, 4u, 19045u);
-        win_store(process, arg[0] + 16u, 4u, 2u);
-        uint8_t zero256[256] = {0};
-        win_write(process, arg[0] + 20u, zero256, strcmp(name, "GetVersionExW") == 0 ? 256u : 128u);
+        uint8_t bytes[284] = {0};
+        uint64_t length;
+        size_t basic = win_suffix(name, "W") ? 276u : 148u;
+        if (!arg[0] || !win_load(process, arg[0], 4u, &length)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (length != basic && length != basic + 8u) { process->last_error = 87u; return XXEMUL_STATUS_OK; }
+        if (!win_memory_span(process, arg[0], length)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        win_put32(bytes, (uint32_t)length);
+        win_put32(bytes + 4u, WIN_OS_VERSION_MAJOR);
+        win_put32(bytes + 8u, WIN_OS_VERSION_MINOR);
+        win_put32(bytes + 12u, WIN_OS_VERSION_BUILD);
+        win_put32(bytes + 16u, 2u);
+        if (length != basic) bytes[basic + 6u] = 1u; /* VER_NT_WORKSTATION */
+        if (!win_write(process, arg[0], bytes, (size_t)length)) return XXEMUL_STATUS_ADDRESS_FAULT;
         *result = 1u;
         return XXEMUL_STATUS_OK;
     }
@@ -8063,27 +8139,29 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         if (extended) *result = 1u;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "GetSystemInfo") == 0) {
-        if (process->emulator->mode == XXEMUL_MODE_X86_64) {
-            win_store(process, arg[0], 2u, 9u);
-            win_store(process, arg[0] + 4u, 4u, 4096u);
-            win_store(process, arg[0] + 8u, 8u, 0x10000u);
-            win_store(process, arg[0] + 16u, 8u, UINT64_C(0x7ffffffeffff));
-            win_store(process, arg[0] + 24u, 8u, 0x0fu);
-            win_store(process, arg[0] + 32u, 4u, 4u);
-            win_store(process, arg[0] + 36u, 4u, 8664u);
-            win_store(process, arg[0] + 40u, 4u, 65536u);
-            win_store(process, arg[0] + 44u, 2u, 6u);
+    if (strcmp(name, "GetSystemInfo") == 0 || strcmp(name, "GetNativeSystemInfo") == 0) {
+        uint8_t bytes[48] = {0};
+        int wide = word_size == 8u;
+        size_t length = wide ? 48u : 36u;
+        /* The guest models native Win32/Win64, independently of the host.
+         * SYSTEM_INFO has three pointer-width fields before its DWORD tail. */
+        if (!arg[0] || !win_memory_span(process, arg[0], length)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        win_put16(bytes, (uint16_t)(wide ? 9u : 0u));
+        win_put32(bytes + 4u, 0x1000u);
+        if (wide) {
+            win_put64(bytes + 8u, UINT64_C(0x10000));
+            win_put64(bytes + 16u, UINT64_C(0x7ffffffeffff));
+            win_put64(bytes + 24u, UINT64_C(0xf));
         } else {
-            win_store(process, arg[0], 2u, 0u);
-            win_store(process, arg[0] + 4u, 4u, 4096u);
-            win_store(process, arg[0] + 8u, 4u, 0x10000u);
-            win_store(process, arg[0] + 12u, 4u, 0x0fu);
-            win_store(process, arg[0] + 16u, 4u, 4u);
-            win_store(process, arg[0] + 20u, 4u, 586u);
-            win_store(process, arg[0] + 24u, 4u, 65536u);
-            win_store(process, arg[0] + 28u, 2u, 6u);
+            win_put32(bytes + 8u, 0x10000u);
+            win_put32(bytes + 12u, 0x7ffeffffu);
+            win_put32(bytes + 16u, 0xfu);
         }
+        win_put32(bytes + (wide ? 32u : 20u), 4u);
+        win_put32(bytes + (wide ? 36u : 24u), wide ? 8664u : 586u);
+        win_put32(bytes + (wide ? 40u : 28u), (uint32_t)WIN_ALLOCATION_GRANULARITY);
+        win_put16(bytes + (wide ? 44u : 32u), 6u);
+        if (!win_write(process, arg[0], bytes, length)) return XXEMUL_STATUS_ADDRESS_FAULT;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetActiveProcessorGroupCount") == 0) {
@@ -8998,15 +9076,15 @@ static xxemul_status win_qsort_continue(xxemul_windows *process, uint64_t curren
 static int win_arm_try_step(xxemul_windows *process, xxemul_step_info *info, xxemul_status *status)
 {
     xxemul *emulator = process->emulator;
-    uint64_t ip = emulator->arm.pc, index, result = 0, return_address;
+    uint64_t ip = emulator->arm.pc, result = 0, return_address;
+    size_t index;
     uint64_t arguments[16] = {0};
     uint8_t word_size = win_word_size(emulator), register_count = word_size == 8u ? 8u : 4u;
     unsigned i;
     win_api *api;
     xxemul_status call_status;
-    if (ip < process->runtime_base + WIN_THUNK_OFFSET) return 0;
-    index = (ip - process->runtime_base - WIN_THUNK_OFFSET) / WIN_THUNK_STRIDE;
-    if (index >= process->api_count || ip != process->runtime_base + WIN_THUNK_OFFSET + index * WIN_THUNK_STRIDE) return 0;
+    index = win_api_index(process, ip);
+    if (index == SIZE_MAX) return 0;
     api = &process->apis[index];
     /* The shared implementations below use guest-memory addresses and
      * scalar arguments. Register-context and guest-callback APIs require
@@ -9490,7 +9568,8 @@ static xxemul_status win_thread_finish(xxemul_windows *process, uint32_t code, x
 
 int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxemul_status *status)
 {
-    uint64_t ip, index, return_address, value = 0;
+    uint64_t ip, return_address, value = 0;
+    size_t index;
     uint64_t arguments[16] = {0};
     uint8_t word_size, i;
     win_api *api;
@@ -9578,9 +9657,8 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
         *status = win_qsort_continue(process, ip, info);
         return 1;
     }
-    if (ip < process->runtime_base + WIN_THUNK_OFFSET) return 0;
-    index = (ip - process->runtime_base - WIN_THUNK_OFFSET) / WIN_THUNK_STRIDE;
-    if (index >= process->api_count || ip != process->runtime_base + WIN_THUNK_OFFSET + index * WIN_THUNK_STRIDE) return 0;
+    index = win_api_index(process, ip);
+    if (index == SIZE_MAX) return 0;
     api = &process->apis[index];
     word_size = (uint8_t)(win_word_size(process->emulator));
     if (!win_load(process, process->emulator->x86.gpr[XXEMUL_X86_RSP], word_size, &return_address)) {
