@@ -909,7 +909,7 @@ static const char *const win_extra_export_names[] = {
     "GetProcessId", "GetThreadId",
     "SetTimer",
     "MoveWindow",
-    "DialogBoxParamA", "DialogBoxParamW", "EndDialog", "GetDlgItem", "SetWindowTextA", "SetWindowTextW", "SetDlgItemTextA", "SetDlgItemTextW", "GetWindowTextA", "GetWindowTextW", "GetDlgItemTextA", "GetDlgItemTextW", "SendMessageA", "SendMessageW", "SendDlgItemMessageA", "SendDlgItemMessageW", "LoadIconA", "LoadIconW", "GetObjectA", "GetObjectW", "CreateFontIndirectA", "CreateFontIndirectW", "DeleteObject", "InitCommonControlsEx",
+    "DialogBoxParamA", "DialogBoxParamW", "FindWindowA", "FindWindowW", "EndDialog", "GetDlgItem", "SetWindowTextA", "SetWindowTextW", "SetDlgItemTextA", "SetDlgItemTextW", "GetWindowTextA", "GetWindowTextW", "GetDlgItemTextA", "GetDlgItemTextW", "SendMessageA", "SendMessageW", "SendDlgItemMessageA", "SendDlgItemMessageW", "LoadIconA", "LoadIconW", "GetObjectA", "GetObjectW", "CreateFontIndirectA", "CreateFontIndirectW", "DeleteObject", "InitCommonControlsEx",
     "SetFileAttributesA",
     "CopyFileA", "CopyFileW",
     "SwitchToThread", "GetTickCount64",
@@ -1123,6 +1123,7 @@ static int win_crt_api(const char *name)
 
 static uint8_t win_argument_count(const char *name)
 {
+    if (win_equal(name, "FindWindowA") || win_equal(name, "FindWindowW")) return 2u;
     if (win_equal(name, "NtQuerySystemInformation")) return 4u;
     if(win_equal(name,"DisableThreadLibraryCalls"))return 1u;
     if(win_equal(name,"lstrcmpiA") || win_equal(name,"lstrcmpiW"))return 2u;
@@ -1926,6 +1927,7 @@ const char *xxemul_windows_thunk_qualified_name(const xxemul *emulator, uint64_t
  * contains its own address-dispatched API thunks in its .text section. */
 static const char *win_export_owner(const char *name)
 {
+    if (win_equal(name, "FindWindowA") || win_equal(name, "FindWindowW")) return "user32.dll";
     if (win_equal(name, "GetWindowsDirectoryA") || win_equal(name, "GetWindowsDirectoryW")) return "kernel32.dll";
     if(win_equal(name,"CheckSumMappedFile"))return "imagehlp.dll";
     if (win_equal(name, "SetTimer") || win_equal(name, "MoveWindow")) return "user32.dll";
@@ -5153,6 +5155,9 @@ static uint64_t win_gui_template(xxemul_windows *process,uint64_t address,uint32
        !win_dialog_string(&r,dialog_class,256u,&ordinal)||dialog_class[0]||ordinal)return 0u;
     dialog=win_gui_new(process,WIN_GUI_DIALOG,0u);if(!dialog)return 0u;
     object=win_gui_at(process,dialog);object->style=(uint32_t)style;
+    /* Empty template class selects the predefined dialog class (WC_DIALOG). */
+    object->class_ordinal=0x8002u;
+    {static const uint16_t name[]={'#','3','2','7','7','0',0};memcpy(object->class_name,name,sizeof(name));}
     if(!win_dialog_string(&r,object->text,256u,NULL))goto bad;
     if(style&0x40u){
         uint64_t points,weight=400u,italic=0u,charset=1u;
@@ -5222,6 +5227,24 @@ static int win_gui_text(xxemul_windows *process,uint64_t address,int wide,uint16
         output[i]=wide?(uint16_t)value:win_reg_ansi((uint8_t)value);if(!value)return 1;
     }
     return 0;
+}
+static xxemul_status win_gui_find_window(xxemul_windows *process,const uint64_t *arg,int wide,uint64_t *result)
+{
+    uint16_t class_name[256],title[256];size_t i;
+    int atom=arg[0]!=0u&&arg[0]<=0xffffu;
+    if((arg[0]&&!atom&&!win_gui_text(process,arg[0],wide,class_name)) ||
+       (arg[1]&&!win_gui_text(process,arg[1],wide,title)))return XXEMUL_STATUS_ADDRESS_FAULT;
+    /* Enumerate real top-level objects of this process's headless GUI model.
+     * Modal ownership does not make a dialog a child window. No host desktop
+     * is queried, and FindWindow leaves LastError unchanged on either result. */
+    for(i=0u;i<WIN_GUI_OBJECTS;++i){
+        const win_gui_object *object=&process->gui_objects[i];
+        if(!object->active||object->kind!=WIN_GUI_DIALOG||(object->style&0x40000000u))continue;
+        if(arg[0]&&(atom?object->class_ordinal!=(uint16_t)arg[0]:!win_reg_name_equal(object->class_name,class_name)))continue;
+        if(arg[1]&&!win_reg_name_equal(object->text,title))continue;
+        *result=UINT64_C(0x10000)+i;break;
+    }
+    return XXEMUL_STATUS_OK;
 }
 static xxemul_status win_dialog_invoke(xxemul_windows *process,win_dialog_frame *frame,xxemul_step_info *info);
 static xxemul_status win_dialog_return(xxemul_windows *process,int waited,xxemul_step_info *info);
@@ -5421,6 +5444,8 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         process->last_error = 120u;
         return XXEMUL_STATUS_OK;
     }
+    if (strcmp(name,"FindWindowA")==0 || strcmp(name,"FindWindowW")==0)
+        return win_gui_find_window(process,arg,win_suffix(name,"W"),result);
     if (strcmp(name,"DialogBoxParamA")==0 || strcmp(name,"DialogBoxParamW")==0) {
         uint64_t resource,dialog,event;uint32_t size;size_t index;
         win_dialog_frame *frame;

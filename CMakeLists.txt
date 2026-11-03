@@ -377,6 +377,13 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
                     --test $<TARGET_FILE:xxemul_windows_dialog_tests>
                     --work "${CMAKE_CURRENT_BINARY_DIR}/windows-dialog-tests" --dialogs)
             set_tests_properties(xxemul_windows_dialog_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_find_window_tests tests/test_windows_find_window.c)
+            target_link_libraries(xxemul_windows_find_window_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_find_window_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_find_window_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-find-window-tests" --dialogs)
+            set_tests_properties(xxemul_windows_find_window_tests PROPERTIES TIMEOUT 60)
             add_executable(xxemul_windows_gui_abi_tests tests/test_windows_gui_abi.c)
             target_link_libraries(xxemul_windows_gui_abi_tests PRIVATE xxemul::xxemul)
             add_test(NAME xxemul_windows_gui_abi_tests
