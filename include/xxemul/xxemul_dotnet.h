@@ -41,6 +41,21 @@ typedef struct xxemul_dotnet_field_info {
     const char *type_name, *name, *signature, *assembly_name;
 } xxemul_dotnet_field_info;
 
+/* Exact ImplMap identity, owned by the program. Scalar types use ECMA-335
+ * ELEMENT_TYPE bytes (Boolean denotes default Win32 BOOL, not an I1 marshal).
+ * supported admits only static, nongeneric Winapi/Cdecl/Stdcall integer/native
+ * integer declarations with default marshalling and PreserveSig. Other valid
+ * declarations remain available for inspection but must not be called through
+ * this bounded scalar ABI. No native code is executed by the loader. */
+typedef struct xxemul_dotnet_pinvoke_info {
+    const char *module_name, *entry_point;
+    uint32_t flags;
+    uint8_t return_type;
+    const uint8_t *parameter_types;
+    size_t parameter_count;
+    int supported;
+} xxemul_dotnet_pinvoke_info;
+
 typedef struct xxemul_dotnet_method_info {
     uint32_t token, flags, impl_flags, rva, code_size;
     uint16_t max_stack;
@@ -52,6 +67,8 @@ typedef struct xxemul_dotnet_method_info {
     /* Defining assembly for MethodDefs, resolution-scope assembly for
      * MemberRefs. NULL when a module/unsupported scope has no assembly. */
     const char *assembly_name;
+    /* NULL for methods without an ImplMap. Borrowed until program destruction. */
+    const xxemul_dotnet_pinvoke_info *pinvoke;
 } xxemul_dotnet_method_info;
 
 /* The program owns a bounded copy of the PE and all exposed metadata. No CLR
@@ -63,6 +80,8 @@ XXEMUL_API void xxemul_dotnet_destroy(xxemul_dotnet_program *program);
 /* Borrowed strings and method information remain valid until destruction. */
 XXEMUL_API const char *xxemul_dotnet_assembly_name(const xxemul_dotnet_program *program);
 XXEMUL_API const char *xxemul_dotnet_module_name(const xxemul_dotnet_program *program);
+/* PE32/PE32+ native pointer width: 4 or 8 bytes, zero for NULL. */
+XXEMUL_API unsigned xxemul_dotnet_pointer_size(const xxemul_dotnet_program *program);
 /* NULL identity denotes a valid netmodule with no Assembly row. All returned
  * metadata/data pointers are borrowed until program destruction. */
 XXEMUL_API const xxemul_dotnet_assembly_info *xxemul_dotnet_assembly_identity(const xxemul_dotnet_program *program);

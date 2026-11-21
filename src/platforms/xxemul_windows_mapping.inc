@@ -59,7 +59,7 @@ static uint64_t win_mapping_create(xxemul_windows *process, const char *api_name
         int64_t file_size;
         file = win_handle_at(process, arg[0]);
         if (!file || file->kind != WIN_HANDLE_FILE || !file->io || !*file->file_path) { process->last_error = 6u; return 0; }
-        if (!(file->file_access & 0x80000000u) || (writable && !(file->file_access & 0x40000000u))) {
+        if (!(file->file_access & (file->module_file_data?0x80000001u:0x80000000u)) || (writable && !(file->file_access & 0x40000000u))) {
             process->last_error = 5u; return 0;
         }
         file_size = xx_io_total_size(file->io);
@@ -73,7 +73,10 @@ static uint64_t win_mapping_create(xxemul_windows *process, const char *api_name
     if (slot == WIN_MAX_HANDLES) { process->last_error = 4u; return 0; }
     data = (uint8_t *)calloc(1u, (size_t)size);
     if (!data) { process->last_error = 8u; return 0; }
-    if (file) {
+    if(file&&file->module_file_data){
+        /* Independent readonly/COW section storage outlives the file handle. */
+        if(!xx_io_read_at(file->io,0,data,(size_t)size)){free(data);process->last_error=30u;return 0;}
+    }else if (file) {
         backing = xx_io_file_open(file->file_path, writable ? "r+b" : "rb");
         if (!backing) { free(data); process->last_error = 5u; return 0; }
         if ((uint64_t)xx_io_total_size(backing) < size && xx_io_resize(backing, (int64_t)size) != 0) {

@@ -28,6 +28,7 @@ typedef struct xxemul_dotnet_method {
     int local_reference;
     xxemul_dotnet_exception_clause *clauses;
     size_t clause_count;
+    xxemul_dotnet_pinvoke_info pinvoke;
 } xxemul_dotnet_method;
 
 typedef struct xxemul_dotnet_class {

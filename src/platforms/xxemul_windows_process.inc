@@ -65,8 +65,10 @@ static void win_child_finish(win_child_process *child, uint32_t code)
     }
     memset(process->handles,0,sizeof(process->handles));
     for(i=0u;i<WIN_MAX_THREADS;++i) {
+        win_actctx_abandon_thread(process,process->threads[i].id);
         win_tls_thread_release(process,&process->threads[i]);
         if(process->threads[i].active) {
+            win_cbt_abandon_thread(process,process->threads[i].id);
             process->threads[i].active=0u;process->threads[i].exit_code=code;
         }
     }
@@ -289,6 +291,16 @@ static xxemul_status win_create_process(xxemul_windows *process, const uint64_t 
     if(process->process_tree->processes>=8u || process->process_tree->next_id>UINT32_MAX-2u) {process->last_error=8u;return XXEMUL_STATUS_OK;}
     emulator=xxemul_create_image_file(format,host,&status);
     if(!emulator) { process->last_error=status==XXEMUL_STATUS_OUT_OF_MEMORY?8u:193u;return XXEMUL_STATUS_OK; }
+    if(process->emulator->windows_native_dll_count){
+        const char *selected[XXEMUL_WINDOWS_NATIVE_DLL_MAX_NAMES];size_t policy_index;
+        for(policy_index=0u;policy_index<process->emulator->windows_native_dll_count;++policy_index)selected[policy_index]=process->emulator->windows_native_dlls[policy_index];
+        status=xxemul_set_windows_native_dlls(emulator,selected,process->emulator->windows_native_dll_count);
+        if(status!=XXEMUL_STATUS_OK){xxemul_destroy(emulator);process->last_error=120u;return XXEMUL_STATUS_OK;}
+    }
+    if(process->emulator->windows_default_actctx){
+        status=xxemul_set_windows_activation_context(emulator,1);
+        if(status!=XXEMUL_STATUS_OK){xxemul_destroy(emulator);process->last_error=50u;return XXEMUL_STATUS_OK;}
+    }
     if(emulator->region_size>UINT64_C(0x10000000)-process->process_tree->memory) {
         xxemul_destroy(emulator);process->last_error=8u;return XXEMUL_STATUS_OK;
     }
@@ -335,12 +347,14 @@ static xxemul_status win_create_process(xxemul_windows *process, const uint64_t 
     child_process->process_id=child->process_id;child_process->threads[0].id=child->thread_id;
     child_process->next_thread_id=child->thread_id;
     ++process->process_tree->processes;process->process_tree->memory+=emulator->region_size;
+    child_process->parent_process_id = process->process_id;
     (void)win_store(child_process,child_process->runtime_base+(win_word_size(emulator)==8u?0x40u:0x20u),win_word_size(emulator),child->process_id);
     (void)win_store(child_process,child_process->runtime_base+(win_word_size(emulator)==8u?0x48u:0x24u),win_word_size(emulator),child->thread_id);
     for(i=0u;i<2u;++i) {
         size_t h=i?thread_slot:process_slot;win_handle *entry=&process->handles[h];
         memset(entry,0,sizeof(*entry));entry->in_use=1u;entry->references=1u;entry->root_slot=(uint16_t)h;
         entry->kind=i?WIN_HANDLE_THREAD:WIN_HANDLE_PROCESS;entry->child_slot=(uint16_t)(slot+1u);
+        if(!i)entry->process_access=0x1fffffu;
         entry->flags=i?thread_inherit:process_inherit;
     }
     (void)win_store(process,arg[9],width,0x100u+process_slot);

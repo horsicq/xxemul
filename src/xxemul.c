@@ -106,6 +106,11 @@ xxemul *xxemul_create_empty(xxemul_arch arch, xxemul_mode mode, uint64_t region_
     emulator->video_mode = 3u;
     emulator->text_attribute = 7u;
     emulator->x87_control = 0x037fu;
+    emulator->x87_tags = UINT16_C(0xffff);
+    emulator->x86_mxcsr = UINT32_C(0x1f80);
+    emulator->x86_debug[4] = UINT32_C(0xffff0ff0);
+    emulator->x86_debug[5] = UINT32_C(0x400);
+    emulator->windows_fault_dispatch = 1;
     if (status != NULL) {
         *status = XXEMUL_STATUS_OK;
     }
@@ -180,6 +185,59 @@ void xxemul_destroy(xxemul *emulator)
     xx_mem_free(emulator);
 }
 
+xxemul_status xxemul_post_window_message(xxemul *emulator, uint64_t window, uint32_t message, uint64_t wparam, uint64_t lparam)
+{
+    if (!emulator || !emulator->windows || emulator->in_step) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    return xxemul_windows_post_input(emulator->windows, window, message, wparam, lparam);
+}
+
+static xxemul_status xxemul_windows_native_name(const char *name,char out[XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY])
+{
+    size_t i,length;int dot=0;
+    if(!name||!*name)return XXEMUL_STATUS_INVALID_ARGUMENT;
+    for(i=0u;i<XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY;++i){unsigned char c=(unsigned char)name[i];
+        if(!c)break;
+        if(i==XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY-1u||c<0x20u||c>0x7eu||strchr("\\/:*?\"<>|",c))return XXEMUL_STATUS_INVALID_ARGUMENT;
+        out[i]=(char)(c>='A'&&c<='Z'?c-'A'+'a':c);if(c=='.')dot=1;
+    }
+    length=i;out[length]='\0';
+    if(!dot){if(length+4u>=XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY)return XXEMUL_STATUS_INVALID_ARGUMENT;memcpy(out+length,".dll",5u);length+=4u;}
+    if(length<=4u||strcmp(out+length-4u,".dll"))return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if(!strcmp(out,"ntdll.dll")||!strcmp(out,"kernel32.dll")||!strcmp(out,"kernelbase.dll")||!strcmp(out,"coredll.dll")||
+       !strncmp(out,"api-ms-",7u)||!strncmp(out,"ext-ms-",7u))return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+    return XXEMUL_STATUS_OK;
+}
+xxemul_status xxemul_validate_windows_native_dlls(const char *const *names,size_t count)
+{
+    char normalized[XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY];size_t i;xxemul_status status;
+    if(count>XXEMUL_WINDOWS_NATIVE_DLL_MAX_NAMES||(count&&!names))return XXEMUL_STATUS_INVALID_ARGUMENT;
+    for(i=0u;i<count;++i)if((status=xxemul_windows_native_name(names[i],normalized))!=XXEMUL_STATUS_OK)return status;
+    return XXEMUL_STATUS_OK;
+}
+xxemul_status xxemul_set_windows_native_dlls(xxemul *emulator,const char *const *names,size_t count)
+{
+    char copied[XXEMUL_WINDOWS_NATIVE_DLL_MAX_NAMES][XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY]={{0}};
+    size_t i,j,used=0u;xxemul_status status;
+    if(!emulator||emulator->windows||emulator->linux_process||emulator->in_step||emulator->windows_native_policy_locked)return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if(count&&(emulator->arch!=XXEMUL_ARCH_X86||(emulator->mode!=XXEMUL_MODE_X86_32&&emulator->mode!=XXEMUL_MODE_X86_64)))return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+    status=xxemul_validate_windows_native_dlls(names,count);if(status!=XXEMUL_STATUS_OK)return status;
+    for(i=0u;i<count;++i){char normalized[XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY];
+        (void)xxemul_windows_native_name(names[i],normalized);
+        for(j=0u;j<used&&strcmp(copied[j],normalized);++j){}
+        if(j==used)memcpy(copied[used++],normalized,strlen(normalized)+1u);
+    }
+    memcpy(emulator->windows_native_dlls,copied,sizeof(copied));emulator->windows_native_dll_count=(uint8_t)used;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_set_windows_activation_context(xxemul *emulator,int enabled)
+{
+    if(!emulator||(enabled!=0&&enabled!=1)||emulator->windows||emulator->linux_process||emulator->in_step||emulator->windows_native_policy_locked)return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if(enabled&&(emulator->arch!=XXEMUL_ARCH_X86||(emulator->mode!=XXEMUL_MODE_X86_32&&emulator->mode!=XXEMUL_MODE_X86_64)))return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+    emulator->windows_default_actctx=(uint8_t)enabled;
+    return XXEMUL_STATUS_OK;
+}
+
 xxemul_status xxemul_start_process(xxemul *emulator, xxemul_image_format format, const char *program_path, const char *working_directory, int argc,
                                    const char *const *argv)
 {
@@ -189,6 +247,8 @@ xxemul_status xxemul_start_process(xxemul *emulator, xxemul_image_format format,
         emulator->linux_process != NULL) {
         return status;
     }
+    if((emulator->windows_native_dll_count||emulator->windows_default_actctx)&&format!=XXEMUL_IMAGE_PE32&&format!=XXEMUL_IMAGE_PE64)return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+    emulator->windows_native_policy_locked=1u;
     if (format == XXEMUL_IMAGE_MACHO32 || format == XXEMUL_IMAGE_MACHO64) {
         if (emulator->darwin == NULL) return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return xxemul_darwin_start(emulator->darwin, program_path, working_directory, argc, argv);
@@ -339,6 +399,8 @@ xxemul_status xxemul_read_memory(xxemul *emulator, uint64_t address, void *buffe
     if (size == 0) {
         return emulator == NULL ? XXEMUL_STATUS_INVALID_ARGUMENT : XXEMUL_STATUS_OK;
     }
+    if (emulator && buffer && emulator->windows && emulator->in_step && !emulator->x86_fetching &&
+        !xxemul_windows_memory_access(emulator->windows,address,size,0u,1)) return XXEMUL_STATUS_ADDRESS_FAULT;
     if (emulator != NULL && buffer != NULL && emulator->linux_process != NULL) {
         mapped = xxemul_linux_mapping_read(emulator->linux_process, address, buffer, size);
         if (mapped != 0) return mapped > 0 ? XXEMUL_STATUS_OK : XXEMUL_STATUS_ADDRESS_FAULT;
@@ -363,6 +425,8 @@ xxemul_status xxemul_write_memory(xxemul *emulator, uint64_t address, const void
     if (size == 0) {
         return emulator == NULL ? XXEMUL_STATUS_INVALID_ARGUMENT : XXEMUL_STATUS_OK;
     }
+    if (emulator && buffer && emulator->windows && emulator->in_step &&
+        !xxemul_windows_memory_access(emulator->windows,address,size,1u,1)) return XXEMUL_STATUS_ADDRESS_FAULT;
     /* Host/debugger writes and guest stores conservatively invalidate an
      * outstanding MIPS LL/SC reservation, including writes through mmap. */
     if (emulator != NULL && emulator->arch == XXEMUL_ARCH_MIPS) {
@@ -546,6 +610,7 @@ xxemul_status xxemul_step(xxemul *emulator, xxemul_step_info *info)
     if (emulator == NULL) {
         return XXEMUL_STATUS_INVALID_ARGUMENT;
     }
+    emulator->windows_native_policy_locked=1u;
     emulator->in_step = 1;
     status = xxemul_step_inner(emulator, info);
     status = xxemul_elf_primary_after_step(emulator, status);
@@ -560,12 +625,21 @@ xxemul_status xxemul_step(xxemul *emulator, xxemul_step_info *info)
     return status;
 }
 
+static int xxemul_windows_fault_status(xxemul_status status)
+{
+    return status == XXEMUL_STATUS_ADDRESS_FAULT || status == XXEMUL_STATUS_BREAKPOINT ||
+        status == XXEMUL_STATUS_DECODE_ERROR || status == XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+}
+
 static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
 {
     xxemul_status status;
+    xxemul_x86_state api_before;
+    xxemul_arm_state api_before_arm;
     if (emulator == NULL) {
         return XXEMUL_STATUS_INVALID_ARGUMENT;
     }
+    emulator->x86_rep_partial = 0;
     if (info != NULL) {
         xx_mem_zero(info, sizeof(*info));
     }
@@ -573,7 +647,26 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
         return XXEMUL_STATUS_HALTED;
     }
     if (emulator->elf_primary != NULL && xxemul_elf_primary_try_step(emulator, info, &status)) return status;
+    if (emulator->windows) {
+        api_before = emulator->x86; api_before_arm = emulator->arm;
+        emulator->fault_address_valid = 0;
+        emulator->windows_exception_code = 0;
+        if (!xxemul_windows_memory_access(emulator->windows,
+                emulator->arch==XXEMUL_ARCH_X86?emulator->x86.ip:emulator->arm.pc,
+                emulator->arch==XXEMUL_ARCH_X86?1u:(emulator->mode==XXEMUL_MODE_ARM_T32?2u:4u),8u,1)) {
+            status=XXEMUL_STATUS_ADDRESS_FAULT;
+            if (emulator->windows_fault_dispatch && emulator->arch==XXEMUL_ARCH_X86 &&
+                xxemul_windows_try_exception(emulator->windows,&api_before,status,info)) return XXEMUL_STATUS_OK;
+            if (emulator->windows_fault_dispatch && emulator->arch==XXEMUL_ARCH_ARM &&
+                xxemul_windows_try_arm_exception(emulator->windows,&api_before_arm,status,info)) return XXEMUL_STATUS_OK;
+            return status;
+        }
+    }
     if (emulator->windows != NULL && xxemul_windows_try_step(emulator->windows, info, &status)) {
+        if (emulator->windows_fault_dispatch && xxemul_windows_fault_status(status) && emulator->arch == XXEMUL_ARCH_X86 &&
+            xxemul_windows_try_exception(emulator->windows, &api_before, status, info)) return XXEMUL_STATUS_OK;
+        if (emulator->windows_fault_dispatch && xxemul_windows_fault_status(status) && emulator->arch == XXEMUL_ARCH_ARM &&
+            xxemul_windows_try_arm_exception(emulator->windows, &api_before_arm, status, info)) return XXEMUL_STATUS_OK;
         if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
         return status;
     }
@@ -583,13 +676,16 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
         fault_ip = emulator->x86.ip;
         if (emulator->windows) before = emulator->x86;
         emulator->fault_address_valid = 0;
+        emulator->windows_exception_code = 0;
         status = xxemul_x86_step(emulator, info);
         if (status == XXEMUL_STATUS_ADDRESS_FAULT && emulator->dos_mode) {
             return xxemul_x86_dispatch_pending_page_fault(emulator, info, fault_ip);
         }
-        if (emulator->windows && xxemul_windows_try_exception(emulator->windows, &before, status, info)) return XXEMUL_STATUS_OK;
-        if (emulator->windows && status == XXEMUL_STATUS_OK && (before.flags & 0x100u) &&
-            xxemul_windows_try_exception(emulator->windows, &emulator->x86, XXEMUL_WINDOWS_SINGLE_STEP_FAULT, info)) return XXEMUL_STATUS_OK;
+        if (emulator->windows && emulator->windows_fault_dispatch && xxemul_windows_fault_status(status) && xxemul_windows_try_exception(emulator->windows, &before, status, info)) return XXEMUL_STATUS_OK;
+        if (emulator->windows && emulator->windows_fault_dispatch && status == XXEMUL_STATUS_OK && (before.flags & 0x100u)) {
+            emulator->x86_debug[4] |= UINT64_C(0x4000);
+            if (xxemul_windows_try_exception(emulator->windows, &emulator->x86, XXEMUL_WINDOWS_SINGLE_STEP_FAULT, info)) return XXEMUL_STATUS_OK;
+        }
         return status;
     }
     if (emulator->arch == XXEMUL_ARCH_MIPS)
@@ -597,6 +693,13 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
             ? xxemul_mips64_step(emulator, info) : xxemul_mips_step(emulator, info);
     if (emulator->darwin != NULL && xxemul_darwin_try_step(emulator->darwin, info, &status)) {
         if (status == XXEMUL_STATUS_HALTED) emulator->halted = 1;
+        return status;
+    }
+    if (emulator->windows && emulator->arch == XXEMUL_ARCH_ARM) {
+        xxemul_arm_state before = emulator->arm;
+        emulator->fault_address_valid = 0; emulator->windows_exception_code = 0;
+        status = xxemul_arm_step(emulator, info);
+        if (emulator->windows_fault_dispatch && xxemul_windows_fault_status(status) && xxemul_windows_try_arm_exception(emulator->windows, &before, status, info)) return XXEMUL_STATUS_OK;
         return status;
     }
     return xxemul_arm_step(emulator, info);
@@ -651,6 +754,13 @@ xxemul_status xxemul_set_output_callback(xxemul *emulator, xxemul_output_callbac
     if (emulator == NULL) return XXEMUL_STATUS_INVALID_ARGUMENT;
     emulator->stream_output = callback;
     emulator->stream_output_context = context;
+    return XXEMUL_STATUS_OK;
+}
+
+xxemul_status xxemul_set_windows_fault_dispatch(xxemul *emulator, int enabled)
+{
+    if (!emulator || (enabled != 0 && enabled != 1)) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    emulator->windows_fault_dispatch = enabled;
     return XXEMUL_STATUS_OK;
 }
 

@@ -217,6 +217,11 @@ XXEMUL_API xxemul_status xxemul_set_guest_environment(xxemul *emulator, const ch
 /** Create a replacement emulator after a Linux memfd exec; caller owns both. */
 XXEMUL_API xxemul *xxemul_create_exec_successor(xxemul *emulator, xxemul_status *status);
 XXEMUL_API int xxemul_process_exit_code(const xxemul *emulator);
+/** Post ordinary window input to a stopped Windows guest through its real
+ * PostMessageA service. The window must belong to the current guest thread.
+ * CPU state is preserved; queued message effects remain. No process runs on
+ * the host. Calling during an emulator step or on another platform fails. */
+XXEMUL_API xxemul_status xxemul_post_window_message(xxemul *emulator, uint64_t window, uint32_t message, uint64_t wparam, uint64_t lparam);
 /** Optional process-backend diagnostic; NULL when none is available.
  * The returned string belongs to the emulator and may change on the next call. */
 XXEMUL_API const char *xxemul_process_error(const xxemul *emulator);
@@ -282,6 +287,22 @@ XXEMUL_API xxemul_status xxemul_set_memory_hook(xxemul *emulator, xxemul_memory_
 /** When enabled, a guest INT3 (and INT 3 outside DOS) returns
  * XXEMUL_STATUS_BREAKPOINT instead of halting the emulator. */
 XXEMUL_API xxemul_status xxemul_set_debug_traps(xxemul *emulator, int enabled);
+/** Automatic Windows native-fault dispatch is enabled by default. Disabling it
+ * exposes raw fault statuses at the native step boundary for host-side API
+ * probes/debugging. Explicit software exception APIs and existing active handlers still run normally.
+ * This does not turn an unhandled exception into successful execution. */
+XXEMUL_API xxemul_status xxemul_set_windows_fault_dispatch(xxemul *emulator, int enabled);
+/** Opt-in native-required DLL names. Empty selection preserves the modeled
+ * policy. Names are copied before process start; missing selected files never
+ * fall back to synthetic modules. PE32/PE64 x86 only; no live policy changes. */
+#define XXEMUL_WINDOWS_NATIVE_DLL_MAX_NAMES 16u
+#define XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY 48u
+XXEMUL_API xxemul_status xxemul_validate_windows_native_dlls(const char *const *names, size_t count);
+XXEMUL_API xxemul_status xxemul_set_windows_native_dlls(xxemul *emulator, const char *const *names, size_t count);
+/** Opt-in default EXE activation context. Disabled by default; disabled mode
+ * does not probe manifests or an assembly store. Enable/unset before process
+ * start only. PE32/PE64 x86 EXEs; DLL-as-main and other architectures unsupported. */
+XXEMUL_API xxemul_status xxemul_set_windows_activation_context(xxemul *emulator, int enabled);
 /** Linear address of the next instruction (CS base applied in DOS modes). */
 XXEMUL_API xxemul_status xxemul_get_current_address(const xxemul *emulator, uint64_t *address);
 /** Address of the current stack pointer, without reading guest memory.
@@ -298,10 +319,14 @@ XXEMUL_API xxemul_status xxemul_x86_get_segment_base(const xxemul *emulator, uns
 /** Linear address of segment:offset using the current segment state. */
 XXEMUL_API xxemul_status xxemul_x86_linear_address(const xxemul *emulator, unsigned segment_index, uint64_t offset, uint64_t *address);
 XXEMUL_API int xxemul_is_halted(const xxemul *emulator);
-/** Name of a synthetic OS entry point (for example a PE import thunk), or
- * NULL. The string is borrowed from the emulator. */
+/** Exact modeled OS or currently mapped native Windows export name, or NULL.
+ * Native names include data exports and actual EAT ordinals when no safe name
+ * is representable. No DLL is loaded by this query. The borrowed string must
+ * be copied before another symbol operation, guest/memory mutation, module
+ * lifetime change, or emulator destruction. No address-result cache is used. */
 XXEMUL_API const char *xxemul_symbol_name(const xxemul *emulator, uint64_t address);
-/** Best available symbol name, retaining module!function for modeled imports. */
+/** Exact Windows export name retaining module!selector qualification; the
+ * same borrowed lifetime and read-only rules as xxemul_symbol_name apply. */
 XXEMUL_API const char *xxemul_symbol_qualified_name(const xxemul *emulator, uint64_t address);
 
 #ifdef __cplusplus

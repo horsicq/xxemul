@@ -138,6 +138,10 @@ add_library(xxemul
     src/platforms/xxemul_bios.c
     src/platforms/xxemul_dpmi.c
     src/platforms/xxemul_windows.c
+    src/platforms/xxemul_windows_context.c
+    src/platforms/xxemul_windows_process_structures.c
+    src/platforms/xxemul_windows_unwind64.c
+    src/platforms/xxemul_windows_unwind_arm.c
     src/platforms/xxemul_linux.c
     src/platforms/xxemul_darwin.c
     src/platforms/xxemul_darwin.h
@@ -277,6 +281,16 @@ if(XXEMUL_BUILD_VIEWER)
 endif()
 
 if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
+    foreach(component seh seh_arm restore_records process_structures process_structures_unit unwind64 unwind_arm context)
+        if((component STREQUAL "seh" OR component STREQUAL "seh_arm" OR component STREQUAL "restore_records" OR component STREQUAL "process_structures") OR NOT (WIN32 AND BUILD_SHARED_LIBS))
+            add_executable(xxemul_windows_${component}_tests tests/test_windows_${component}.c)
+            target_compile_features(xxemul_windows_${component}_tests PRIVATE c_std_11)
+            target_include_directories(xxemul_windows_${component}_tests PRIVATE src)
+            target_link_libraries(xxemul_windows_${component}_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+            add_test(NAME xxemul_windows_${component} COMMAND xxemul_windows_${component}_tests)
+            set_tests_properties(xxemul_windows_${component} PROPERTIES TIMEOUT 120)
+        endif()
+    endforeach()
     add_executable(xxemul_x86_tsc_tests tests/test_x86_tsc.c)
     target_link_libraries(xxemul_x86_tsc_tests PRIVATE xxemul::xxemul xxfclib::xxfclib cdisasm::cdisasm)
     add_test(NAME xxemul_x86_tsc COMMAND xxemul_x86_tsc_tests)
@@ -370,6 +384,14 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
                     --test $<TARGET_FILE:xxemul_windows_threads_tests>
                     --work "${CMAKE_CURRENT_BINARY_DIR}/windows-thread-tests")
             set_tests_properties(xxemul_windows_threads_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_startup_context_tests tests/test_windows_startup_context.c)
+            target_link_libraries(xxemul_windows_startup_context_tests PRIVATE xxemul::xxemul)
+            target_compile_features(xxemul_windows_startup_context_tests PRIVATE c_std_11)
+            add_test(NAME xxemul_windows_startup_context_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_startup_context_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-startup-context-tests")
+            set_tests_properties(xxemul_windows_startup_context_tests PROPERTIES TIMEOUT 60)
             add_executable(xxemul_windows_dialog_tests tests/test_windows_dialog.c)
             target_link_libraries(xxemul_windows_dialog_tests PRIVATE xxemul::xxemul)
             add_test(NAME xxemul_windows_dialog_tests
@@ -398,6 +420,34 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
                     --test $<TARGET_FILE:xxemul_windows_pointer_checks_tests>
                     --work "${CMAKE_CURRENT_BINARY_DIR}/windows-pointer-checks-tests")
             set_tests_properties(xxemul_windows_pointer_checks_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_system_module_files_tests tests/test_windows_system_module_files.c)
+            target_link_libraries(xxemul_windows_system_module_files_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_system_module_files_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_system_module_files_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-system-module-files-tests")
+            set_tests_properties(xxemul_windows_system_module_files_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_copied_module_thunks_tests tests/test_windows_copied_module_thunks.c)
+            target_link_libraries(xxemul_windows_copied_module_thunks_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_copied_module_thunks_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_copied_module_thunks_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/tests/windows_copied_module_thunks")
+            set_tests_properties(xxemul_windows_copied_module_thunks_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_local_time_tests tests/test_windows_local_time.c)
+            target_link_libraries(xxemul_windows_local_time_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_local_time_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_local_time_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-local-time-tests")
+            set_tests_properties(xxemul_windows_local_time_tests PROPERTIES TIMEOUT 60)
+            add_executable(xxemul_windows_nt_process_tests tests/test_windows_nt_process.c)
+            target_link_libraries(xxemul_windows_nt_process_tests PRIVATE xxemul::xxemul)
+            add_test(NAME xxemul_windows_nt_process_tests
+                COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_windows_registry_temp.py"
+                    --test $<TARGET_FILE:xxemul_windows_nt_process_tests>
+                    --work "${CMAKE_CURRENT_BINARY_DIR}/windows-nt-process-tests" --processes)
+            set_tests_properties(xxemul_windows_nt_process_tests PROPERTIES TIMEOUT 60)
             add_executable(xxemul_windows_gui_abi_tests tests/test_windows_gui_abi.c)
             target_link_libraries(xxemul_windows_gui_abi_tests PRIVATE xxemul::xxemul)
             add_test(NAME xxemul_windows_gui_abi_tests

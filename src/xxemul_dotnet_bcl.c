@@ -64,6 +64,10 @@ struct xxemul_dotnet_bcl_host {
     bcl_object *objects, *resolver;
     size_t module_count, native_bytes, output_bytes;
     uint64_t remaining_instructions;
+    xxemul_dotnet_bcl_pinvoke_callback pinvoke_callback;
+    void *pinvoke_context;
+    uint64_t max_native_instructions, remaining_native_instructions;
+    uint32_t native_last_error;
     unsigned executing, invoke_depth;
     char *entry_path, *filesystem_root;
     char diagnostic[512];
@@ -903,6 +907,7 @@ static int framework_assembly(const char *assembly)
     static const char *const names[] = {"mscorlib",
                                         "System.Private.CoreLib",
                                         "System.Runtime",
+                                        "System.Runtime.InteropServices",
                                         "System.Console",
                                         "System",
                                         "System.Core",
@@ -956,6 +961,7 @@ static int supported_signature(const xxemul_dotnet_method_info *method)
         S("System.Object", "GetType", "()System.Type"),
         S("System.Object", "ToString", "()System.String"),
         S("System.Object", "ReferenceEquals", "(System.Object,System.Object)System.Boolean"),
+        S("System.Runtime.InteropServices.Marshal", "GetLastWin32Error", "()System.Int32"),
         S("System.Text.UTF8Encoding", ".ctor", "()System.Void"),
         S("System.Text.UTF8Encoding", ".ctor", "(System.Boolean)System.Void"),
         S("System.Text.UTF8Encoding", ".ctor", "(System.Boolean,System.Boolean)System.Void"),
@@ -1090,6 +1096,36 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
     bcl_module *module = module_for(h, program);
     *out = value(XXEMUL_DOTNET_VALUE_VOID, 0);
     ++h->statistics.service_calls;
+    if (m->flags & UINT32_C(0x2000)) {
+        const xxemul_dotnet_pinvoke_info *binding = m->pinvoke;
+        uint64_t before = h->remaining_native_instructions;
+        uint32_t last_error = 0;
+        xxemul_dotnet_value_kind expected;
+        if (!binding || !binding->supported || count != binding->parameter_count || !h->pinvoke_callback)
+            return host_fail(h, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "unsupported native P/Invoke: %s", m->selector);
+        if (!before) return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "native P/Invoke instruction budget exhausted: %s", m->selector);
+        ++h->statistics.native_calls;
+        status = h->pinvoke_callback(h->pinvoke_context, vm, m, a, count, out, &last_error, &h->remaining_native_instructions);
+        if (h->remaining_native_instructions > before)
+            return host_fail(h, XXEMUL_STATUS_INVALID_ARGUMENT, "native provider increased instruction budget: %s", m->selector);
+        h->statistics.native_instructions += before - h->remaining_native_instructions;
+        if (status != XXEMUL_STATUS_OK)
+            return host_fail(h, status, "native P/Invoke failed (%u): %s!%s", (unsigned)status, binding->module_name, binding->entry_point);
+        if (before == h->remaining_native_instructions)
+            return host_fail(h, XXEMUL_STATUS_INVALID_ARGUMENT, "native provider completed without executing a guest instruction: %s", m->selector);
+        switch (binding->return_type) {
+            case 0x01: expected = XXEMUL_DOTNET_VALUE_VOID; break;
+            case 0x0a: case 0x0b: expected = XXEMUL_DOTNET_VALUE_I8; break;
+            case 0x18: case 0x19: expected = XXEMUL_DOTNET_VALUE_NATIVE; break;
+            default: expected = XXEMUL_DOTNET_VALUE_I4; break;
+        }
+        if (out->kind != expected || (expected == XXEMUL_DOTNET_VALUE_I4 && out->bits > UINT32_MAX) ||
+            (expected == XXEMUL_DOTNET_VALUE_NATIVE && xxemul_dotnet_pointer_size(program) == 4u && out->bits > UINT32_MAX) ||
+            (binding->return_type == 0x02 && out->bits > 1u))
+            return host_fail(h, XXEMUL_STATUS_INVALID_ARGUMENT, "native provider returned an incompatible scalar: %s", m->selector);
+        if (binding->flags & 0x40u) h->native_last_error = last_error;
+        return XXEMUL_STATUS_OK;
+    }
     if (!strcmp(t, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream")) {
         if (!(h->config.flags & XXEMUL_DOTNET_BCL_SHARPZIP_STREAMS))
             goto unsupported;
@@ -1097,6 +1133,10 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         goto unsupported;
     if (!supported_signature(m))
         goto unsupported;
+    if (!strcmp(t, "System.Runtime.InteropServices.Marshal") && !strcmp(name, "GetLastWin32Error") && !count) {
+        *out = value(XXEMUL_DOTNET_VALUE_I4, h->native_last_error);
+        return XXEMUL_STATUS_OK;
+    }
     if (!strcmp(t, "System.Object") && !strcmp(name, ".ctor") && count == 1)
         return XXEMUL_STATUS_OK;
     if ((!strcmp(t, "System.Object") || !strcmp(t, "System.Exception")) && !strcmp(name, "GetType") && count == 1) {
@@ -2043,6 +2083,16 @@ void xxemul_dotnet_bcl_host_destroy(xxemul_dotnet_bcl_host *h)
     host_free(h, h->entry_path, strlen(h->entry_path) + 1);
     free(h);
 }
+xxemul_status xxemul_dotnet_bcl_set_pinvoke_callback(xxemul_dotnet_bcl_host *h,
+    xxemul_dotnet_bcl_pinvoke_callback callback, void *context, uint64_t max_native_instructions)
+{
+    if (!h || h->executing || h->entry_module || (!callback && (context || max_native_instructions)))
+        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    h->pinvoke_callback = callback;
+    h->pinvoke_context = context;
+    h->max_native_instructions = callback ? (max_native_instructions ? max_native_instructions : UINT64_C(0x100000)) : 0;
+    return XXEMUL_STATUS_OK;
+}
 static xxemul_status bcl_execute_impl(xxemul_dotnet_bcl_host *h, const xxemul_dotnet_program *program, int argc, const char *const *argv,
                                       xxemul_dotnet_result *result)
 {
@@ -2057,6 +2107,7 @@ static xxemul_status bcl_execute_impl(xxemul_dotnet_bcl_host *h, const xxemul_do
     h->diagnostic[0] = 0;
     h->output_bytes = 0;
     h->remaining_instructions = h->config.max_instructions;
+    h->remaining_native_instructions = h->max_native_instructions;
     {
         size_t size;
         xxemul_dotnet_data(program, &size);

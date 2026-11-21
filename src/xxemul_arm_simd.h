@@ -125,6 +125,25 @@ static int xxemul_arm_simd(xxemul *e, const cdisasm_arm_instruction *in, uint64_
             *status = xxemul_arm_write_register(e, reg->reg, UINT64_C(0x8004c004));
             return 1;
         }
+        if (system->imm == UINT64_C(0xda20) || system->imm == UINT64_C(0xda21)) {
+            uint32_t *fp_status = system->imm == UINT64_C(0xda20) ? &e->arm.fpcr : &e->arm.fpsr;
+            if (name == CDISASM_ARM_NAME_MRS) *status = xxemul_arm_write_register(e, reg->reg, *fp_status);
+            else {
+                *status = xxemul_arm_read_register(e, reg->reg, pc, &value, NULL);
+                if (*status == XXEMUL_STATUS_OK) *fp_status = (uint32_t)value;
+            }
+            return 1;
+        }
+        if (e->windows && system->imm == UINT64_C(0xde82)) {
+            /* TPIDR_EL0 is user TLS state; Windows ARM64's TEB is X18. */
+            if (name == CDISASM_ARM_NAME_MRS)
+                *status = xxemul_arm_write_register(e, reg->reg, e->arm_thread_pointer_valid ? e->arm_thread_pointer : 0u);
+            else {
+                *status = xxemul_arm_read_register(e, reg->reg, pc, &value, NULL);
+                if (*status == XXEMUL_STATUS_OK) { e->arm_thread_pointer = value; e->arm_thread_pointer_valid = 1u; }
+            }
+            return 1;
+        }
         /* cdisasm's packed system-register operand for NZCV (S3_3_C4_C2_0). */
         if (system->imm != UINT64_C(0xda10)) return 1;
         if (name == CDISASM_ARM_NAME_MRS) {

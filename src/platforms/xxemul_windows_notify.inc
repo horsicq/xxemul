@@ -145,6 +145,10 @@ static xxemul_status win_dll_continue(xxemul_windows *process, int returned, xxe
                 order = UINT64_MAX;
                 for (i = 0u; i < process->module_count; ++i) {
                     win_module *module = &process->modules[i];
+                    /* A nested LoadLibrary/forwarder transaction owns its
+                     * root's dependency closure, not older startup work.
+                     * Startup frames retain the global ordered drain. */
+                    if (!frame->startup && !win_dll_reaches(process, frame->root_slot, i, 0u)) continue;
                     if (module->real && module->live && !module->initialized && !module->initializing &&
                         module->init_order && module->init_order < order) { slot = i; order = module->init_order; }
                 }
@@ -182,6 +186,7 @@ static xxemul_status win_dll_continue(xxemul_windows *process, int returned, xxe
          * also returned. Those callbacks may still call DLL code. */
         for (i = 0u; i < process->module_count; ++i)
             if (process->modules[i].real && process->modules[i].live) win_dll_discard(process, i);
+        win_runtime_abandon_process(process);
         process->process_terminated = 1u;
         process->exit_code = frame->exit_code;
         process->emulator->exit_code = (uint8_t)frame->exit_code;
@@ -286,6 +291,7 @@ static int win_dll_exit_needed(xxemul_windows *process)
 {
     size_t i;
     if (process->dll_exiting) return 0;
+    if (win_fls_has_values(process)) return 1;
     if (process->tls_started && process->main_tls.callbacks) return 1;
     for (i = 0u; i < process->module_count; ++i) if (process->modules[i].real && process->modules[i].live) return 1;
     return 0;
@@ -293,8 +299,20 @@ static int win_dll_exit_needed(xxemul_windows *process)
 
 static xxemul_status win_dll_exit(xxemul_windows *process, uint32_t code, xxemul_step_info *info)
 {
-    win_dll_frame *frame = win_dll_frame_begin(process);
+    win_dll_frame *frame;
     size_t i;
+    if (win_fls_current(process)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (!process->fls_process_exiting) {
+        /* ExitProcess ends the other threads before the calling thread's
+         * FLS/DLL cleanup. This is abrupt: do not invoke their destructors. */
+        process->fls_process_exiting = 1u;
+        for (i = 0u; i < WIN_MAX_THREADS; ++i)
+            if (i != process->thread_current && process->threads[i].active)
+                win_thread_end(process, i, code);
+    }
+    if (win_fls_has_values(process)) return win_fls_start_exit(process, WIN_FLS_PROCESS_EXIT, code, info);
+    process->threads[process->thread_current].fls_cleanup_done = 1u;
+    frame = win_dll_frame_begin(process);
     if (!frame) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     frame->unloading = 1u;
     frame->exiting = 1u;

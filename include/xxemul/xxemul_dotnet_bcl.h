@@ -11,6 +11,15 @@ extern "C" {
 
 typedef struct xxemul_dotnet_bcl_host xxemul_dotnet_bcl_host;
 typedef void (*xxemul_dotnet_bcl_output_callback)(void *context, unsigned stream, const char *data, size_t size);
+/** Optional native-guest provider for validated scalar ImplMap declarations.
+ * It must execute the requested guest function, decrement remaining_budget for
+ * each native instruction, and return its typed result/actual LastError. It
+ * must never execute a host DLL or implicitly accept an unsupported import.
+ * Arguments and method metadata are borrowed for the duration of the call. */
+typedef xxemul_status (*xxemul_dotnet_bcl_pinvoke_callback)(void *context, xxemul_dotnet_vm *vm,
+    const xxemul_dotnet_method_info *method, const xxemul_dotnet_value *arguments,
+    size_t argument_count, xxemul_dotnet_value *result, uint32_t *last_error,
+    uint64_t *remaining_budget);
 
 /** Explicit compatibility implementation of SharpZipLib's public decompression
  * stream interface. It uses xxfclib's checked zlib decoder; it never extracts a
@@ -40,10 +49,19 @@ typedef struct xxemul_dotnet_bcl_statistics {
     uint64_t service_calls, reflected_invocations, stream_reads, stream_writes;
     uint64_t sha256_operations, assemblies_loaded, managed_instructions;
     uint64_t sharpzip_streams;
+    uint64_t native_calls, native_instructions;
 } xxemul_dotnet_bcl_statistics;
 
 XXEMUL_API xxemul_dotnet_bcl_host *xxemul_dotnet_bcl_host_create(const xxemul_dotnet_bcl_config *config, xxemul_status *status);
 XXEMUL_API void xxemul_dotnet_bcl_host_destroy(xxemul_dotnet_bcl_host *host);
+/** Configure before execute; NULL disables native dispatch. Zero budget with a
+ * provider selects 1,000,000 native instructions, shared by all calls and child
+ * VMs during entry execution. This setter keeps the input config ABI intact.
+ * Without a provider, P/Invoke remains explicitly unsupported. SetLastError
+ * declarations retain the actual returned native error for Marshal's getter;
+ * unflagged calls preserve the last captured error (Framework-style policy). */
+XXEMUL_API xxemul_status xxemul_dotnet_bcl_set_pinvoke_callback(xxemul_dotnet_bcl_host *host,
+    xxemul_dotnet_bcl_pinvoke_callback callback, void *context, uint64_t max_native_instructions);
 /** Execute the actual CLI entry with a real System.String[] vector. The
  * borrowed root program must outlive host. Assembly.Load creates bounded
  * parsed child programs and reflection invokes their real CIL. Unknown

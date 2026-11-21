@@ -11,6 +11,31 @@ function(xxemul_add_dotnet_tests)
     add_executable(xxemul_dotnet_pointer_tests "${_managed_root}/tests/test_dotnet_pointer_tables.c")
     target_link_libraries(xxemul_dotnet_pointer_tests PRIVATE xxemul::xxemul xxfclib::xxfclib)
     add_test(NAME xxemul_dotnet_pointer_tables COMMAND xxemul_dotnet_pointer_tests)
+    add_executable(xxemul_dotnet_pinvoke_metadata_tests "${_managed_root}/tests/test_dotnet_pinvoke_metadata.c")
+    target_link_libraries(xxemul_dotnet_pinvoke_metadata_tests PRIVATE xxemul::xxemul)
+    add_test(NAME xxemul_dotnet_pinvoke_metadata COMMAND xxemul_dotnet_pinvoke_metadata_tests)
+    add_executable(xxemul_dotnet_pinvoke_host_tests "${_managed_root}/tests/test_dotnet_pinvoke_host.c")
+    target_link_libraries(xxemul_dotnet_pinvoke_host_tests PRIVATE xxemul::xxemul)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME xxemul_dotnet_pinvoke_host
+            COMMAND "${Python3_EXECUTABLE}" -B "${_managed_root}/tests/run_dotnet_pinvoke_host_tests.py"
+                --unit $<TARGET_FILE:xxemul_dotnet_pinvoke_host_tests>
+                --generator "${_managed_root}/tests/owned_pe_pinvoke_fixture.py"
+                --work "${CMAKE_CURRENT_BINARY_DIR}/pinvoke-host")
+        set_tests_properties(xxemul_dotnet_pinvoke_host PROPERTIES TIMEOUT 120)
+        # The direct bridge entry is private, so a Windows shared-library build
+        # exercises it through the public managed integration instead.
+        if(NOT (WIN32 AND BUILD_SHARED_LIBS))
+            add_executable(xxemul_windows_native_bridge_tests "${_managed_root}/tests/test_windows_native_bridge.c")
+            target_include_directories(xxemul_windows_native_bridge_tests PRIVATE "${_managed_root}/src")
+            target_link_libraries(xxemul_windows_native_bridge_tests PRIVATE xxemul::xxemul xxfclib::xxfclib cdisasm::cdisasm)
+            add_test(NAME xxemul_windows_native_bridge
+                COMMAND "${Python3_EXECUTABLE}" -B "${_managed_root}/tests/run_windows_native_bridge.py"
+                    --exe $<TARGET_FILE:xxemul_windows_native_bridge_tests>)
+            set_tests_properties(xxemul_windows_native_bridge PROPERTIES TIMEOUT 120)
+        endif()
+    endif()
 
     if(EXISTS "${XXEMUL_XXFCLIB_SOURCE_DIR}/tests/test_dotnet_resources.c")
         add_executable(xxemul_dotnet_resource_tests "${XXEMUL_XXFCLIB_SOURCE_DIR}/tests/test_dotnet_resources.c")

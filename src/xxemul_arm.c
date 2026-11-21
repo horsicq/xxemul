@@ -2,6 +2,7 @@
 #include "xxemul_arm_auth.h"
 #include "platforms/xxemul_darwin.h"
 #include "platforms/xxemul_linux.h"
+#include "platforms/xxemul_windows.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -547,17 +548,22 @@ static xxemul_status xxemul_arm_decode_current(xxemul *emulator, cdisasm_arm_ins
 
     /* Linux loaders execute their folded code in mmap regions outside the
      * original image. Fetch through the same guest memory path as data. */
+    emulator->x86_fetching = 1u; /* permission is checked on the decoded span, not lookahead */
     status = xxemul_read_memory(emulator, emulator->arm.pc, code, available);
     if (status != XXEMUL_STATUS_OK && emulator->mode == XXEMUL_MODE_ARM_T32) {
         available = 2u;
         status = xxemul_read_memory(emulator, emulator->arm.pc, code, available);
     }
     if (status != XXEMUL_STATUS_OK) {
+        emulator->x86_fetching = 0u;
         return status;
     }
     if (emulator->mode == XXEMUL_MODE_ARM_T32 && (xxemul_arm_itstate(emulator) & 15u))
         flags.bitmap[CDISASM_ARM_DECODE_FLAGS_OPTION_BITMAP] |= CDISASM_ARM_DECODE_OPTION_IN_IT_BLOCK;
     decoded_size = cdisasm_arm_decode(CDISASM_ARM_CPU_ANY, xxemul_arm_cdisasm_mode(emulator), code, available, emulator->arm.pc, &flags, instruction);
+    emulator->x86_fetching = 0u;
+    if (emulator->windows && emulator->in_step && decoded_size &&
+        !xxemul_windows_memory_access(emulator->windows,emulator->arm.pc,decoded_size,8u,1)) return XXEMUL_STATUS_ADDRESS_FAULT;
     return decoded_size == 0u ? XXEMUL_STATUS_DECODE_ERROR : XXEMUL_STATUS_OK;
 }
 
@@ -1614,11 +1620,16 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
     uint8_t itstate = emulator->mode == XXEMUL_MODE_ARM_T32 ? xxemul_arm_itstate(emulator) : 0u;
     xxemul_status status;
 
+    emulator->x86_fetching = 1;
     status = xxemul_arm_decode_current(emulator, &instruction);
+    emulator->x86_fetching = 0;
     if (status != XXEMUL_STATUS_OK) {
+        if (emulator->windows && status == XXEMUL_STATUS_DECODE_ERROR && instruction.last_error_id == CDISASM_STATUS_INVALID_INSTRUCTION)
+            emulator->windows_exception_code = UINT32_C(0xc000001d);
         return status;
     }
     if ((instruction.instruction_flags & (CDISASM_ARM_INSTRUCTION_FLAG_ILLEGAL | CDISASM_ARM_INSTRUCTION_FLAG_UNPREDICTABLE)) != 0u) {
+        if (emulator->windows) emulator->windows_exception_code = UINT32_C(0xc000001d);
         return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
     if (itstate & 15u) {
@@ -1678,8 +1689,42 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
             break;
         case CDISASM_ARM_NAME_BKPT:
         case CDISASM_ARM_NAME_BRK:
+            if (emulator->windows) {
+                emulator->windows_exception_code = UINT32_C(0x80000003);
+                status = XXEMUL_STATUS_BREAKPOINT;
+                break;
+            }
             emulator->halted = 1;
             status = XXEMUL_STATUS_HALTED;
+            break;
+        case CDISASM_ARM_NAME_MRC:
+        case CDISASM_ARM_NAME_MCR:
+            /* CP15 TPIDRURW: Windows ARM32's NtCurrentTeb intrinsic. The
+             * decoder supplies the packed coprocessor selectors and GPR. */
+            if (!emulator->windows || emulator->mode == XXEMUL_MODE_ARM_A64 || instruction.operand_count != 2u ||
+                instruction.operand[0].type != CDISASM_OPERAND_IMMEDIATE ||
+                instruction.operand[0].imm != UINT64_C(0x1068f) ||
+                instruction.operand[1].type != CDISASM_OPERAND_REGISTER ||
+                instruction.operand[1].reg < CDISASM_ARM_REG_R0 || instruction.operand[1].reg > CDISASM_ARM_REG_R14)
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            if (instruction.name_id == CDISASM_ARM_NAME_MRC)
+                status = xxemul_arm_write_register(emulator, instruction.operand[1].reg,
+                    emulator->arm_thread_pointer_valid ? emulator->arm_thread_pointer : xxemul_windows_teb_address(emulator->windows));
+            else {
+                status = xxemul_arm_read_register(emulator, instruction.operand[1].reg, current_pc, &value, NULL);
+                if (status == XXEMUL_STATUS_OK) {
+                    emulator->arm_thread_pointer = (uint32_t)value;
+                    emulator->arm_thread_pointer_valid = 1u;
+                }
+            }
+            break;
+        case CDISASM_ARM_NAME_UDF:
+            if (emulator->windows) emulator->windows_exception_code = UINT32_C(0xc000001d);
+            status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            break;
+        case CDISASM_ARM_NAME_HLT:
+            if (emulator->windows) emulator->windows_exception_code = UINT32_C(0xc0000096);
+            status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             break;
         case CDISASM_ARM_NAME_MOV:
         case CDISASM_ARM_NAME_MOVS:

@@ -88,7 +88,13 @@ struct xxemul {
     void *memory_hook_context;
     int in_step;
     int x86_fetching;
+    int x86_rep_partial;
     int debug_traps;
+    int windows_fault_dispatch;
+    uint8_t windows_native_dll_count;
+    uint8_t windows_native_policy_locked;
+    uint8_t windows_default_actctx;
+    char windows_native_dlls[XXEMUL_WINDOWS_NATIVE_DLL_MAX_NAMES][XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY];
     uint64_t fault_address;
     unsigned fault_access;
     int fault_address_valid;
@@ -99,6 +105,11 @@ struct xxemul {
      * host time and debugger register/IP writes. OS-service dispatch and
      * failed/undecoded instructions do not advance the counter. */
     uint64_t x86_tsc;
+    /* Canonical physical x87/MMX bits. Numeric arrays below are derived
+     * contiguous-stack caches, with the inherited binary64/exact-int precision.
+     * Never serialize arbitrary register bits through those numeric caches. */
+    uint8_t x87_raw[8][10];
+    uint16_t x87_tags;
     double x87_stack[8];
     uint64_t x87_int_val[8];
     uint8_t x87_is_int[8];
@@ -106,6 +117,14 @@ struct xxemul {
     uint8_t x87_top;
     uint16_t x87_control;
     uint16_t x87_status;
+    /* Modeled architectural state exposed by Windows CONTEXT/FXSAVE. */
+    uint64_t x86_debug[6]; /* DR0..DR3, DR6, DR7. */
+    uint32_t x86_mxcsr;
+    uint32_t windows_exception_code;
+    uint64_t arm_break_value[8], arm_watch_value[2];
+    uint32_t arm_break_control[8], arm_watch_control[2];
+    uint64_t arm_thread_pointer;
+    uint8_t arm_thread_pointer_valid;
     xxemul_arm_state arm;
     xxemul_mips_state mips;
     uint32_t mips_branch_target;

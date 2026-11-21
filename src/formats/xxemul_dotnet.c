@@ -16,6 +16,7 @@
 #define DN_COUNT_LIMIT ((size_t)200000)
 #define DN_SIGNATURE_LIMIT ((size_t)65536)
 #define DN_ARGUMENT_LIMIT ((size_t)1024)
+#define DN_NATIVE_ARGUMENT_LIMIT ((size_t)64)
 #define DN_DEPTH_LIMIT 32
 #define DN_WORK_LIMIT ((size_t)128 * 1024 * 1024)
 #define DN_TOKEN(table, rid) (((uint32_t)(table) << 24) | (uint32_t)(rid))
@@ -1174,19 +1175,20 @@ static int dn_load_exception_clauses(dn_loader *loader, xxemul_dotnet_method *me
     while (more) {
         const uint8_t *header;
         xxemul_dotnet_exception_clause *clauses;
+        xx_dotnet_method_eh_section section;
         size_t length, width, count, i, old = method->clause_count;
         int fat;
         offset = start + ((offset - start + 3u) & ~(size_t)3u);
         if (++sections > 64 || !dn_range(end, offset, 4)) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
         header = data + offset;
-        if ((header[0] & 0x3fu) != 1u) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
-        fat = (header[0] & 0x40u) != 0;
-        more = (header[0] & 0x80u) != 0;
-        length = fat ? (size_t)header[1] | (size_t)header[2] << 8 | (size_t)header[3] << 16 : header[1];
-        width = fat ? 24u : 12u;
-        if ((!fat && (header[2] || header[3])) || length < 4 || !dn_range(end, offset, length) || (length - 4) % width)
+        if (old > 4096u || !xx_dotnet_method_eh_section_decode(header, end - offset,
+                XX_DOTNET_METHOD_BODY_ALLOW_LEGACY_EH_SIZE, (uint32_t)old, &section))
             return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
-        count = (length - 4) / width;
+        fat = section.fat;
+        more = section.more;
+        length = section.size;
+        width = section.clause_size;
+        count = section.clause_count;
         if (count > 4096u - old || !dn_work(loader, count * sizeof(*clauses))) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
         if (count) {
             clauses = (xxemul_dotnet_exception_clause *)realloc(method->clauses, (old + count) * sizeof(*clauses));
@@ -1229,7 +1231,7 @@ static int dn_load_body(dn_loader *loader, xxemul_dotnet_method *method)
     if (!method->info.rva) return 1;
     /* Native/runtime-provided bodies are retained as inventory, never IL. */
     if ((method->info.impl_flags & 3) != 0 || (method->info.impl_flags & 4)) return 1;
-    if (!xx_dotnet_inspect_method_body(&loader->inspection, method->info.rva, &body) || body.code_size > 16u * 1024u * 1024u || body.code_offset < 0 ||
+    if (!xx_dotnet_inspect_method_body_ex(&loader->inspection, method->info.rva, XX_DOTNET_METHOD_BODY_ALLOW_LEGACY_EH_SIZE, &body) || body.code_size > 16u * 1024u * 1024u || body.code_offset < 0 ||
         (uint64_t)body.code_offset > SIZE_MAX || !dn_range(loader->program->size, (size_t)body.code_offset, body.code_size))
         return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
     method->code = loader->program->data + (size_t)body.code_offset;
@@ -1347,6 +1349,188 @@ static int dn_load_methods(dn_loader *loader)
     return 1;
 }
 
+static uint8_t dn_native_type(const xxemul_dotnet_type *type)
+{
+    /* The managed parser normalizes a few trusted valuetypes to scalars for
+     * CIL/BCL execution. Their native layout is not thereby proven. */
+    if (type->token && (type->element_type == 0x08u || type->element_type == 0x18u)) return 0x11u;
+    return type->element_type;
+}
+static int dn_native_scalar(const xxemul_dotnet_type *type, int allow_void)
+{
+    uint8_t kind = dn_native_type(type);
+    if (type->token || !type->supported) return 0;
+    return (allow_void && kind == 0x01u) || kind == 0x02u || (kind >= 0x04u && kind <= 0x0bu) || kind == 0x18u || kind == 0x19u;
+}
+
+/* MarshalAs belongs to Param definition tokens even in unoptimized #- metadata
+ * with ParamPtr permutations. Build ownership once rather than scan methods
+ * for every FieldMarshal row. No custom native marshalling is guessed. */
+static int dn_native_marshal_methods(dn_loader *loader, uint8_t *marshaled)
+{
+    const xx_dotnet_inspect_cli *cli = loader->cli;
+    uint32_t *owners = NULL, rid, previous = 1u, list_table = cli->pRows[7] ? 7u : 8u;
+    int ok = 0;
+    if (cli->pRows[8]) {
+        owners = (uint32_t *)calloc(cli->pRows[8], sizeof(*owners));
+        if (!owners) return dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY);
+    }
+    for (rid = 1u; rid <= loader->program->method_def_count + 1u; ++rid) {
+        uint32_t next, slot;
+        if (rid <= loader->program->method_def_count) {
+            const uint8_t *row = dn_row(loader, 6u, rid);
+            if (!row) goto done;
+            row += 8u + cli->nStringIndexSize + cli->nBlobIndexSize;
+            next = dn_index(&row, cli->pIndexSize[list_table]);
+        } else next = cli->pRows[list_table] + 1u;
+        if (next < previous || next > cli->pRows[list_table] + 1u || (rid == 1u && next != 1u)) {
+            dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done;
+        }
+        for (slot = previous; slot < next; ++slot) {
+            uint32_t parameter = slot;
+            if (list_table == 7u) {
+                const uint8_t *row = dn_row(loader, 7u, slot);
+                if (!row) goto done;
+                parameter = dn_index(&row, cli->pIndexSize[8]);
+            }
+            if (!parameter || parameter > cli->pRows[8] || owners[parameter - 1u]) {
+                dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done;
+            }
+            owners[parameter - 1u] = rid - 1u;
+        }
+        previous = next;
+    }
+    for (rid = 1u; rid <= cli->pRows[13]; ++rid) {
+        const uint8_t *row = dn_row(loader, 13u, rid);
+        uint32_t parent;
+        if (!row || !dn_coded_token(loader, 6u, dn_index(&row, cli->nHasFieldMarshalSize), &parent)) goto done;
+        if (!parent) { dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done; }
+        if ((parent >> 24) == 8u) {
+            uint32_t owner = owners[(parent & 0xffffffu) - 1u];
+            if (!owner || owner > loader->program->method_def_count) { dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done; }
+            marshaled[owner - 1u] = 1u;
+        }
+    }
+    for (rid = 1u; rid <= cli->pRows[8]; ++rid) {
+        const uint8_t *row = dn_row(loader, 8u, rid);
+        if (!row) goto done;
+        /* A dangling HasFieldMarshal flag cannot silently regain default
+         * scalar ABI semantics even if its FieldMarshal row is missing. */
+        if (xxemul_dotnet_u16(row) & 0x2000u) {
+            if (!owners[rid - 1u]) { dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done; }
+            marshaled[owners[rid - 1u] - 1u] = 1u;
+        }
+    }
+    ok = 1;
+done:
+    free(owners);
+    return ok;
+}
+
+static int dn_native_abi_directives(dn_loader *loader, uint8_t *unsupported)
+{
+    const xx_dotnet_inspect_cli *cli = loader->cli;
+    xxemul_dotnet_program *program = loader->program;
+    uint32_t rid;
+    for (rid = 1u; rid <= cli->pRows[12]; ++rid) {
+        const uint8_t *row = dn_row(loader, 12u, rid);
+        uint32_t parent, constructor;
+        size_t method;
+        const char *type;
+        if (!row || !dn_coded_token(loader, 4u, dn_index(&row, cli->nHasCustomAttributeSize), &parent) ||
+            !dn_coded_token(loader, 5u, dn_index(&row, cli->nCustomAttributeTypeSize), &constructor)) return 0;
+        if ((parent >> 24) != 6u && (parent >> 24) != 32u) continue;
+        if ((constructor >> 24) == 6u) method = (constructor & 0xffffffu) - 1u;
+        else if ((constructor >> 24) == 10u) method = program->memberref_map[(constructor & 0xffffffu) - 1u];
+        else continue;
+        if (method >= program->method_count || strcmp(program->methods[method].info.name, ".ctor")) continue;
+        type = program->methods[method].info.type_name;
+        if (strcmp(type, "System.Runtime.CompilerServices.DisableRuntimeMarshallingAttribute") &&
+            strcmp(type, "System.Runtime.InteropServices.LCIDConversionAttribute") &&
+            strcmp(type, "System.Runtime.InteropServices.UnmanagedCallConvAttribute") &&
+            strcmp(type, "System.Runtime.InteropServices.DefaultDllImportSearchPathsAttribute")) continue;
+        /* Call-shape/marshalling directives and search scopes need explicit
+         * provider support. Retain inventory; never silently assume defaults.
+         * Attribute payloads are not interpreted or executed by this loader. */
+        if ((parent >> 24) == 32u) { if (program->method_def_count) memset(unsupported, 1, program->method_def_count); }
+        else unsupported[(parent & 0xffffffu) - 1u] = 1u;
+    }
+    return 1;
+}
+
+static int dn_load_pinvokes(dn_loader *loader)
+{
+    xxemul_dotnet_program *program = loader->program;
+    const xx_dotnet_inspect_cli *cli = loader->cli;
+    uint8_t *marshaled = NULL;
+    uint32_t rid;
+    int ok = 0;
+    if (!cli->pRows[28]) {
+        for (rid = 0u; rid < program->method_def_count; ++rid)
+            if (program->methods[rid].info.flags & 0x2000u) return dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE);
+        return 1;
+    }
+    if (program->method_def_count) {
+        marshaled = (uint8_t *)calloc(program->method_def_count, 1u);
+        if (!marshaled) return dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY);
+    }
+    if (!dn_native_marshal_methods(loader, marshaled) || !dn_native_abi_directives(loader, marshaled)) goto done;
+    for (rid = 1u; rid <= cli->pRows[28]; ++rid) {
+        const uint8_t *row = dn_row(loader, 28u, rid), *module;
+        uint32_t flags, member, name, scope, convention;
+        xxemul_dotnet_method *method;
+        size_t i;
+        uint8_t *types;
+        if (!row) goto done;
+        flags = xxemul_dotnet_u16(row); row += 2u;
+        if (!dn_coded_token(loader, 10u, dn_index(&row, cli->nMemberForwardedSize), &member) || (member >> 24) != 6u) {
+            dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done;
+        }
+        name = dn_index(&row, cli->nStringIndexSize);
+        scope = dn_index(&row, cli->pIndexSize[26]);
+        convention = flags & 0x0700u;
+        if (!scope || scope > cli->pRows[26] || (flags & ~0x3777u) || (flags & 0x0030u) == 0x0030u ||
+            (flags & 0x3000u) == 0x3000u || convention > 0x0500u) {
+            dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done;
+        }
+        method = program->methods + (member & 0xffffffu) - 1u;
+        if (method->info.pinvoke || !(method->info.flags & 0x2000u) || !(method->info.flags & 0x10u) || method->info.rva) {
+            dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done;
+        }
+        method->info.pinvoke = &method->pinvoke;
+        method->pinvoke.flags = flags;
+        method->pinvoke.entry_point = dn_heap_string(loader, name);
+        module = dn_row(loader, 26u, scope);
+        if (!module) goto done;
+        method->pinvoke.module_name = dn_heap_string(loader, dn_index(&module, cli->nStringIndexSize));
+        if (!method->pinvoke.entry_point || !*method->pinvoke.entry_point || !method->pinvoke.module_name || !*method->pinvoke.module_name) {
+            dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done;
+        }
+        method->pinvoke.return_type = dn_native_type(&method->signature.return_type);
+        method->pinvoke.parameter_count = method->signature.parameter_count;
+        types = method->signature.parameter_count ? (uint8_t *)malloc(method->signature.parameter_count) : NULL;
+        if (method->signature.parameter_count && !types) { dn_fail(loader, XXEMUL_STATUS_OUT_OF_MEMORY); goto done; }
+        method->pinvoke.parameter_types = types;
+        method->pinvoke.supported = method->signature.parameter_count <= DN_NATIVE_ARGUMENT_LIMIT && method->signature.supported && !method->signature.has_this && !method->signature.generic &&
+            !method->signature.vararg && !method->signature.explicit_this && !marshaled[(member & 0xffffffu) - 1u] &&
+            (method->info.impl_flags & 0x87u) == 0x80u && (convention == 0x0100u || convention == 0x0200u || convention == 0x0300u) &&
+            dn_native_scalar(&method->signature.return_type, 1);
+        if ((method->owner_token >> 24) == 2u && program->types[(method->owner_token & 0xffffffu) - 1u].is_generic) method->pinvoke.supported = 0;
+        for (i = 0u; i < method->signature.parameter_count; ++i) {
+            types[i] = dn_native_type(method->signature.parameters + i);
+            if (!dn_native_scalar(method->signature.parameters + i, 0)) method->pinvoke.supported = 0;
+        }
+    }
+    for (rid = 0u; rid < program->method_def_count; ++rid)
+        if ((program->methods[rid].info.flags & 0x2000u) && !program->methods[rid].info.pinvoke) {
+            dn_fail(loader, XXEMUL_STATUS_INVALID_IMAGE); goto done;
+        }
+    ok = 1;
+done:
+    free(marshaled);
+    return ok;
+}
+
 static int dn_load_user_strings(dn_loader *loader)
 {
     xxemul_dotnet_program *program = loader->program;
@@ -1424,6 +1608,9 @@ void xxemul_dotnet_destroy(xxemul_dotnet_program *program)
             free((char *)method->info.name);
             free((char *)method->info.signature);
             free((char *)method->info.selector);
+            free((char *)method->pinvoke.module_name);
+            free((char *)method->pinvoke.entry_point);
+            free((void *)method->pinvoke.parameter_types);
             dn_signature_free(&method->signature);
             if (method->locals)
                 for (j = 0; j < method->local_count; ++j) dn_type_free(method->locals + j);
@@ -1507,7 +1694,7 @@ xxemul_dotnet_program *xxemul_dotnet_create(const void *data, size_t size, xxemu
     }
     if (!dn_validate_image(&loader) || !dn_validate_tables(&loader) || !dn_validate_pointers(&loader) || !dn_load_types(&loader) ||
         !dn_load_member_owners(&loader) || !dn_load_fields(&loader) || !dn_load_field_data(&loader) ||
-        !dn_load_methods(&loader) || !dn_load_user_strings(&loader) || !dn_load_assembly_metadata(&loader) || !dn_load_resources(&loader)) {
+        !dn_load_methods(&loader) || !dn_load_pinvokes(&loader) || !dn_load_user_strings(&loader) || !dn_load_assembly_metadata(&loader) || !dn_load_resources(&loader)) {
         if (loader.status == XXEMUL_STATUS_OK) loader.status = XXEMUL_STATUS_INVALID_IMAGE;
         goto done;
     }
@@ -1568,6 +1755,10 @@ const char *xxemul_dotnet_assembly_name(const xxemul_dotnet_program *program)
 const char *xxemul_dotnet_module_name(const xxemul_dotnet_program *program)
 {
     return program ? program->module_name : NULL;
+}
+unsigned xxemul_dotnet_pointer_size(const xxemul_dotnet_program *program)
+{
+    return program ? program->pointer_size : 0u;
 }
 const xxemul_dotnet_assembly_info *xxemul_dotnet_assembly_identity(const xxemul_dotnet_program *program)
 {

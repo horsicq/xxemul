@@ -14,6 +14,12 @@
 
 #include "xxemul_windows.h"
 #include "xxemul_internal.h"
+#include "xxemul_windows_context.h"
+#include "xxemul_windows_seh_crt.h"
+#include "xxemul_windows_unwind64.h"
+#include "xxemul_windows_unwind_arm.h"
+#include "xxemul_windows_process_structures.h"
+#include "xxemul_arm_auth.h"
 #include <xxfclib/formats/executable/pe/xx_pe_make.h>
 #if XXEMUL_ENABLE_DOTNET
 #include "xxemul/xxemul_dotnet_bcl.h"
@@ -52,19 +58,36 @@
 #define WIN_MAX_APIS 2048u
 #define WIN_MAX_MODULE_APIS 512u
 #define WIN_MAX_THREADS 32u
+/* Per-worker TEBs occupy the reserved gap after modeled DLLs, before CRT data. */
+#define WIN_THREAD_TEB_OFFSET UINT64_C(0x1b0000)
+#define WIN_THREAD_TEB_STRIDE UINT64_C(0x2000)
+#if WIN_THREAD_TEB_OFFSET + WIN_MAX_THREADS * WIN_THREAD_TEB_STRIDE > 0x1f0000u
+#error Worker TEB reservation overlaps the Windows CRT runtime data
+#endif
 #define WIN_MAX_MODULES 24u
 #define WIN_STATIC_TLS_SLOTS (WIN_MAX_MODULES + 1u)
 #define WIN_MAX_TLS_CALLBACKS 64u
 #define WIN_MODULE_OFFSET UINT64_C(0x20000)
 #define WIN_MODULE_STRIDE WIN_ALLOCATION_GRANULARITY
+#if WIN_MODULE_OFFSET + (WIN_MAX_MODULES + 1u) * WIN_MODULE_STRIDE > WIN_THREAD_TEB_OFFSET
+#error Windows module reservation overlaps worker TEBs
+#endif
 #define WIN_BOOTSTRAP_SEH_OFFSET UINT64_C(0x1f000)
 #define WIN_MAX_HANDLES 64u
 #define WIN_MAX_ALLOCATIONS 4096u
 #define WIN_MAX_VECTORED_HANDLERS 64u
+#define WIN_MAX_SEH_DEPTH 32u
+#define WIN_MAX_SEH_SEARCH 1024u
+#define WIN_SEH_NESTED_OFFSET UINT64_C(0x8f10)
+#define WIN_SEH_CALLBACK_PENDING ((xxemul_status)0x7fff0001)
 #define WIN_VECTORED_HANDLE_OFFSET UINT64_C(0x8200)
 #define WIN_SHELL_MALLOC_OFFSET UINT64_C(0x8500)
 #define WIN_MAX_CRITICAL_SECTIONS 128u
 #define WIN_MAX_TLS_SLOTS 128u
+#define WIN_FLS_SLOTS 128u
+#define WIN_FLS_FRAMES 8u
+#define WIN_FLS_RETURN_OFFSET UINT64_C(0x8f00)
+#define WIN_CBT_RETURN_OFFSET UINT64_C(0x8ee0)
 #define WIN_MAX_ONEXIT 256u
 #define WIN_MAX_CRT_FDS 128u
 #define WIN_ENV_MAX_BYTES 512u
@@ -85,6 +108,7 @@
 #define WIN_DLL_RETURN_OFFSET UINT64_C(0x8f70)
 #define WIN_LOADER_START_OFFSET UINT64_C(0x8f50)
 #define WIN_THREAD_START_OFFSET UINT64_C(0x8f40)
+#define WIN_NATIVE_RETURN_OFFSET UINT64_C(0x8f20)
 #define WIN_DLL_DEPTH 8u
 #define WIN_INITTERM_RETURN_OFFSET UINT64_C(0x8ff0)
 #define WIN_MAX_INITTERM_DEPTH 8u
@@ -114,6 +138,9 @@ typedef struct win_api {
     uint64_t address;
     uint8_t argument_count;
     uint8_t caller_cleans;
+    uint16_t export_ordinal; /* zero retains the existing sorted named exports */
+    uint16_t effective_export_ordinal; /* committed ordinal in the emitted EAT */
+    uint8_t export_unnamed, unsupported;
 } win_api;
 
 typedef struct win_tls_image {
@@ -126,11 +153,13 @@ typedef struct win_tls_image {
 
 typedef struct win_module {
     char name[48];
+    uint8_t *canonical_file;
+    size_t canonical_file_size;
     uint64_t base;
     uint16_t api_indices[WIN_MAX_MODULE_APIS];
     uint16_t api_count;
     uint8_t building;
-    uint64_t image_size, allocation, init_order;
+    uint64_t image_size, allocation, init_order, ldr_name, ldr_name_capacity;
     uint32_t generation, references, entry_rva, export_rva, export_size, resource_rva, resource_size, dependencies;
     uint8_t real, live, initialized, initializing, data_only, thread_callbacks_disabled, primary;
     win_tls_image tls;
@@ -182,13 +211,15 @@ typedef struct win_file_attribute {
 typedef struct win_handle {
     uint16_t child_slot;
     uint32_t object_id;
-    uint64_t thread_start, thread_parameter;
+    uint64_t thread_start, thread_parameter, heap_address;
     uint32_t thread_exit;
     uint8_t thread_finished;
     uint16_t thread_slot;
     xx_io_device *io;
     win_find_state *find;
     win_toolhelp_snapshot *snapshot;
+    uint8_t *module_file_data;
+    uint32_t module_file_share;
     uint8_t *mapping_data;
     uint64_t mapping_size, view_address, view_allocation, view_size, view_offset, view_reference;
     uint32_t mapping_protect, view_access;
@@ -199,6 +230,7 @@ typedef struct win_handle {
     uint32_t references;
     uint32_t flags;
     uint32_t file_access;
+    uint32_t process_access;
     uint16_t root_slot;
     uint8_t kind;
     uint8_t manual_reset;
@@ -226,18 +258,27 @@ typedef struct win_allocation {
     uint64_t capacity;
     uint64_t heap_owner;
     uint8_t active;
+    uint8_t virtual_memory;
 } win_allocation;
+typedef struct win_memory_page { uint64_t allocation; uint32_t protect, initial_protect, state, type; } win_memory_page;
 
 typedef struct win_vectored_handler {
     uint64_t callback;
     uint64_t handle;
+    uint64_t order;
     uint8_t first;
     uint8_t active;
+    uint8_t continuation;
 } win_vectored_handler;
+
+typedef struct win_function_callback {
+    uint64_t identifier, base, end, callback, context;
+    uint8_t active;
+} win_function_callback;
 
 typedef struct win_critical_section {
     uint64_t address;
-    uint32_t recursion;
+    uint32_t recursion, owner_id;
     uint8_t active;
 } win_critical_section;
 
@@ -281,44 +322,152 @@ typedef struct win_qsort_frame {
     uint8_t building;
 } win_qsort_frame;
 
+enum { WIN_SEH_DISPATCH, WIN_SEH_UNWIND, WIN_SEH_FILTER_API, WIN_SEH_LOOKUP_API, WIN_SEH_CONSOLIDATE };
+enum { WIN_SEH_VEH, WIN_SEH_FRAMES, WIN_SEH_UNHANDLED, WIN_SEH_VCH, WIN_SEH_RESUME };
+enum { WIN_SEH_CALL_NONE, WIN_SEH_CALL_VEH, WIN_SEH_CALL_FRAME,
+       WIN_SEH_CALL_UNHANDLED, WIN_SEH_CALL_VCH, WIN_SEH_CALL_SCOPE_FILTER,
+       WIN_SEH_CALL_SCOPE_FINALLY, WIN_SEH_CALL_FUNCTION_TABLE, WIN_SEH_CALL_CONSOLIDATE };
 typedef struct win_seh_frame {
-    xxemul_x86_state saved;
-    uint64_t context, record, call_sp, registration;
-    unsigned searched, vectored_cursor;
-    int vectored;
+    win_seh_crt_state crt, crt_target;
+    xxemul_x86_state saved, walk, next_walk;
+    xxemul_arm_state saved_arm, walk_arm, next_walk_arm;
+    xxemul_mode saved_mode;
+    uint8_t saved_context[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+    uint64_t context, walk_context, record, pointers, call_sp, registration, next_registration;
+    uint64_t original_registration, dispatcher, nested_frame, frame_base;
+    uint64_t target_frame, target_ip, return_value, unwind_context;
+    uint64_t image_base, function_entry, handler_data, establisher_frame, control_pc;
+    uint64_t vectored_snapshot[WIN_MAX_VECTORED_HANDLERS];
+    uint64_t scope_table, scope_index, scope_count, scope_target, scope_level, scope_resume_index;
+    uint64_t lookup_callback, lookup_parameter, lookup_base, lookup_result, lookup_output;
+    uint8_t lookup_ready, walk_pending;
+    uint32_t code, flags, parameter_count;
+    uint64_t exception_address, linked_record, information[15];
+    unsigned searched, vectored_cursor, vectored_count;
+    unsigned kind, phase, call_kind, scope_mode;
+    uint8_t walk_started, at_target, preserve_registration, control_pc_unwound;
     xxemul_status original_status;
-    uint64_t dispatcher, original_registration;
 } win_seh_frame;
 
+#define WIN_REGISTERED_MESSAGES 0x4000u
+#define WIN_REGISTERED_MESSAGE_BUCKETS 1024u
+typedef struct win_registered_message {
+    uint16_t *name;
+    uint32_t hash;
+    uint16_t next; /* index + 1, zero ends a chain */
+} win_registered_message;
+typedef struct win_registered_message_registry {
+    win_registered_message entries[WIN_REGISTERED_MESSAGES];
+    uint16_t buckets[WIN_REGISTERED_MESSAGE_BUCKETS];
+    uint32_t count;
+} win_registered_message_registry;
+
+/* Global atoms are separate from the user class/message tables. */
+typedef struct win_global_atom { uint16_t *name; uint32_t references, hash; uint16_t next; } win_global_atom;
+typedef struct win_global_atoms { win_global_atom entries[0x4000]; uint16_t buckets[1024], free_head; uint32_t count; } win_global_atoms;
+typedef struct win_window_property { uint64_t data; uint16_t atom; uint8_t active, owns_atom; } win_window_property;
+#define WIN_WINDOW_PROPERTIES 64u
 #define WIN_GUI_OBJECTS 256u
 #define WIN_GUI_DIALOGS 8u
+#define WIN_GUI_CLASSES 64u
+#define WIN_WINDOW_FRAMES 16u
+#define WIN_WINDOW_MESSAGES 128u
+#define WIN_WINDOW_RETURN_OFFSET UINT64_C(0x8f30)
+#define WIN_WINDOW_WAIT_OFFSET UINT64_C(0x8fb0)
 #define WIN_DIALOG_RETURN_OFFSET UINT64_C(0x8f90)
 #define WIN_DIALOG_WAIT_OFFSET UINT64_C(0x8f80)
-enum { WIN_GUI_DIALOG=1, WIN_GUI_CONTROL=2, WIN_GUI_FONT=3, WIN_GUI_ICON=4 };
+enum { WIN_GUI_DIALOG=1, WIN_GUI_CONTROL=2, WIN_GUI_FONT=3, WIN_GUI_ICON=4, WIN_GUI_WINDOW=5, WIN_GUI_MENU=6, WIN_GUI_DC=7, WIN_GUI_BITMAP=8, WIN_GUI_REGION=9 };
+#define WIN_REGION_MAX_RECTS 4096u
+typedef struct win_region_rect { int32_t left, top, right, bottom; } win_region_rect;
+typedef struct win_menu_item { uint64_t id; uint32_t flags; uint16_t text[256]; } win_menu_item;
 typedef struct win_gui_object {
     uint64_t parent, font, icon[2], resource;
-    uint32_t id, style, resource_size;
+    uint64_t generation, dialog_proc, dialog_result;
+    uint64_t procedure, instance, menu, extra, user_data, window_region, canvas;
+    win_menu_item *menu_items;
+    win_window_property *properties;
+    win_region_rect *region_rects;
+    uint32_t region_count;
+    uint32_t owner_id, ex_style, menu_count;
+    int32_t x, y, width, height;
+    uint32_t id, style, resource_size, class_style;
     int32_t position, minimum, maximum, increment;
-    uint16_t text[256], class_name[64], class_ordinal;
-    uint8_t logfont[92], kind, active;
+    uint16_t text[256], class_name[256], class_ordinal;
+    uint8_t logfont[92], kind, active, wide, destroying, visible, dialog_ended;
 } win_gui_object;
+typedef struct win_gui_class {
+    uint64_t procedure, instance, icon, small_icon, cursor, brush, strings, menu_atom;
+    uint32_t style, class_extra, window_extra;
+    uint16_t name[256], atom;
+    uint8_t active, wide, menu_named;
+} win_gui_class;
+typedef struct win_window_frame {
+    xxemul_x86_state caller;
+    uint64_t handle, procedure, data, call_sp, message, wparam, lparam, sequence, result;
+    uint32_t owner_id;
+    uint64_t object_generation;
+    uint8_t cbt_state, cbt_wide, create_initial[80];
+    uint8_t active, operation, phase, failed, fixed_result;
+} win_window_frame;
+typedef struct win_window_message { uint64_t handle, wparam, lparam, generation; uint32_t message, owner_id, time; } win_window_message;
+typedef struct win_window_wait { xxemul_x86_state caller; uint64_t arguments[4], event, generation, observed; uint32_t quit_code; uint8_t active, quit_pending, wait_only; } win_window_wait;
+typedef struct win_dialog_plan win_dialog_plan;
 typedef struct win_dialog_frame {
     xxemul_x86_state caller;
     uint64_t handle, procedure, parameter, event, result, sequence;
-    uint32_t owner_id;
-    uint8_t active, ended, phase, wide;
+    uint64_t data, current_handle, current_generation, call_sp;
+    uint64_t root_generation, filter_data, message_handle, message_generation, message_wparam, message_lparam, teardown_sequence;
+    uint32_t teardown_slot;
+    uint32_t message_id;
+    win_dialog_plan *plan;
+    uint32_t owner_id, mxcsr;
+    uint16_t control;
+    uint8_t active, ended, phase, wide, create_phase, modeless, invoking, font_sent, established, teardown, dlgproc_installed;
+    uint8_t create_initial[80];
 } win_dialog_frame;
+
+#include "xxemul_windows_cbt_types.inc"
+
+typedef struct win_fls_slot {
+    uint64_t callback, generation;
+    uint8_t allocated, retiring;
+} win_fls_slot;
+enum { WIN_FLS_FREE = 1, WIN_FLS_THREAD_EXIT, WIN_FLS_PROCESS_EXIT };
+typedef struct win_fls_frame {
+    xxemul_x86_state caller;
+    uint64_t generations[WIN_FLS_SLOTS], values[WIN_MAX_THREADS];
+    uint64_t callback, generation, call_sp;
+    uint32_t owner_id, exit_code, mxcsr;
+    uint16_t control, slot, cursor;
+    uint8_t active, previous, kind, invoking;
+} win_fls_frame;
 
 typedef struct win_thread_context {
     xxemul_x86_state cpu;
+    xxemul_arm_state arm_cpu;
+    xxemul_mode cpu_mode;
+    uint64_t arm_thread_pointer;
+    uint8_t arm_thread_pointer_valid;
+    uint64_t arm_break_value[8], arm_watch_value[2];
+    uint32_t arm_break_control[8], arm_watch_control[2];
+    uint8_t x87_raw[8][10];
+    uint16_t x87_tags;
     double x87_stack[8];
     uint64_t x87_int_val[8], tls_values[WIN_MAX_TLS_SLOTS];
+    uint64_t fls_values[WIN_FLS_SLOTS];
+    uint8_t fls_top, fls_cleanup_done;
     uint8_t x87_is_int[8], x87_depth, x87_top;
     uint16_t x87_control, x87_status, handle_slot;
+    uint64_t x86_debug[6];
+    uint32_t x86_mxcsr;
     uint32_t last_error, id, suspended, exit_code;
-    uint64_t stack_base, stack_limit, seh_head, tls_array, stack_allocation, tls_allocation, start_address;
+    uint32_t com_references;
+    uint8_t com_apartment; /* 0 uninitialized, 1 MTA, 2 STA */
+    uint64_t actctx_handles[32], actctx_cookies[32];
+    size_t actctx_depth;
+    uint64_t stack_base, stack_limit, seh_head, tls_array, stack_allocation, tls_allocation, start_address, teb_base;
     uint64_t static_tls_allocations[WIN_STATIC_TLS_SLOTS];
-    win_seh_frame seh_frames[8]; size_t seh_depth;
+    win_seh_frame seh_frames[WIN_MAX_SEH_DEPTH]; size_t seh_depth;
     win_qsort_frame qsort_frames[WIN_MAX_QSORT_DEPTH]; size_t qsort_depth;
     win_initterm_frame initterm_frames[WIN_MAX_INITTERM_DEPTH]; size_t initterm_depth;
     uint64_t deadline, wait_handles[WIN_MAX_HANDLES];
@@ -328,6 +477,30 @@ typedef struct win_thread_context {
 
 #define WIN_MAX_CHILDREN 8u
 #define WIN_CHILD_WAIT_OFFSET UINT64_C(0x8f60)
+/* Keep the dedicated FLS callback return distinct from every runtime trap.
+   These sixteen-byte slots occupy the otherwise unused 0x8f00..0x8fff gap. */
+#if WIN_FLS_RETURN_OFFSET < 0x8f00u || WIN_FLS_RETURN_OFFSET >= 0x9000u || \
+    (WIN_FLS_RETURN_OFFSET & (WIN_THUNK_STRIDE - 1u)) != 0u || \
+    WIN_FLS_RETURN_OFFSET == WIN_SEH_NESTED_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_NATIVE_RETURN_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_WINDOW_RETURN_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_THREAD_START_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_LOADER_START_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_CHILD_WAIT_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_DLL_RETURN_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_DIALOG_WAIT_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_DIALOG_RETURN_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_THREAD_RETURN_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_WINDOW_WAIT_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_SEH_RETURN_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_PROCESS_RETURN_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_QSORT_RETURN_OFFSET || \
+    WIN_FLS_RETURN_OFFSET == WIN_INITTERM_RETURN_OFFSET
+#error Windows FLS callback return overlaps another runtime trap
+#endif
+_Static_assert(WIN_CBT_RETURN_OFFSET == 0x8ee0u && (WIN_CBT_RETURN_OFFSET & 15u) == 0u &&
+               WIN_CBT_RETURN_OFFSET < 0x8f00u && WIN_CBT_RETURN_OFFSET >= 0x85a0u,
+               "CBT callback return must have a private runtime slot");
 typedef struct win_process_tree { uint32_t next_id, processes; uint64_t memory; xxemul_windows *root; } win_process_tree;
 typedef struct win_child_process {
     xxemul *emulator;
@@ -337,10 +510,16 @@ typedef struct win_child_process {
     uint8_t active, finished;
 } win_child_process;
 
+typedef struct win_actctx_state win_actctx_state;
 struct xxemul_windows {
     xxemul *emulator;
+    /* Borrowed reverse-symbol result; no address/result cache is retained. */
+    char native_symbol[145];
     uint64_t image_base;
     uint64_t image_size;
+    uint32_t image_entry_rva;
+    uint16_t image_subsystem, image_subsystem_major, image_subsystem_minor;
+    uint8_t image_is_dll;
     uint64_t runtime_base;
     uint64_t heap_cursor;
     uint64_t heap_limit;
@@ -355,10 +534,12 @@ struct xxemul_windows {
     uint32_t argc;
     uint32_t app_type;
     uint8_t managed_invoked;
+    uint8_t native_call_active;
+    xxemul_status native_call_failure;
     uint64_t matherr_handler;
     uint32_t last_error;
     uint32_t exit_code;
-    uint32_t process_id;
+    uint32_t process_id, parent_process_id;
     uint32_t startup_flags;
     uint16_t startup_show;
     win_process_tree *process_tree;
@@ -372,6 +553,8 @@ struct xxemul_windows {
     uint64_t unhandled_filter;
     uint64_t tls_values[WIN_MAX_TLS_SLOTS];
     uint32_t tls_count;
+    uint8_t tls_allocated[WIN_MAX_TLS_SLOTS], structures_ready, process_initialized, loader_lock_held;
+    uint64_t heap_descriptors[64];
     uint64_t onexit_callbacks[WIN_MAX_ONEXIT];
     size_t onexit_count;
     uint64_t crt_fd_handles[WIN_MAX_CRT_FDS];
@@ -401,15 +584,22 @@ struct xxemul_windows {
     win_handle handles[WIN_MAX_HANDLES];
     win_file_attribute file_attributes[WIN_FILE_ATTRIBUTE_SLOTS];
     win_allocation allocations[WIN_MAX_ALLOCATIONS];
+    win_memory_page *memory_pages;
+    size_t memory_page_count;
+    uint8_t memory_dep;
     size_t allocation_count;
     win_vectored_handler vectored_handlers[WIN_MAX_VECTORED_HANDLERS];
     size_t vectored_handler_count;
+    uint64_t vectored_sequence;
+    xxemul_windows_unwind64_registry function_tables;
+    xxemul_windows_unwind_arm_registry arm_function_tables;
+    win_function_callback function_callbacks[64];
     win_critical_section critical_sections[WIN_MAX_CRITICAL_SECTIONS];
     win_initterm_frame initterm_frames[WIN_MAX_INITTERM_DEPTH];
     size_t initterm_depth;
     win_qsort_frame qsort_frames[WIN_MAX_QSORT_DEPTH];
     size_t qsort_depth;
-    win_seh_frame seh_frames[8];
+    win_seh_frame seh_frames[WIN_MAX_SEH_DEPTH];
     size_t seh_depth;
     int tls_started;
     uint64_t loader_entry;
@@ -420,7 +610,20 @@ struct xxemul_windows {
     unsigned thread_current;
     uint32_t next_thread_id;
     uint64_t scheduler_tick;
+    win_registered_message_registry *registered_messages;
+    win_global_atoms *global_atoms;
     win_gui_object gui_objects[WIN_GUI_OBJECTS];
+    uint64_t gui_generation;
+    win_hook_state hooks;
+    win_gui_class gui_classes[WIN_GUI_CLASSES];
+    uint32_t gui_class_sequence;
+    win_window_frame window_frames[WIN_WINDOW_FRAMES];
+    win_window_wait window_waits[WIN_MAX_THREADS];
+    win_window_message window_messages[WIN_WINDOW_MESSAGES];
+    size_t window_message_count;
+    uint64_t window_sequence;
+    unsigned window_pending;
+    uint8_t window_wait_pending;
     win_dialog_frame dialogs[WIN_GUI_DIALOGS];
     uint64_t dialog_sequence;
     unsigned dialog_pending;
@@ -433,8 +636,17 @@ struct xxemul_windows {
     uint8_t dll_pending_unload, dll_exiting;
     uint64_t dll_sequence;
     uint32_t dll_generation;
+    win_fls_slot fls_slots[WIN_FLS_SLOTS];
+    win_fls_frame fls_frames[WIN_FLS_FRAMES];
+    uint8_t fls_pending, fls_process_exiting;
+    win_actctx_state *actctx;
+    win_actctx_state *actctx_created[16];
+    uint64_t actctx_next_cookie;
 };
 
+static void win_actctx_abandon_thread(xxemul_windows *p,uint32_t owner);
+static void win_runtime_abandon_process(xxemul_windows *p)
+{unsigned i;for(i=0;i<WIN_MAX_THREADS;i++)if(p->threads[i].id){win_actctx_abandon_thread(p,p->threads[i].id);win_cbt_abandon_thread(p,p->threads[i].id);}}
 static void win_children_destroy(xxemul_windows *process);
 static xxemul_status win_children_pump(xxemul_windows *process, unsigned quantum);
 static int win_children_runnable(const xxemul_windows *process);
@@ -442,8 +654,11 @@ static win_child_process *win_child_at(xxemul_windows *process, const win_handle
 static int win_set_guest_directory(xxemul_windows *process, const char *guest);
 static xxemul_status win_thread_yield(xxemul_windows *process, xxemul_step_info *info);
 static xxemul_status win_thread_finish_raw(xxemul_windows *process, uint32_t code, xxemul_step_info *info);
+static xxemul_status win_thread_finish(xxemul_windows *process, uint32_t code, xxemul_step_info *info);
+static xxemul_status win_dll_exit(xxemul_windows *process, uint32_t code, xxemul_step_info *info);
 static void win_thread_end(xxemul_windows *process, size_t slot, uint32_t code);
 static int win_dll_last_thread(xxemul_windows *process);
+static xxemul_status win_critical_initialize(xxemul_windows *process, uint64_t address);
 
 static uint8_t win_word_size(const xxemul *emulator)
 {
@@ -521,24 +736,54 @@ static int win_prefix(const char *text, const char *prefix)
     return 1;
 }
 
+static uint64_t win_current_teb(const xxemul_windows *process)
+{
+    uint64_t base = process->threads[process->thread_current].teb_base;
+    return base ? base : process->runtime_base;
+}
+
+static void win_guest_memory_fault(xxemul_windows *process, uint64_t address, size_t count, unsigned access)
+{
+    xxemul *e = process->emulator;
+    uint64_t base = e->region_address;
+    if (e->fault_address_valid && e->fault_access == access) {
+        e->windows_exception_code = 0xc0000005u;
+        return; /* preserve the core validator's first denied byte */
+    }
+    if (address >= base && address - base < e->region_size && count > e->region_size - (size_t)(address - base))
+        address = base + e->region_size;
+    e->fault_address = address;
+    e->fault_access = access;
+    e->fault_address_valid = 1u;
+    e->windows_exception_code = 0xc0000005u;
+}
+
 static int win_write(xxemul_windows *process, uint64_t address, const void *bytes, size_t count)
 {
-    return xxemul_write_memory(process->emulator, address, bytes, count) == XXEMUL_STATUS_OK;
+    if (xxemul_write_memory(process->emulator, address, bytes, count) == XXEMUL_STATUS_OK) return 1;
+    win_guest_memory_fault(process, address, count, 1u);
+    return 0;
 }
 
 static int win_read(xxemul_windows *process, uint64_t address, void *bytes, size_t count)
 {
-    return xxemul_read_memory(process->emulator, address, bytes, count) == XXEMUL_STATUS_OK;
+    if (xxemul_read_memory(process->emulator, address, bytes, count) == XXEMUL_STATUS_OK) return 1;
+    win_guest_memory_fault(process, address, count, 0u);
+    return 0;
 }
 
 static int win_store(xxemul_windows *process, uint64_t address, uint8_t size, uint64_t value)
 {
-    return xxemul_store_integer(process->emulator, address, size, value) == XXEMUL_STATUS_OK;
+    if (xxemul_store_integer(process->emulator, address, size, value) == XXEMUL_STATUS_OK) return 1;
+    win_guest_memory_fault(process, address, size, 1u);
+    return 0;
 }
 
 static int win_load(xxemul_windows *process, uint64_t address, uint8_t size, uint64_t *value)
 {
-    return xxemul_load_integer(process->emulator, address, size, value) == XXEMUL_STATUS_OK;
+    if (xxemul_load_integer(process->emulator, address, size, value) == XXEMUL_STATUS_OK) return 1;
+    win_guest_memory_fault(process, address, size, 0u);
+    return 0;
 }
 
 static int win_guest_string(xxemul_windows *process, uint64_t address, char *buffer, size_t capacity, int wide)
@@ -612,6 +857,7 @@ static int win_environment_match(const char *entry, const char *name)
 }
 
 static uint16_t win_reg_ansi(uint8_t c);
+static xxemul_status win_process_sync_parameters(xxemul_windows *process);
 
 static int win_sync_environment(xxemul_windows *process)
 {
@@ -626,7 +872,8 @@ static int win_sync_environment(xxemul_windows *process)
         ++index;
         offset += strlen(process->environment_data + offset) + 1u;
     }
-    return win_store(process, process->envp_address + index * word_size, word_size, 0u);
+    return win_store(process, process->envp_address + index * word_size, word_size, 0u) &&
+        win_process_sync_parameters(process) == XXEMUL_STATUS_OK;
 }
 
 static int win_append_quoted(char *buffer, size_t capacity, size_t *length, const char *arg)
@@ -665,6 +912,7 @@ static uint64_t win_heap_alloc(xxemul_windows *process, uint64_t size)
         best->active = 1u;
         best->size = size;
         best->heap_owner = 0x400u;
+        best->virtual_memory = 0u;
         return best->address;
     }
     if (rounded > process->heap_limit - process->heap_cursor) return 0;
@@ -679,6 +927,7 @@ static uint64_t win_heap_alloc(xxemul_windows *process, uint64_t size)
     free_slot->capacity = rounded;
     free_slot->heap_owner = 0x400u;
     free_slot->active = 1u;
+    free_slot->virtual_memory = 0u;
     return result;
 }
 
@@ -916,16 +1165,41 @@ static const char *const win_export_names[] = {"LoadLibraryA",
                                         "GetShortPathNameW"};
 
 static const char *const win_extra_export_names[] = {
+    "DefDlgProcA", "DefDlgProcW", "DialogBoxIndirectParamA", "DialogBoxIndirectParamW",
+    "CreateDialogIndirectParamW", "CallMsgFilterA", "CallMsgFilterW",
+    "CreateRectRgn", "CombineRgn", "GetRgnBox", "GetRegionData", "PtInRegion", "GetWindowRgn",
+    "AlphaBlend",
+    "AddVectoredContinueHandler", "RemoveVectoredContinueHandler", "UnhandledExceptionFilter",
+    "RtlRaiseException", "RtlRaiseStatus", "NtRaiseException", "ZwRaiseException",
+    "NtContinue", "ZwContinue", "RtlRestoreContext", "RtlCaptureContext",
+    "RtlAddFunctionTable", "RtlDeleteFunctionTable", "RtlLookupFunctionEntry", "RtlInstallFunctionTableCallback",
+    "NtQueryInformationThread", "ZwQueryInformationThread", "ZwQueryInformationProcess", "RtlGetCurrentPeb", "GetProcessHeaps", "RtlGetProcessHeaps", "TlsGetValue2",
+    "RtlAllocateHeap", "RtlReAllocateHeap", "RtlFreeHeap", "RtlSizeHeap", "RtlValidateHeap",
+    "RtlDecompressBuffer",
+    "RtlAcquirePebLock", "RtlReleasePebLock", "RtlInitializeCriticalSection", "RtlInitializeCriticalSectionAndSpinCount",
+    "RtlInitializeCriticalSectionEx", "RtlDeleteCriticalSection", "RtlEnterCriticalSection", "RtlLeaveCriticalSection", "RtlTryEnterCriticalSection",
+    "__C_specific_handler",
+    "GetParent", "MulDiv", "SetWindowPos", "GetWindowRect", "GetClientRect", "IsWindowVisible", "IsWindowUnicode", "IsIconic", "SystemParametersInfoA", "SystemParametersInfoW", "MonitorFromWindow", "GetMonitorInfoA", "GetMonitorInfoW", "EnumDisplayMonitors", "GetSystemMetrics", "CreateIcon", "DestroyIcon", "GetDC", "ReleaseDC", "GetDeviceCaps", "CreateDIBitmap", "CreateCompatibleDC", "CreateCompatibleBitmap", "CreateBitmap", "DeleteDC", "SelectObject", "BitBlt", "StretchBlt", "GetBitmapBits", "SetBkColor", "SetTextColor", "SetBkMode",
+    "RegisterWindowMessageA", "RegisterWindowMessageW", "ReuseDDElParam",
+    "GlobalAddAtomA", "GlobalAddAtomW", "GlobalFindAtomA", "GlobalFindAtomW", "SetPropA", "SetPropW", "GetPropA", "GetPropW", "RemovePropA", "RemovePropW", "GetWindowLongA", "GetWindowLongW", "SetWindowLongA", "SetWindowLongW", "GetWindowLongPtrA", "GetWindowLongPtrW", "SetWindowLongPtrA", "SetWindowLongPtrW", "GetClassLongA", "GetClassLongW", "SetClassLongA", "SetClassLongW", "GetClassLongPtrA", "GetClassLongPtrW", "SetClassLongPtrA", "SetClassLongPtrW", "CallWindowProcA", "CallWindowProcW", "GlobalDeleteAtom",
+    "CoInitialize", "CoInitializeEx", "CoUninitialize",
+    "RegisterClassA", "RegisterClassW", "GetClassInfoA", "GetClassInfoW", "UnregisterClassA", "UnregisterClassW",
+    "RegisterClassExA", "RegisterClassExW", "GetClassInfoExA", "GetClassInfoExW",
+    "CreateWindowExA", "CreateWindowExW", "DefWindowProcA", "DefWindowProcW", "DestroyWindow", "ShowWindow", "UpdateWindow",
+    "GetMessageA", "GetMessageW", "PeekMessageA", "PeekMessageW", "DispatchMessageA", "DispatchMessageW",
+    "WaitMessage", "PostMessageA", "PostMessageW", "PostQuitMessage", "TranslateMessage", "CreateMenu", "CreatePopupMenu", "AppendMenuA", "AppendMenuW", "SetMenu", "GetMenu", "GetMenuItemCount", "GetMenuItemID", "GetMenuState", "DestroyMenu",
     "DisableThreadLibraryCalls", "lstrcmpi", "lstrcmpiA", "lstrcmpiW", "CheckSumMappedFile",
     "CreateToolhelp32Snapshot", "Process32First", "Process32FirstW", "Process32Next", "Process32NextW",
     "IsBadReadPtr",
+    "IsBadWritePtr",
+    "NtQueryInformationProcess",
     "MoveFileA",
     "FindResourceW", "FindResourceExW",
     "GetEnvironmentVariableA", "GetEnvironmentVariableW", "SetEnvironmentVariableA", "SetCurrentDirectoryA",
-    "GetProcessId", "GetThreadId",
+    "GetProcessId", "GetThreadId", "IsWow64Process",
     "SetTimer",
     "MoveWindow",
-    "DialogBoxParamA", "DialogBoxParamW", "FindWindowA", "FindWindowW", "EndDialog", "GetDlgItem", "SetWindowTextA", "SetWindowTextW", "SetDlgItemTextA", "SetDlgItemTextW", "GetWindowTextA", "GetWindowTextW", "GetDlgItemTextA", "GetDlgItemTextW", "SendMessageA", "SendMessageW", "SendDlgItemMessageA", "SendDlgItemMessageW", "LoadIconA", "LoadIconW", "GetObjectA", "GetObjectW", "CreateFontIndirectA", "CreateFontIndirectW", "DeleteObject", "InitCommonControlsEx",
+    "DialogBoxParamA", "DialogBoxParamW", "FindWindowA", "FindWindowW", "EndDialog", "GetDlgItem", "SetWindowTextA", "SetWindowTextW", "SetDlgItemTextA", "SetDlgItemTextW", "GetWindowTextA", "GetWindowTextW", "GetDlgItemTextA", "GetDlgItemTextW", "SendMessageA", "SendMessageW", "SendDlgItemMessageA", "SendDlgItemMessageW", "LoadIconA", "LoadIconW", "GetObjectA", "GetObjectW", "CreateFontIndirectA", "CreateFontIndirectW", "DeleteObject", "InitCommonControls", "InitCommonControlsEx",
     "SetFileAttributesA",
     "CopyFileA", "CopyFileW",
     "SwitchToThread", "GetTickCount64",
@@ -1017,9 +1291,11 @@ static const char *const win_extra_export_names[] = {
     "RegOpenKeyA", "RegOpenKeyW",
     "GetSystemDirectoryA", "GetWindowsDirectoryW",
     "timeGetTime", "NtQuerySystemInformation",
+    "FindActCtxSectionStringA", "FindActCtxSectionStringW", "GetCurrentActCtx", "AddRefActCtx", "ReleaseActCtx",
+    "GetSystemWindowsDirectoryA", "GetSystemWindowsDirectoryW",
 };
 
-static const char *const win_crt_names[] = {"_controlfp", "_except_handler3", "_filelength", "_filelengthi64", "_chsize", "_access", "__p___initenv", "_adjust_fdiv", "atexit", "atoi",
+static const char *const win_crt_names[] = {"_controlfp", "_except_handler3", "_except_handler4_common", "_abnormal_termination", "__abnormal_termination", "_filelength", "_filelengthi64", "_chsize", "_access", "__p___initenv", "_adjust_fdiv", "atexit", "atoi",
                                         "_iob",
                                         "__getmainargs",
                                         "__initenv",
@@ -1137,13 +1413,99 @@ static int win_crt_api(const char *name)
     return 0;
 }
 
+#include "xxemul_windows_abi.inc"
+
 static uint8_t win_argument_count(const char *name)
 {
-    if(win_equal(name,"IsBadReadPtr"))return 2u;
+    if (!strcmp(name, "RtlDecompressBuffer")) return 6u;
+    if(win_equal(name,"FindActCtxSectionStringA")||win_equal(name,"FindActCtxSectionStringW")||win_equal(name,"FindActCtxSectionGuid"))return 5u;
+    if(win_equal(name,"GetCurrentActCtx")||win_equal(name,"AddRefActCtx")||win_equal(name,"ReleaseActCtx")||win_equal(name,"CreateActCtxA")||win_equal(name,"CreateActCtxW")||win_equal(name,"ZombifyActCtx"))return 1u;
+    if(win_equal(name,"ActivateActCtx")||win_equal(name,"DeactivateActCtx")||win_equal(name,"GetSystemWindowsDirectoryA")||win_equal(name,"GetSystemWindowsDirectoryW"))return 2u;
+    if(win_equal(name,"QueryActCtxW")||win_equal(name,"QueryActCtxSettingsW"))return 7u;
+    if (win_equal(name, "CreateFiber")) return 3u;
+    if (win_equal(name, "CreateFiberEx")) return 5u;
+    if (win_equal(name, "ConvertThreadToFiberEx")) return 2u;
+    if (win_equal(name, "ConvertThreadToFiber") || win_equal(name, "SwitchToFiber") || win_equal(name, "DeleteFiber")) return 1u;
+    if (win_equal(name, "ConvertFiberToThread")) return 0u;
+    if(win_equal(name,"GetWindowRgn"))return 2u;
+    if(win_equal(name,"CombineRgn"))return 4u;
+    if(win_equal(name,"SetWindowRgn")||win_equal(name,"GetRegionData")||win_equal(name,"PtInRegion"))return 3u;
+    if (win_equal(name,"IsWow64Process")) return 2u;
+    if(win_prefix(name,"GlobalGetAtomName")||win_prefix(name,"GetClassName"))return 3u;
+    if(win_prefix(name,"DefDlgProc"))return 4u;
+    if(win_equal(name,"DialogBoxIndirectParamA")||win_equal(name,"DialogBoxIndirectParamW")||win_equal(name,"CreateDialogIndirectParamA")||win_equal(name,"CreateDialogIndirectParamW"))return 5u;
+    if(win_prefix(name,"CallMsgFilter"))return 2u;
+    if(win_prefix(name,"GlobalAddAtom")||win_prefix(name,"GlobalFindAtom")||win_equal(name,"GlobalDeleteAtom"))return 1u;
+    if(win_prefix(name,"SetProp"))return 3u;
+    if(win_prefix(name,"GetProp")||win_prefix(name,"RemoveProp"))return 2u;
+    if(win_prefix(name,"GetWindowLong")||win_prefix(name,"GetClassLong"))return 2u;
+    if(win_prefix(name,"SetWindowLong")||win_prefix(name,"SetClassLong"))return 3u;
+    if(win_equal(name,"WaitMessage"))return 0u;
+    if(win_equal(name,"MulDiv"))return 3u;
+    if(win_equal(name,"GetParent"))return 1u;
+    if(win_equal(name,"SetWindowPos"))return 7u;
+    if(win_equal(name,"GetWindowRect")||win_equal(name,"GetClientRect"))return 2u;
+    if(win_equal(name,"IsWindowVisible")||win_equal(name,"IsWindowUnicode")||win_equal(name,"IsIconic"))return 1u;
+    if(win_equal(name,"SystemParametersInfoA")||win_equal(name,"SystemParametersInfoW"))return 4u;
+    if(win_prefix(name,"CallWindowProc"))return 5u;
+    if(win_equal(name,"CreateDIBitmap"))return 6u;
+    if(win_equal(name,"CreateCompatibleDC")||win_equal(name,"DeleteDC"))return 1u;
+    if(win_equal(name,"CreateCompatibleBitmap")||win_equal(name,"GetBitmapBits"))return 3u;
+    if(win_equal(name,"SelectObject")||win_equal(name,"SetBkColor")||win_equal(name,"SetTextColor")||win_equal(name,"SetBkMode"))return 2u;
+    if(win_equal(name,"BitBlt"))return 9u;
+    if(win_equal(name,"StretchBlt"))return 11u;
+    if(win_equal(name,"CreateBitmap"))return 5u;
+    if(win_equal(name,"CreateIcon"))return 7u;
+    if(win_equal(name,"DestroyIcon"))return 1u;
+    if(win_equal(name,"MonitorFromWindow")||win_equal(name,"GetMonitorInfoA")||win_equal(name,"GetMonitorInfoW"))return 2u;
+    if(win_equal(name,"GlobalAddAtomW"))return 1u;
+    if(win_equal(name,"LoadCursorW"))return 2u;
+    if(win_equal(name,"VirtualQueryEx"))return 4u;
+    if(win_equal(name,"EnumDisplayMonitors")||win_equal(name,"SystemParametersInfoW"))return 4u;
+    if (win_equal(name,"CreateWindowExA") || win_equal(name,"CreateWindowExW")) return 12u;
+    if (win_equal(name,"DefWindowProcA") || win_equal(name,"DefWindowProcW") || win_equal(name,"SendMessageW") || win_equal(name,"PostMessageA") || win_equal(name,"PostMessageW") || win_equal(name,"GetMessageA") || win_equal(name,"GetMessageW") || win_equal(name,"AppendMenuA") || win_equal(name,"AppendMenuW")) return 4u;
+    if (win_equal(name,"PeekMessageA") || win_equal(name,"PeekMessageW")) return 5u;
+    if (win_equal(name,"DispatchMessageA") || win_equal(name,"DispatchMessageW") || win_equal(name,"DestroyWindow") || win_equal(name,"UpdateWindow") || win_equal(name,"TranslateMessage") || win_equal(name,"PostQuitMessage") || win_equal(name,"GetMenu") || win_equal(name,"GetMenuItemCount") || win_equal(name,"DestroyMenu")) return 1u;
+    if (win_equal(name,"SetMenu") || win_equal(name,"ShowWindow") || win_equal(name,"GetMenuItemID")) return 2u;
+    if (win_equal(name,"GetMenuState")) return 3u;
+    if (win_equal(name, "RtlAcquirePebLock") || win_equal(name, "RtlReleasePebLock")) return 0u;
+    if (win_equal(name, "RtlInitializeCriticalSectionEx")) return 3u;
+    if (win_equal(name, "RtlInitializeCriticalSectionAndSpinCount")) return 2u;
+    if (win_equal(name, "RtlInitializeCriticalSection") || win_equal(name, "RtlDeleteCriticalSection") ||
+        win_equal(name, "RtlEnterCriticalSection") || win_equal(name, "RtlLeaveCriticalSection") || win_equal(name, "RtlTryEnterCriticalSection")) return 1u;
+    if (win_equal(name, "RtlReAllocateHeap")) return 4u;
+    if (win_equal(name, "RtlAllocateHeap") || win_equal(name, "RtlFreeHeap") || win_equal(name, "RtlSizeHeap") || win_equal(name, "RtlValidateHeap")) return 3u;
+    if (win_equal(name, "GetProcessHeaps") || win_equal(name, "RtlGetProcessHeaps")) return 2u;
+    if (win_equal(name, "TlsGetValue2")) return 1u;
+    if (win_equal(name, "RtlVirtualUnwind")) return 8u;
+    if (win_equal(name, "RtlUnwindEx") || win_equal(name, "RtlInstallFunctionTableCallback")) return 6u;
+    if (win_equal(name, "RaiseException") || win_equal(name, "RtlUnwind") || win_equal(name, "__C_specific_handler")) return 4u;
+    if (win_equal(name, "RtlAddFunctionTable") || win_equal(name, "RtlLookupFunctionEntry") ||
+        win_equal(name, "NtRaiseException") || win_equal(name, "ZwRaiseException")) return 3u;
+    if (win_equal(name, "NtContinue") || win_equal(name, "ZwContinue") || win_equal(name, "RtlRestoreContext") ||
+        win_equal(name, "AddVectoredContinueHandler")) return 2u;
+    if (win_equal(name, "RtlCaptureContext") || win_equal(name, "RtlRaiseException") || win_equal(name, "RtlRaiseStatus") ||
+        win_equal(name, "RtlDeleteFunctionTable") || win_equal(name, "RemoveVectoredContinueHandler")) return 1u;
+    if (win_equal(name, "NtQueryInformationThread") || win_equal(name, "ZwQueryInformationThread") || win_equal(name, "ZwQueryInformationProcess")) return 5u;
+    if(win_equal(name,"NtQueryInformationProcess"))return 5u;
+    if(win_equal(name,"IsBadReadPtr")||win_equal(name,"IsBadWritePtr"))return 2u;
     if(win_equal(name,"CreateToolhelp32Snapshot") || win_equal(name,"Process32First") || win_equal(name,"Process32FirstW") ||
        win_equal(name,"Process32Next") || win_equal(name,"Process32NextW"))return 2u;
     if (win_equal(name, "FindWindowA") || win_equal(name, "FindWindowW")) return 2u;
     if (win_equal(name, "NtQuerySystemInformation")) return 4u;
+    if (win_equal(name, "RegisterWindowMessageA") || win_equal(name, "RegisterWindowMessageW")) return 1u;
+    if (win_equal(name, "CoInitialize")) return 1u;
+    if (win_equal(name, "CoInitializeEx")) return 2u;
+    if (win_equal(name, "CoUninitialize")) return 0u;
+    if (win_equal(name, "SysAllocStringByteLen")) return 2u;
+    if (win_equal(name, "SysStringByteLen")) return 1u;
+    if (win_equal(name, "RegisterClassA") || win_equal(name, "RegisterClassW")) return 1u;
+    if (win_equal(name, "RegisterClassExA") || win_equal(name, "RegisterClassExW")) return 1u;
+    if (win_equal(name, "GetClassInfoA") || win_equal(name, "GetClassInfoW")) return 3u;
+    if (win_equal(name, "GetClassInfoExA") || win_equal(name, "GetClassInfoExW")) return 3u;
+    if (win_equal(name, "UnregisterClassA") || win_equal(name, "UnregisterClassW")) return 2u;
+    if (win_equal(name, "GetProcessVersion") || win_equal(name, "GetDC") || win_equal(name,"CreatePalette")) return 1u;
+    if (win_equal(name, "GetDeviceCaps") || win_equal(name, "ReleaseDC")) return 2u;
     if(win_equal(name,"DisableThreadLibraryCalls"))return 1u;
     if(win_equal(name,"lstrcmpi") || win_equal(name,"lstrcmpiA") || win_equal(name,"lstrcmpiW"))return 2u;
     if(win_equal(name,"CheckSumMappedFile"))return 4u;
@@ -1183,6 +1545,8 @@ static uint8_t win_argument_count(const char *name)
     if (win_equal(name, "DialogBoxParamA")) return 5u;
     if (win_equal(name, "_controlfp")) return 2u;
     if (win_equal(name, "_except_handler3")) return 4u;
+    if (win_equal(name, "_except_handler4_common")) return 6u;
+    if (win_equal(name, "_abnormal_termination") || win_equal(name, "__abnormal_termination")) return 0u;
     if (win_equal(name, "_filelength") || win_equal(name, "_filelengthi64")) return 1u;
     if (win_equal(name, "_chsize") || win_equal(name, "_access")) return 2u;
     if (win_equal(name, "fopen") || win_equal(name, "_wfopen") || win_equal(name, "_waccess")) return 2u;
@@ -1210,7 +1574,9 @@ static uint8_t win_argument_count(const char *name)
     if (win_equal(name, "GetKeyboardType") || win_equal(name, "atexit") || win_equal(name, "ResumeThread") || win_equal(name, "ExitThread")) return 1u;
     if (win_equal(name, "GetLongPathNameA") || win_equal(name, "GetLongPathNameW") ||
         win_equal(name, "lstrcpynA") || win_equal(name, "lstrcpynW")) return 3u;
-    if (win_equal(name, "CharNextA") || win_equal(name, "CharNextW")) return 1u;
+    if (win_equal(name, "CharNextA") || win_equal(name, "CharNextW") ||
+        win_equal(name, "PathFindExtensionA") || win_equal(name, "PathFindExtensionW") ||
+        win_equal(name, "PathFindFileNameA") || win_equal(name, "PathFindFileNameW")) return 1u;
     if (win_equal(name, "MessageBoxA") || win_equal(name, "MessageBoxW")) return 4u;
     if (win_equal(name, "AllocateAndInitializeSid")) return 11u;
     if (win_equal(name, "CreateProcessA") || win_equal(name, "CreateProcessW")) return 10u;
@@ -1320,18 +1686,46 @@ static uint8_t win_argument_count(const char *name)
         win_equal(name, "CharUpperA") || win_equal(name, "GetClipboardData") || win_equal(name, "GetKeyboardLayout") || win_equal(name, "GetSystemMetrics") ||
         win_equal(name, "MessageBeep") || win_equal(name, "OpenClipboard") || win_equal(name, "GetActiveProcessorCount") || win_equal(name, "atoi"))
         return 1u;
-    return 0u;
+    return win_import_argument_count(name);
 }
 
 static win_module *win_find_module(xxemul_windows *process, const char *name, int create);
+static int win_memory_init(xxemul_windows *process,int dep);
+static int win_memory_api(xxemul_windows *,const char *,const uint64_t *,uint64_t *,xxemul_status *);
 static int win_loadable_module(xxemul_windows *process, const char *name);
 static win_module *win_dll_at(xxemul_windows *process, uint64_t handle);
 static uint64_t win_dll_load(xxemul_windows *process,const char *name,uint32_t flags);
 static uint64_t win_dll_export(xxemul_windows *process,win_module *module,const char *name,unsigned depth,int by_ordinal);
+static int win_actctx_prepare(xxemul_windows *process);
+static void win_actctx_destroy(xxemul_windows *process);
+static int win_actctx_selected(const xxemul_windows *process,const char *name);
+static int win_actctx_host_path(xxemul_windows *process,const char *name,char *host,size_t capacity);
+static int win_actctx_api_name(const char *name);
+static int win_actctx_unsupported_name(const char *name);
+static xxemul_status win_actctx_api(xxemul_windows *process,const char *name,const uint64_t *arg,uint64_t *result);
+static int win_native_required(xxemul_windows *process,const char *name)
+{
+    const char *base=name,*p;char normalized[XXEMUL_WINDOWS_NATIVE_DLL_NAME_CAPACITY];size_t i,length;
+    if(win_actctx_selected(process,name))return 1;
+    if(!process->emulator->windows_native_dll_count||!name||!*name)return 0;
+    for(p=name;*p;++p)if(*p=='/'||*p=='\\')base=p+1;
+    if(!win_copy(normalized,sizeof(normalized),base))return 0;
+    if(!strchr(normalized,'.')){length=strlen(normalized);if(length+5u>sizeof(normalized))return 0;memcpy(normalized+length,".dll",5u);}
+    for(i=0u;i<process->emulator->windows_native_dll_count;++i)
+        if(win_equal(normalized,process->emulator->windows_native_dlls[i]))return 1;
+    return 0;
+}
+static win_module *win_native_module(xxemul_windows *process,const char *name)
+{
+    win_module *module=win_find_module(process,name,0);
+    if(module){if(module->real)return module;process->last_error=120u;return NULL;}
+    return win_dll_at(process,win_dll_load(process,name,0u));
+}
 static int win_guest_module_span(xxemul_windows *process,uint64_t handle,uint64_t *base,uint64_t *size,uint32_t *generation);
 static int win_set_guest_directory(xxemul_windows *process, const char *guest);
 static int win_module_exports(xxemul_windows *process, win_module *module);
 static int win_loader_lists(xxemul_windows *process);
+static int win_working_root(xxemul_windows *process, char *root, size_t capacity);
 
 static uint64_t win_data_address(const xxemul_windows *process, unsigned index)
 {
@@ -1370,7 +1764,585 @@ static size_t win_api_index(const xxemul_windows *process, uint64_t address)
     return SIZE_MAX;
 }
 
-static uint64_t win_resolve(xxemul_windows *process, const char *module, const char *name)
+/* Explicit export identities are evidence-backed and module-scoped.  An
+ * unnamed ordinal has no inferred Windows name or argument ABI.  Ordinal zero
+ * declares a named-only identity; any emitted EAT ordinal is synthetic. */
+typedef struct win_export_spec {
+    const char *module, *name;
+    uint16_t ordinal;
+    uint8_t unsupported, strict_module;
+} win_export_spec;
+static const win_export_spec win_explicit_exports[] = {
+    {"user32.dll", "GetWindowRgn", 0u, 0u, 0u},
+    {"gdi32.dll", "CreateRectRgn", 0u, 0u, 0u},
+    {"gdi32.dll", "CombineRgn", 0u, 0u, 0u},
+    {"gdi32.dll", "GetRgnBox", 0u, 0u, 0u},
+    {"gdi32.dll", "GetRegionData", 0u, 0u, 0u},
+    {"gdi32.dll", "PtInRegion", 0u, 0u, 0u},
+    {"user32.dll", "ReuseDDElParam", 0u, 1u, 0u},
+    {"oledlg.dll", NULL, 8u, 1u, 1u},
+    {"msimg32.dll", "AlphaBlend", 0u, 1u, 1u},
+    {"comctl32.dll", "InitCommonControls", 17u, 1u, 0u},
+    {"oleaut32.dll", "SysAllocString", 2u, 1u, 0u},
+    {"oleaut32.dll", "SysAllocStringLen", 4u, 0u, 0u},
+    {"oleaut32.dll", "SysReAllocStringLen", 5u, 0u, 0u},
+    {"oleaut32.dll", "SysFreeString", 6u, 0u, 0u},
+    {"oleaut32.dll", "SysStringLen", 7u, 1u, 0u},
+    {"oleaut32.dll", "VariantInit", 8u, 1u, 0u}, /* retained legacy alias */
+    {"oleaut32.dll", "VariantClear", 9u, 0u, 0u},
+    {"oleaut32.dll", "VariantCopy", 10u, 1u, 0u},
+    {"oleaut32.dll", "VariantChangeType", 12u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayCreate", 15u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayGetDim", 17u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayGetElemsize", 18u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayGetUBound", 19u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayGetLBound", 20u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayAccessData", 23u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayUnaccessData", 24u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayGetElement", 25u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayPutElement", 26u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayRedim", 40u, 1u, 0u},
+    {"oleaut32.dll", "VariantChangeTypeEx", 147u, 1u, 0u},
+    {"oleaut32.dll", "SafeArrayPtrOfIndex", 148u, 1u, 0u},
+    {"oleaut32.dll", "SysStringByteLen", 149u, 0u, 0u},
+    {"oleaut32.dll", "SysAllocStringByteLen", 150u, 0u, 0u},
+    {"oleaut32.dll", "OleLoadPicture", 418u, 1u, 0u},
+    {"oleaut32.dll", "OleCreateFontIndirect", 420u, 1u, 0u}
+};
+
+/* Documented legacy names and their exporting DLLs. This is initial EAT
+ * metadata, not a new API body or a claim of fixed Windows ordinals. */
+typedef struct win_catalogue_export { const char *module, *name; } win_catalogue_export;
+static const win_catalogue_export win_catalogue_exports[] = {
+    {"ntdll.dll", "RtlDecompressBuffer"},
+    {"advapi32.dll", "RegCloseKey"},
+    {"advapi32.dll", "RegCreateKeyExA"},
+    {"advapi32.dll", "RegOpenKeyExA"},
+    {"advapi32.dll", "RegQueryValueExA"},
+    {"advapi32.dll", "RegSetValueExA"},
+    {"comctl32.dll", "ImageList_Destroy"},
+    {"comctl32.dll", "InitCommonControls"},
+    {"comdlg32.dll", "ChooseColorA"},
+    {"comdlg32.dll", "ChooseFontA"},
+    {"comdlg32.dll", "CommDlgExtendedError"},
+    {"comdlg32.dll", "FindTextA"},
+    {"comdlg32.dll", "GetFileTitleA"},
+    {"comdlg32.dll", "GetOpenFileNameA"},
+    {"comdlg32.dll", "GetSaveFileNameA"},
+    {"comdlg32.dll", "PrintDlgA"},
+    {"comdlg32.dll", "ReplaceTextA"},
+    {"gdi32.dll", "AbortDoc"},
+    {"gdi32.dll", "BitBlt"},
+    {"gdi32.dll", "CreateBitmap"},
+    {"gdi32.dll", "CreateCompatibleBitmap"},
+    {"gdi32.dll", "CreateCompatibleDC"},
+    {"gdi32.dll", "CreateDCA"},
+    {"gdi32.dll", "CreateFontIndirectA"},
+    {"gdi32.dll", "CreatePen"},
+    {"gdi32.dll", "CreatePenIndirect"},
+    {"gdi32.dll", "CreateSolidBrush"},
+    {"gdi32.dll", "DPtoLP"},
+    {"gdi32.dll", "DeleteDC"},
+    {"gdi32.dll", "DeleteEnhMetaFile"},
+    {"gdi32.dll", "DeleteObject"},
+    {"gdi32.dll", "Ellipse"},
+    {"gdi32.dll", "EndDoc"},
+    {"gdi32.dll", "EndPage"},
+    {"gdi32.dll", "Escape"},
+    {"gdi32.dll", "ExcludeClipRect"},
+    {"gdi32.dll", "ExtFloodFill"},
+    {"gdi32.dll", "ExtTextOutA"},
+    {"gdi32.dll", "GetBkColor"},
+    {"gdi32.dll", "GetBkMode"},
+    {"gdi32.dll", "GetBoundsRect"},
+    {"gdi32.dll", "GetCharWidthA"},
+    {"gdi32.dll", "GetClipBox"},
+    {"gdi32.dll", "GetCurrentObject"},
+    {"gdi32.dll", "GetCurrentPositionEx"},
+    {"gdi32.dll", "GetDIBColorTable"},
+    {"gdi32.dll", "GetDIBits"},
+    {"gdi32.dll", "GetDeviceCaps"},
+    {"gdi32.dll", "GetEnhMetaFileA"},
+    {"gdi32.dll", "GetMapMode"},
+    {"gdi32.dll", "GetObjectA"},
+    {"gdi32.dll", "GetPixel"},
+    {"gdi32.dll", "GetROP2"},
+    {"gdi32.dll", "GetStockObject"},
+    {"gdi32.dll", "GetTextColor"},
+    {"gdi32.dll", "GetTextExtentPointA"},
+    {"gdi32.dll", "GetTextMetricsA"},
+    {"gdi32.dll", "GetViewportExtEx"},
+    {"gdi32.dll", "GetWindowExtEx"},
+    {"gdi32.dll", "IntersectClipRect"},
+    {"gdi32.dll", "LPtoDP"},
+    {"gdi32.dll", "LineTo"},
+    {"gdi32.dll", "MoveToEx"},
+    {"gdi32.dll", "OffsetViewportOrgEx"},
+    {"gdi32.dll", "PatBlt"},
+    {"gdi32.dll", "PlayEnhMetaFile"},
+    {"gdi32.dll", "PtVisible"},
+    {"gdi32.dll", "RealizePalette"},
+    {"gdi32.dll", "RectVisible"},
+    {"gdi32.dll", "Rectangle"},
+    {"gdi32.dll", "RestoreDC"},
+    {"gdi32.dll", "SaveDC"},
+    {"gdi32.dll", "ScaleViewportExtEx"},
+    {"gdi32.dll", "ScaleWindowExtEx"},
+    {"gdi32.dll", "SelectObject"},
+    {"gdi32.dll", "SelectPalette"},
+    {"gdi32.dll", "SetAbortProc"},
+    {"gdi32.dll", "SetBkColor"},
+    {"gdi32.dll", "SetBkMode"},
+    {"gdi32.dll", "SetBoundsRect"},
+    {"gdi32.dll", "SetMapMode"},
+    {"gdi32.dll", "SetPixelV"},
+    {"gdi32.dll", "SetROP2"},
+    {"gdi32.dll", "SetStretchBltMode"},
+    {"gdi32.dll", "SetTextAlign"},
+    {"gdi32.dll", "SetTextColor"},
+    {"gdi32.dll", "SetViewportExtEx"},
+    {"gdi32.dll", "SetViewportOrgEx"},
+    {"gdi32.dll", "SetWindowExtEx"},
+    {"gdi32.dll", "SetWindowOrgEx"},
+    {"gdi32.dll", "StartDocA"},
+    {"gdi32.dll", "StartPage"},
+    {"gdi32.dll", "StretchDIBits"},
+    {"gdi32.dll", "TextOutA"},
+    {"kernel32.dll", "AllocConsole"},
+    {"kernel32.dll", "CloseHandle"},
+    {"kernel32.dll", "CompareStringA"},
+    {"kernel32.dll", "CompareStringW"},
+    {"kernel32.dll", "CopyFileA"},
+    {"kernel32.dll", "CreateDirectoryA"},
+    {"kernel32.dll", "CreateFileA"},
+    {"kernel32.dll", "DeleteCriticalSection"},
+    {"kernel32.dll", "DeleteFileA"},
+    {"kernel32.dll", "DuplicateHandle"},
+    {"kernel32.dll", "EnterCriticalSection"},
+    {"kernel32.dll", "ExitProcess"},
+    {"kernel32.dll", "FileTimeToLocalFileTime"},
+    {"kernel32.dll", "FileTimeToSystemTime"},
+    {"kernel32.dll", "FillConsoleOutputAttribute"},
+    {"kernel32.dll", "FillConsoleOutputCharacterA"},
+    {"kernel32.dll", "FindClose"},
+    {"kernel32.dll", "FindFirstFileA"},
+    {"kernel32.dll", "FindNextFileA"},
+    {"kernel32.dll", "FindResourceA"},
+    {"kernel32.dll", "FlushConsoleInputBuffer"},
+    {"kernel32.dll", "FlushFileBuffers"},
+    {"kernel32.dll", "FormatMessageA"},
+    {"kernel32.dll", "FreeConsole"},
+    {"kernel32.dll", "FreeEnvironmentStringsA"},
+    {"kernel32.dll", "FreeEnvironmentStringsW"},
+    {"kernel32.dll", "FreeLibrary"},
+    {"kernel32.dll", "GetACP"},
+    {"kernel32.dll", "GetCPInfo"},
+    {"kernel32.dll", "GetCommandLineA"},
+    {"kernel32.dll", "GetConsoleScreenBufferInfo"},
+    {"kernel32.dll", "GetConsoleTitleA"},
+    {"kernel32.dll", "GetCurrentDirectoryA"},
+    {"kernel32.dll", "GetCurrentProcess"},
+    {"kernel32.dll", "GetCurrentProcessId"},
+    {"kernel32.dll", "GetCurrentThread"},
+    {"kernel32.dll", "GetCurrentThreadId"},
+    {"kernel32.dll", "GetDateFormatA"},
+    {"kernel32.dll", "GetDriveTypeA"},
+    {"kernel32.dll", "GetEnvironmentStrings"},
+    {"kernel32.dll", "GetEnvironmentStringsW"},
+    {"kernel32.dll", "GetFileAttributesA"},
+    {"kernel32.dll", "GetFileSize"},
+    {"kernel32.dll", "GetFileTime"},
+    {"kernel32.dll", "GetFileType"},
+    {"kernel32.dll", "GetFullPathNameA"},
+    {"kernel32.dll", "GetLastError"},
+    {"kernel32.dll", "GetLocalTime"},
+    {"kernel32.dll", "GetLocaleInfoA"},
+    {"kernel32.dll", "GetLocaleInfoW"},
+    {"kernel32.dll", "GetModuleFileNameA"},
+    {"kernel32.dll", "GetModuleHandleA"},
+    {"kernel32.dll", "GetOEMCP"},
+    {"kernel32.dll", "GetProcAddress"},
+    {"kernel32.dll", "GetProcessVersion"},
+    {"kernel32.dll", "GetStartupInfoA"},
+    {"kernel32.dll", "GetStdHandle"},
+    {"kernel32.dll", "GetStringTypeA"},
+    {"kernel32.dll", "GetStringTypeW"},
+    {"kernel32.dll", "GetSystemTime"},
+    {"kernel32.dll", "GetThreadLocale"},
+    {"kernel32.dll", "GetTickCount"},
+    {"kernel32.dll", "GetTimeZoneInformation"},
+    {"kernel32.dll", "GetVersion"},
+    {"kernel32.dll", "GetVersionExA"},
+    {"kernel32.dll", "GetVolumeInformationA"},
+    {"kernel32.dll", "GlobalAddAtomA"},
+    {"kernel32.dll", "GlobalAlloc"},
+    {"kernel32.dll", "GlobalDeleteAtom"},
+    {"kernel32.dll", "GlobalFlags"},
+    {"kernel32.dll", "GlobalFree"},
+    {"kernel32.dll", "GlobalGetAtomNameA"},
+    {"kernel32.dll", "GlobalHandle"},
+    {"kernel32.dll", "GlobalLock"},
+    {"kernel32.dll", "GlobalReAlloc"},
+    {"kernel32.dll", "GlobalUnlock"},
+    {"kernel32.dll", "HeapAlloc"},
+    {"kernel32.dll", "HeapCreate"},
+    {"kernel32.dll", "HeapDestroy"},
+    {"kernel32.dll", "HeapFree"},
+    {"kernel32.dll", "HeapReAlloc"},
+    {"kernel32.dll", "HeapSize"},
+    {"kernel32.dll", "InitializeCriticalSection"},
+    {"kernel32.dll", "InterlockedDecrement"},
+    {"kernel32.dll", "InterlockedIncrement"},
+    {"kernel32.dll", "IsBadCodePtr"},
+    {"kernel32.dll", "IsBadReadPtr"},
+    {"kernel32.dll", "IsBadWritePtr"},
+    {"kernel32.dll", "IsWow64Process"},
+    {"kernel32.dll", "LCMapStringA"},
+    {"kernel32.dll", "LCMapStringW"},
+    {"kernel32.dll", "LeaveCriticalSection"},
+    {"kernel32.dll", "LoadLibraryA"},
+    {"kernel32.dll", "LoadResource"},
+    {"kernel32.dll", "LocalAlloc"},
+    {"kernel32.dll", "LocalFree"},
+    {"kernel32.dll", "LocalLock"},
+    {"kernel32.dll", "LocalReAlloc"},
+    {"kernel32.dll", "LocalUnlock"},
+    {"kernel32.dll", "LockFile"},
+    {"kernel32.dll", "LockResource"},
+    {"kernel32.dll", "MulDiv"},
+    {"kernel32.dll", "MultiByteToWideChar"},
+    {"kernel32.dll", "PeekConsoleInputA"},
+    {"kernel32.dll", "RaiseException"},
+    {"kernel32.dll", "ReadConsoleInputA"},
+    {"kernel32.dll", "ReadFile"},
+    {"kernel32.dll", "RemoveDirectoryA"},
+    {"kernel32.dll", "RtlUnwind"},
+    {"kernel32.dll", "SetConsoleCtrlHandler"},
+    {"kernel32.dll", "SetConsoleCursorPosition"},
+    {"kernel32.dll", "SetConsoleTextAttribute"},
+    {"kernel32.dll", "SetConsoleTitleA"},
+    {"kernel32.dll", "SetEndOfFile"},
+    {"kernel32.dll", "SetEnvironmentVariableA"},
+    {"kernel32.dll", "SetErrorMode"},
+    {"kernel32.dll", "SetFilePointer"},
+    {"kernel32.dll", "SetHandleCount"},
+    {"kernel32.dll", "SetLastError"},
+    {"kernel32.dll", "SetStdHandle"},
+    {"kernel32.dll", "SetUnhandledExceptionFilter"},
+    {"kernel32.dll", "SizeofResource"},
+    {"kernel32.dll", "Sleep"},
+    {"kernel32.dll", "TerminateProcess"},
+    {"kernel32.dll", "TlsAlloc"},
+    {"kernel32.dll", "TlsGetValue"},
+    {"kernel32.dll", "TlsSetValue"},
+    {"kernel32.dll", "UnhandledExceptionFilter"},
+    {"kernel32.dll", "UnlockFile"},
+    {"kernel32.dll", "VirtualAlloc"},
+    {"kernel32.dll", "VirtualFree"},
+    {"kernel32.dll", "WideCharToMultiByte"},
+    {"kernel32.dll", "WriteConsoleA"},
+    {"kernel32.dll", "WriteFile"},
+    {"kernel32.dll", "WritePrivateProfileStringA"},
+    {"kernel32.dll", "lstrcatA"},
+    {"kernel32.dll", "lstrcmpA"},
+    {"kernel32.dll", "lstrcmpiA"},
+    {"kernel32.dll", "lstrcpyA"},
+    {"kernel32.dll", "lstrcpynA"},
+    {"kernel32.dll", "lstrlenA"},
+    {"ole32.dll", "CLSIDFromProgID"},
+    {"ole32.dll", "CLSIDFromString"},
+    {"ole32.dll", "CoFreeUnusedLibraries"},
+    {"ole32.dll", "CoGetClassObject"},
+    {"ole32.dll", "CoRegisterMessageFilter"},
+    {"ole32.dll", "CoRevokeClassObject"},
+    {"ole32.dll", "CoTaskMemAlloc"},
+    {"ole32.dll", "CoTaskMemFree"},
+    {"ole32.dll", "CreateILockBytesOnHGlobal"},
+    {"ole32.dll", "CreateStreamOnHGlobal"},
+    {"ole32.dll", "OleFlushClipboard"},
+    {"ole32.dll", "OleInitialize"},
+    {"ole32.dll", "OleIsCurrentClipboard"},
+    {"ole32.dll", "OleUninitialize"},
+    {"ole32.dll", "StgCreateDocfileOnILockBytes"},
+    {"ole32.dll", "StgOpenStorageOnILockBytes"},
+    {"oleaut32.dll", "OleCreateFontIndirect"},
+    {"oleaut32.dll", "OleLoadPicture"},
+    {"oleaut32.dll", "SafeArrayAccessData"},
+    {"oleaut32.dll", "SafeArrayGetDim"},
+    {"oleaut32.dll", "SafeArrayGetElemsize"},
+    {"oleaut32.dll", "SafeArrayGetLBound"},
+    {"oleaut32.dll", "SafeArrayGetUBound"},
+    {"oleaut32.dll", "SafeArrayUnaccessData"},
+    {"oleaut32.dll", "SysAllocString"},
+    {"oleaut32.dll", "SysAllocStringByteLen"},
+    {"oleaut32.dll", "SysAllocStringLen"},
+    {"oleaut32.dll", "SysFreeString"},
+    {"oleaut32.dll", "SysStringLen"},
+    {"oleaut32.dll", "VariantChangeType"},
+    {"oleaut32.dll", "VariantClear"},
+    {"oleaut32.dll", "VariantCopy"},
+    {"shell32.dll", "DragFinish"},
+    {"shell32.dll", "DragQueryFileA"},
+    {"shell32.dll", "ShellExecuteA"},
+    {"user32.dll", "AdjustWindowRectEx"},
+    {"user32.dll", "AppendMenuA"},
+    {"user32.dll", "BeginDeferWindowPos"},
+    {"user32.dll", "BeginPaint"},
+    {"user32.dll", "BringWindowToTop"},
+    {"user32.dll", "CallNextHookEx"},
+    {"user32.dll", "CallWindowProcA"},
+    {"user32.dll", "CharNextA"},
+    {"user32.dll", "CharUpperA"},
+    {"user32.dll", "CheckMenuItem"},
+    {"user32.dll", "ClientToScreen"},
+    {"user32.dll", "CloseClipboard"},
+    {"user32.dll", "CopyAcceleratorTableA"},
+    {"user32.dll", "CopyRect"},
+    {"user32.dll", "CreateDialogIndirectParamA"},
+    {"user32.dll", "CreateMenu"},
+    {"user32.dll", "CreatePopupMenu"},
+    {"user32.dll", "CreateWindowExA"},
+    {"user32.dll", "DefFrameProcA"},
+    {"user32.dll", "DefMDIChildProcA"},
+    {"user32.dll", "DefWindowProcA"},
+    {"user32.dll", "DeferWindowPos"},
+    {"user32.dll", "DestroyCursor"},
+    {"user32.dll", "DestroyIcon"},
+    {"user32.dll", "DestroyMenu"},
+    {"user32.dll", "DestroyWindow"},
+    {"user32.dll", "DispatchMessageA"},
+    {"user32.dll", "DrawFrameControl"},
+    {"user32.dll", "DrawIcon"},
+    {"user32.dll", "DrawMenuBar"},
+    {"user32.dll", "DrawStateA"},
+    {"user32.dll", "DrawTextA"},
+    {"user32.dll", "EnableMenuItem"},
+    {"user32.dll", "EnableWindow"},
+    {"user32.dll", "EndDeferWindowPos"},
+    {"user32.dll", "EndDialog"},
+    {"user32.dll", "EndPaint"},
+    {"user32.dll", "EnumClipboardFormats"},
+    {"user32.dll", "EqualRect"},
+    {"user32.dll", "FindWindowA"},
+    {"user32.dll", "GetActiveWindow"},
+    {"user32.dll", "GetAsyncKeyState"},
+    {"user32.dll", "GetCapture"},
+    {"user32.dll", "GetCaretPos"},
+    {"user32.dll", "GetClassInfoA"},
+    {"user32.dll", "GetClassNameA"},
+    {"user32.dll", "GetClientRect"},
+    {"user32.dll", "GetCursorPos"},
+    {"user32.dll", "GetDC"},
+    {"user32.dll", "GetDesktopWindow"},
+    {"user32.dll", "GetDlgCtrlID"},
+    {"user32.dll", "GetDlgItem"},
+    {"user32.dll", "GetFocus"},
+    {"user32.dll", "GetForegroundWindow"},
+    {"user32.dll", "GetKeyState"},
+    {"user32.dll", "GetLastActivePopup"},
+    {"user32.dll", "GetMenu"},
+    {"user32.dll", "GetMenuCheckMarkDimensions"},
+    {"user32.dll", "GetMenuItemCount"},
+    {"user32.dll", "GetMenuItemID"},
+    {"user32.dll", "GetMenuState"},
+    {"user32.dll", "GetMessageA"},
+    {"user32.dll", "GetMessagePos"},
+    {"user32.dll", "GetMessageTime"},
+    {"user32.dll", "GetNextDlgGroupItem"},
+    {"user32.dll", "GetNextDlgTabItem"},
+    {"user32.dll", "GetParent"},
+    {"user32.dll", "GetPropA"},
+    {"user32.dll", "GetScrollPos"},
+    {"user32.dll", "GetScrollRange"},
+    {"user32.dll", "GetSubMenu"},
+    {"user32.dll", "GetSysColor"},
+    {"user32.dll", "GetSysColorBrush"},
+    {"user32.dll", "GetSystemMetrics"},
+    {"user32.dll", "GetTabbedTextExtentA"},
+    {"user32.dll", "GetTopWindow"},
+    {"user32.dll", "GetUpdateRect"},
+    {"user32.dll", "GetWindow"},
+    {"user32.dll", "GetWindowDC"},
+    {"user32.dll", "GetWindowLongA"},
+    {"user32.dll", "GetWindowRect"},
+    {"user32.dll", "GetWindowTextA"},
+    {"user32.dll", "GetWindowTextLengthA"},
+    {"user32.dll", "GrayStringA"},
+    {"user32.dll", "InflateRect"},
+    {"user32.dll", "InsertMenuA"},
+    {"user32.dll", "IntersectRect"},
+    {"user32.dll", "InvalidateRect"},
+    {"user32.dll", "IsChild"},
+    {"user32.dll", "IsClipboardFormatAvailable"},
+    {"user32.dll", "IsDialogMessageA"},
+    {"user32.dll", "IsIconic"},
+    {"user32.dll", "IsRectEmpty"},
+    {"user32.dll", "IsWindow"},
+    {"user32.dll", "IsWindowEnabled"},
+    {"user32.dll", "IsWindowVisible"},
+    {"user32.dll", "KillTimer"},
+    {"user32.dll", "LoadAcceleratorsA"},
+    {"user32.dll", "LoadBitmapA"},
+    {"user32.dll", "LoadCursorA"},
+    {"user32.dll", "LoadIconA"},
+    {"user32.dll", "LoadImageA"},
+    {"user32.dll", "LoadMenuA"},
+    {"user32.dll", "LoadStringA"},
+    {"user32.dll", "MapDialogRect"},
+    {"user32.dll", "MapWindowPoints"},
+    {"user32.dll", "MessageBeep"},
+    {"user32.dll", "MessageBoxA"},
+    {"user32.dll", "ModifyMenuA"},
+    {"user32.dll", "MoveWindow"},
+    {"user32.dll", "OffsetRect"},
+    {"user32.dll", "OpenClipboard"},
+    {"user32.dll", "PeekMessageA"},
+    {"user32.dll", "PostMessageA"},
+    {"user32.dll", "PostQuitMessage"},
+    {"user32.dll", "PostThreadMessageA"},
+    {"user32.dll", "PtInRect"},
+    {"user32.dll", "RedrawWindow"},
+    {"user32.dll", "RegisterClassA"},
+    {"user32.dll", "RegisterClipboardFormatA"},
+    {"user32.dll", "RegisterWindowMessageA"},
+    {"user32.dll", "ReleaseCapture"},
+    {"user32.dll", "ReleaseDC"},
+    {"user32.dll", "RemoveMenu"},
+    {"user32.dll", "RemovePropA"},
+    {"user32.dll", "ReuseDDElParam"},
+    {"user32.dll", "ScreenToClient"},
+    {"user32.dll", "ScrollWindow"},
+    {"user32.dll", "SendDlgItemMessageA"},
+    {"user32.dll", "SendMessageA"},
+    {"user32.dll", "SetActiveWindow"},
+    {"user32.dll", "SetCursor"},
+    {"user32.dll", "SetDlgItemTextA"},
+    {"user32.dll", "SetFocus"},
+    {"user32.dll", "SetForegroundWindow"},
+    {"user32.dll", "SetMenu"},
+    {"user32.dll", "SetMenuItemBitmaps"},
+    {"user32.dll", "SetPropA"},
+    {"user32.dll", "SetRect"},
+    {"user32.dll", "SetRectEmpty"},
+    {"user32.dll", "SetScrollInfo"},
+    {"user32.dll", "SetScrollPos"},
+    {"user32.dll", "SetScrollRange"},
+    {"user32.dll", "SetTimer"},
+    {"user32.dll", "SetWindowLongA"},
+    {"user32.dll", "SetWindowPos"},
+    {"user32.dll", "SetWindowTextA"},
+    {"user32.dll", "SetWindowsHookExA"},
+    {"user32.dll", "ShowOwnedPopups"},
+    {"user32.dll", "ShowScrollBar"},
+    {"user32.dll", "ShowWindow"},
+    {"user32.dll", "SystemParametersInfoA"},
+    {"user32.dll", "TabbedTextOutA"},
+    {"user32.dll", "TrackPopupMenu"},
+    {"user32.dll", "TranslateAcceleratorA"},
+    {"user32.dll", "TranslateMessage"},
+    {"user32.dll", "UnhookWindowsHookEx"},
+    {"user32.dll", "UnpackDDElParam"},
+    {"user32.dll", "UpdateWindow"},
+    {"user32.dll", "ValidateRect"},
+    {"user32.dll", "WaitMessage"},
+    {"user32.dll", "WinHelpA"},
+    {"user32.dll", "wsprintfA"},
+    {"winmm.dll", "PlaySoundA"},
+    {"winspool.drv", "ClosePrinter"},
+    {"winspool.drv", "DocumentPropertiesA"},
+    {"winspool.drv", "EndDocPrinter"},
+    {"winspool.drv", "EndPagePrinter"},
+    {"winspool.drv", "OpenPrinterA"},
+    {"winspool.drv", "StartDocPrinterA"},
+    {"winspool.drv", "StartPagePrinter"},
+    {"winspool.drv", "WritePrinter"},
+};
+static int win_profile_module_equal(const char *module, const char *canonical)
+{
+    const char *base = module, *at;
+    char normalized[48];
+    size_t length;
+    if (!module) return 0;
+    for (at = module; *at; ++at) if (*at == '/' || *at == '\\') base = at + 1;
+    if (!win_copy(normalized, sizeof(normalized), base)) return 0;
+    if (!strchr(normalized, '.')) {
+        length = strlen(normalized);
+        if (length + 5u > sizeof(normalized)) return 0;
+        memcpy(normalized + length, ".dll", 5u);
+    }
+    return win_equal(normalized, canonical);
+}
+static const win_catalogue_export *win_catalogue_export_of(const char *name)
+{
+    size_t i;
+    if (!name) return NULL;
+    for (i = 0u; i < sizeof(win_catalogue_exports) / sizeof(win_catalogue_exports[0]); ++i)
+        if (!strcmp(name, win_catalogue_exports[i].name)) return &win_catalogue_exports[i];
+    return NULL;
+}
+static int win_catalogue_module(const char *module)
+{
+    size_t i;
+    if (!module) return 0;
+    for (i = 0u; i < sizeof(win_catalogue_exports) / sizeof(win_catalogue_exports[0]); ++i)
+        if (win_profile_module_equal(module, win_catalogue_exports[i].module)) return 1;
+    return win_profile_module_equal(module, "kernelbase.dll") || win_prefix(module, "api-ms-win-core-");
+}
+static int win_catalogue_case_mismatch(const char *name)
+{
+    size_t i;
+    int folded = 0;
+    if (!name) return 1;
+    for (i = 0u; i < sizeof(win_catalogue_exports) / sizeof(win_catalogue_exports[0]); ++i) {
+        const char *canonical = win_catalogue_exports[i].name;
+        if (!strcmp(name, canonical)) return 0;
+        if (win_equal(name, canonical)) folded = 1;
+    }
+    for (i = 0u; i < sizeof(win_explicit_exports) / sizeof(win_explicit_exports[0]); ++i) {
+        const char *canonical = win_explicit_exports[i].name;
+        if (!canonical) continue;
+        if (!strcmp(name, canonical)) return 0;
+        if (win_equal(name, canonical)) folded = 1;
+    }
+#define WIN_CATALOGUE_CASE(array) \
+    for (i = 0u; i < sizeof(array) / sizeof((array)[0]); ++i) { \
+        if (!strcmp(name, (array)[i])) return 0; \
+        if (win_equal(name, (array)[i])) folded = 1; \
+    }
+    WIN_CATALOGUE_CASE(win_export_names)
+    WIN_CATALOGUE_CASE(win_extra_export_names)
+    WIN_CATALOGUE_CASE(win_crt_names)
+#undef WIN_CATALOGUE_CASE
+    return folded;
+}
+static int win_explicit_module(const char *module)
+{
+    size_t i;
+    if (win_catalogue_module(module)) return 1;
+    for (i = 0u; i < sizeof(win_explicit_exports) / sizeof(win_explicit_exports[0]); ++i)
+        if (win_profile_module_equal(module, win_explicit_exports[i].module)) return 1;
+    return 0;
+}
+static int win_strict_exports_module(const char *module)
+{
+    size_t i;
+    for (i = 0u; i < sizeof(win_explicit_exports) / sizeof(win_explicit_exports[0]); ++i)
+        if (win_profile_module_equal(module, win_explicit_exports[i].module) && win_explicit_exports[i].strict_module) return 1;
+    return 0;
+}
+static const win_export_spec *win_explicit_export(const char *module, uint16_t ordinal, const char *name)
+{
+    size_t i;
+    for (i = 0u; i < sizeof(win_explicit_exports) / sizeof(win_explicit_exports[0]); ++i) {
+        const win_export_spec *spec = &win_explicit_exports[i];
+        if (win_profile_module_equal(module, spec->module) &&
+            (name ? spec->name && !strcmp(name, spec->name) : ordinal && ordinal == spec->ordinal)) return spec;
+    }
+    return NULL;
+}
+static int win_export_for_module(const char *module, const char *name);
+static uint64_t win_resolve_entry(xxemul_windows *process, const char *module, const char *name,
+                                  const win_export_spec *explicit_export)
 {
     size_t i;
     win_api *api;
@@ -1382,9 +2354,24 @@ static uint64_t win_resolve(xxemul_windows *process, const char *module, const c
         else mapped=win_dll_at(process,win_dll_load(process,module,0u));
     }
     if (mapped == NULL) return 0;
-    if (mapped->real) return win_dll_export(process,mapped,name,0u,0);
+    if (mapped->real) return win_dll_export(process,mapped,name,0u,explicit_export && !explicit_export->name);
     module = mapped->name;
     if (strcmp(name, "GetProcAddressA") == 0) name = "GetProcAddress";
+    if (win_catalogue_case_mismatch(name)) return 0u;
+    if (win_catalogue_export_of(name) && !win_export_for_module(module, name)) return 0u;
+    if (!explicit_export) explicit_export = win_explicit_export(module, 0u, name);
+    if (win_strict_exports_module(module) && !explicit_export) return 0u;
+    if (!explicit_export && win_explicit_module(module) && name[0] == '#') return 0u;
+    /* Known new names keep their actual DLL ownership; do not create a lazy
+     * alias in another modeled module. Real DLL exports were handled above. */
+    for (i = 0u; i < sizeof(win_explicit_exports) / sizeof(win_explicit_exports[0]); ++i)
+        if (win_explicit_exports[i].name && !strcmp(name, win_explicit_exports[i].name) &&
+            !win_equal(module, win_explicit_exports[i].module)) {
+            /* CE's coredll intentionally aggregates existing non-CRT services;
+             * retain the callable policy without claiming their NT ordinals. */
+            if (!win_equal(module, "coredll.dll")) return 0u;
+            explicit_export = &win_explicit_exports[i];
+        }
     is_crt = win_crt_api(name) || win_suffix(module, "msvcrt.dll") || win_suffix(module, "ucrtbase.dll") || strstr(module, "api-ms-win-crt-") != NULL;
     {
         static const char *const data_names[7] = {"_iob", "__initenv", "__mb_cur_max", "_acmdln", "_commode", "_fmode", "_adjust_fdiv"};
@@ -1400,9 +2387,18 @@ static uint64_t win_resolve(xxemul_windows *process, const char *module, const c
     }
     if (process->api_count >= WIN_MAX_APIS || mapped->api_count >= WIN_MAX_MODULE_APIS) return 0;
     api = &process->apis[process->api_count];
+    /* A failed module construction can roll api_count back to a used slot. */
+    memset(api, 0, sizeof(*api));
     if (!win_copy(api->module, sizeof(api->module), module) || !win_copy(api->name, sizeof(api->name), name)) return 0;
     snprintf(api->qualified, sizeof(api->qualified), "%s!%s", api->module, api->name);
-    api->argument_count = win_argument_count(name);
+    if (explicit_export) {
+        api->export_ordinal = win_equal(module, explicit_export->module) ? explicit_export->ordinal : 0u;
+        api->export_unnamed = (uint8_t)(explicit_export->name == NULL);
+        api->unsupported = explicit_export->unsupported;
+    }
+    api->argument_count = api->unsupported ? 0u : win_argument_count(name);
+    if (process->emulator->mode == XXEMUL_MODE_X86_32 && win_equal(name, "WindowFromPoint")) api->argument_count = 2u;
+    if (process->emulator->mode == XXEMUL_MODE_X86_32 && win_equal(name, "PtInRect")) api->argument_count = 3u;
     if (process->emulator->mode == XXEMUL_MODE_X86_32 && strcmp(name, "SetFilePointerEx") == 0) api->argument_count = 5u;
     if (process->emulator->mode == XXEMUL_MODE_X86_64 && strcmp(name, "_lseeki64") == 0) api->argument_count = 3u;
     if (process->emulator->mode == XXEMUL_MODE_X86_64 && strcmp(name, "_chsize_s") == 0) api->argument_count = 2u;
@@ -1419,20 +2415,70 @@ static uint64_t win_resolve(xxemul_windows *process, const char *module, const c
     }
     return address;
 }
+static uint64_t win_resolve_spec(xxemul_windows *process, const win_export_spec *spec)
+{
+    char label[16];
+    if (!spec) return 0u;
+    if (spec->name) return win_resolve_entry(process, spec->module, spec->name, spec);
+    snprintf(label, sizeof(label), "#%u", (unsigned)spec->ordinal);
+    return win_resolve_entry(process, spec->module, label, spec);
+}
+static uint64_t win_resolve(xxemul_windows *process, const char *module, const char *name)
+{
+    if(win_native_required(process,module)){
+        win_module *native=win_native_module(process,module);
+        return native?win_dll_export(process,native,name,0u,0):0u;
+    }
+    /* A named lookup of the literal "#8" is not an ordinal selector. */
+    win_module *mapped = win_find_module(process, module, 0);
+    const char *canonical = mapped ? mapped->name : module;
+    if (!mapped || !mapped->real) {
+        const win_export_spec *spec = win_explicit_export(canonical, 0u, name);
+        if (spec) return win_resolve_spec(process, spec);
+        if (win_strict_exports_module(canonical)) return 0u;
+    }
+    return win_resolve_entry(process, module, name, NULL);
+}
+static uint64_t win_resolve_ordinal(xxemul_windows *process, const char *module, uint16_t ordinal)
+{
+    if(win_native_required(process,module)){
+        char label[16];win_module *native=win_native_module(process,module);
+        if(!native)return 0u;
+        snprintf(label,sizeof(label),"#%u",(unsigned)ordinal);
+        return win_dll_export(process,native,label,0u,1);
+    }
+    const win_export_spec *spec = win_explicit_export(module, ordinal, NULL);
+    win_module *mapped;
+    size_t i;
+    if (spec) return win_resolve_spec(process, spec);
+    if (!ordinal || !win_explicit_module(module)) return 0u;
+    mapped = win_find_module(process, module, 0);
+    if (!mapped || mapped->real) return 0u;
+    /* Non-fixed named exports keep their emitted synthetic profile ordinal;
+     * numeric API and EAT lookup agree even in a strict named-only profile.
+     * Only committed EAT entries can resolve here; gaps remain unmapped. */
+    for (i = 0u; i < mapped->api_count; ++i) {
+        const win_api *api = &process->apis[mapped->api_indices[i]];
+        if (api->effective_export_ordinal == ordinal) return api->address;
+    }
+    return 0u;
+}
+static uint64_t win_resolve_ordinal_label(xxemul_windows *process, const char *module, const char *label)
+{
+    uint32_t ordinal = 0u;
+    const char *at;
+    if (!label || label[0] != '#' || !label[1]) return 0u;
+    for (at = label + 1; *at; ++at) {
+        if (*at < '0' || *at > '9' || ordinal > (UINT16_MAX - (unsigned)(*at - '0')) / 10u) return 0u;
+        ordinal = ordinal * 10u + (unsigned)(*at - '0');
+    }
+    return win_resolve_ordinal(process, module, (uint16_t)ordinal);
+}
 
 static const char *win_oleaut32_ordinal_name(uint16_t ordinal)
 {
-    switch (ordinal) {
-        case 2: return "SysAllocString";
-        case 4: return "SysAllocStringLen";
-        case 6: return "SysFreeString";
-        case 7: return "SysStringLen";
-        case 8: return "VariantInit";
-        case 9: return "VariantClear";
-        case 10: return "VariantCopy";
-        case 149: return "SysStringByteLen";
-        default: return NULL;
-    }
+    const win_export_spec *spec = win_explicit_export("oleaut32.dll", ordinal, NULL);
+    return spec ? spec->name : NULL;
 }
 
 static int win_bind_imports(xxemul_windows *process, const uint8_t *optional, size_t optional_size, int is_64)
@@ -1459,13 +2505,29 @@ static int win_bind_imports(xxemul_windows *process, const uint8_t *optional, si
         uint32_t iat_rva = win_le32(entry + 16u);
         char module[48];
         size_t symbol_index;
+        win_module *dependency;
+        const uint8_t *first_slot;
         if (module_rva == 0 || iat_rva == 0) return 1;
         if (module_rva == 0 || iat_rva == 0 || !win_image_string(process, module_rva, module, sizeof(module))) return 0;
         if (lookup_rva == 0) lookup_rva = iat_rva;
+        if (!win_image_rva(process, lookup_rva, pointer_size, &first_slot) ||
+            !win_image_rva(process, iat_rva, pointer_size, &first_slot)) return 0;
+        /* A descriptor declares a DLL dependency even when its first lookup
+         * entry is zero. Do not resolve a dummy symbol or write its IAT: an
+         * empty descriptor may deliberately share another descriptor's IAT.
+         * Reuse the real-DLL importer policy, including native-required names. */
+        dependency = win_find_module(process, module, 0);
+        if (!dependency) {
+            if (win_loadable_module(process, module)) dependency = win_find_module(process, module, 1);
+            else dependency = win_dll_at(process, win_dll_load(process, module, 0u));
+        }
+        if (!dependency) return 0;
         for (symbol_index = 0; symbol_index < 4096u; ++symbol_index) {
             uint64_t raw, slot_rva, source_rva, address;
             const uint8_t *slot;
-            char name[96];
+            /* The legacy image-string reader reserves a byte in addition to
+             * the terminating NUL. This storage accepts4095 selector bytes. */
+            char name[4097];
             source_rva = (uint64_t)lookup_rva + symbol_index * pointer_size;
             slot_rva = (uint64_t)iat_rva + symbol_index * pointer_size;
             if (!win_image_rva(process, source_rva, pointer_size, &slot) || !win_image_rva(process, slot_rva, pointer_size, &slot)) return 0;
@@ -1488,6 +2550,11 @@ static int win_bind_imports(xxemul_windows *process, const uint8_t *optional, si
             }
             if(raw & (is_64 ? UINT64_C(0x8000000000000000) : UINT64_C(0x80000000))){
                 win_module *real_module=win_find_module(process,module,0);
+                if ((!real_module || !real_module->real) && win_explicit_module(module)) {
+                    address = win_resolve_ordinal(process, module, (uint16_t)(raw & 0xffffu));
+                    if (!address || !win_store(process, process->image_base + slot_rva, pointer_size, address)) return 0;
+                    continue;
+                }
                 if(!real_module && !win_loadable_module(process,module)) {
                     real_module=win_dll_at(process,win_dll_load(process,module,0u));
                     if(!real_module)return 0;
@@ -1501,7 +2568,6 @@ static int win_bind_imports(xxemul_windows *process, const uint8_t *optional, si
         }
         if (symbol_index == 4096u) return 0;
         if (process->main_dll_slot) {
-            win_module *dependency = win_find_module(process, module, 0);
             if (dependency && dependency->real && !dependency->primary)
                 process->modules[process->main_dll_slot - 1u].dependencies |= UINT32_C(1) << (size_t)(dependency - process->modules);
         }
@@ -1598,6 +2664,201 @@ static int win_bootstrap_seh(xxemul_windows *process, win_thread_context *thread
     return 1;
 }
 
+static int win_process_read(void *context, uint64_t address, void *bytes, size_t size)
+{
+    return win_read((xxemul_windows *)context, address, bytes, size);
+}
+
+static int win_process_write(void *context, uint64_t address, const void *bytes, size_t size)
+{
+    return win_write((xxemul_windows *)context, address, bytes, size);
+}
+
+static xxemul_windows_process_memory win_process_memory(xxemul_windows *process)
+{
+    xxemul_windows_process_memory memory = {win_process_read, win_process_write, process};
+    return memory;
+}
+
+static int win_process_unicode(xxemul_windows *process, uint64_t descriptor, xxemul_windows_unicode_value *value)
+{
+    uint64_t length, maximum, address;
+    unsigned width = win_word_size(process->emulator);
+    if (!win_load(process, descriptor, 2u, &length) || !win_load(process, descriptor + 2u, 2u, &maximum) ||
+        !win_load(process, descriptor + (width == 8u ? 8u : 4u), (uint8_t)width, &address)) return 0;
+    value->address = address; value->length = (uint16_t)length; value->maximum_length = (uint16_t)maximum;
+    return 1;
+}
+
+static int win_process_description(xxemul_windows *process, xxemul_windows_process_description *description)
+{
+    xxemul *e = process->emulator;
+    unsigned width = win_word_size(e), index;
+    uint64_t params = process->runtime_base + 0x4000u;
+    memset(description, 0, sizeof(*description));
+    description->is64 = width == 8u;
+    description->peb = process->runtime_base + 0x2000u;
+    description->loader = process->runtime_base + 0x3000u;
+    description->parameters = params;
+    description->image_base = process->image_base;
+    description->heap = process->runtime_base + WIN_THREAD_TEB_OFFSET;
+    description->heap_list = description->heap + 0x800u;
+    description->tls_bitmap = description->heap + 0xa00u;
+    description->tls_expansion_bitmap = description->heap + 0xa20u;
+    description->fast_peb_lock = description->heap + 0xb00u;
+    description->loader_lock = description->heap + 0xb80u;
+    description->heap_start = (process->image_base + process->image_size + 15u) & ~UINT64_C(15);
+    description->heap_limit = process->heap_limit;
+    process->heap_descriptors[0] = description->heap;
+    description->heap_count = 1u;
+    for (index = 0; index < WIN_MAX_HANDLES && description->heap_count < 64u; ++index)
+        if (process->handles[index].in_use && process->handles[index].kind == WIN_HANDLE_HEAP && process->handles[index].heap_address)
+            process->heap_descriptors[description->heap_count++] = process->handles[index].heap_address;
+    description->heaps = process->heap_descriptors;
+    description->heap_capacity = 64u;
+    description->tls_capacity = WIN_MAX_TLS_SLOTS;
+    description->environment = process->runtime_base + 0x7c00u;
+    description->environment_bytes = process->environment_size * 2u;
+    description->standard_input = 0x10u;
+    description->standard_output = 0x11u;
+    description->standard_error = 0x12u;
+    description->major_version = WIN_OS_VERSION_MAJOR;
+    description->minor_version = WIN_OS_VERSION_MINOR;
+    description->build_number = WIN_OS_VERSION_BUILD;
+    description->platform_id = 2u;
+    description->processor_count = 1u;
+    description->affinity_mask = process->process_affinity;
+    description->heap_flags = 2u;
+    description->loader_initialized = process->loader_ready;
+    description->process_initializing = !process->process_initialized;
+    description->subsystem = process->image_subsystem;
+    description->subsystem_major = process->image_subsystem_major;
+    description->subsystem_minor = process->image_subsystem_minor;
+    description->dll_path.address = description->heap + 0xc00u;
+    description->dll_path.length = 38u;
+    description->dll_path.maximum_length = 40u;
+    return win_process_unicode(process, params + (width == 8u ? 0x60u : 0x38u), &description->image_path) &&
+        win_process_unicode(process, params + (width == 8u ? 0x70u : 0x40u), &description->command_line) &&
+        win_process_unicode(process, params + (width == 8u ? 0x38u : 0x24u), &description->current_directory);
+}
+
+static xxemul_status win_process_sync_parameters(xxemul_windows *process)
+{
+    xxemul_windows_process_description description;
+    xxemul_windows_process_memory memory;
+    if (!process->structures_ready) return XXEMUL_STATUS_OK;
+    if (!win_process_description(process, &description)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    memory = win_process_memory(process);
+    return xxemul_windows_process_update_parameters(&memory, &description);
+}
+
+static xxemul_status win_process_sync_heaps(xxemul_windows *process)
+{
+    xxemul_windows_process_description description;
+    xxemul_windows_process_memory memory;
+    if (!process->structures_ready) return XXEMUL_STATUS_OK;
+    if (!win_process_description(process, &description)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    memory = win_process_memory(process);
+    return xxemul_windows_process_update_heaps(&memory, &description);
+}
+
+static xxemul_status win_process_sync_tls(xxemul_windows *process)
+{
+    xxemul_windows_process_description description;
+    xxemul_windows_process_memory memory;
+    uint32_t allocated[4] = {0};
+    unsigned index;
+    if (!process->structures_ready) return XXEMUL_STATUS_OK;
+    for (index = 0; index < WIN_MAX_TLS_SLOTS; ++index)
+        if (process->tls_allocated[index]) allocated[index / 32u] |= UINT32_C(1) << (index & 31u);
+    if (!win_process_description(process, &description)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    memory = win_process_memory(process);
+    return xxemul_windows_process_update_tls_bitmap(&memory, &description, allocated, 4u);
+}
+
+static xxemul_status win_thread_initialize_structures(xxemul_windows *process, win_thread_context *thread)
+{
+    xxemul_windows_thread_description description;
+    xxemul_windows_process_memory memory = win_process_memory(process);
+    memset(&description, 0, sizeof(description));
+    description.is64 = win_word_size(process->emulator) == 8u;
+    description.teb = thread->teb_base;
+    description.peb = process->runtime_base + 0x2000u;
+    description.stack_base = thread->stack_base;
+    description.stack_limit = thread->stack_limit;
+    description.deallocation_stack = thread->stack_allocation ? thread->stack_allocation : thread->stack_limit;
+    description.exception_list = thread->seh_head;
+    description.static_tls = thread->tls_array;
+    description.tls_expansion = thread->teb_base + 0x1c00u;
+    description.process_id = process->process_id;
+    description.thread_id = thread->id;
+    description.last_error = thread->last_error;
+    description.locale = 0x0409u;
+    description.tls_values = thread->tls_values;
+    description.tls_count = WIN_MAX_TLS_SLOTS;
+    return xxemul_windows_thread_initialize(&memory, &description);
+}
+
+static xxemul_status win_process_sync_exception_flags(xxemul_windows *process)
+{
+    xxemul_windows_process_memory memory = win_process_memory(process);
+    size_t index;
+    int veh = 0, vch = 0;
+    if (!process->structures_ready) return XXEMUL_STATUS_OK;
+    for (index = 0; index < process->vectored_handler_count; ++index) {
+        const win_vectored_handler *entry = &process->vectored_handlers[index];
+        if (!entry->active) continue;
+        if (entry->continuation) vch = 1; else veh = 1;
+    }
+    return xxemul_windows_process_update_exception_flags(&memory, win_word_size(process->emulator) == 8u,
+        process->runtime_base + 0x2000u, !process->process_initialized, veh, vch);
+}
+
+static int win_process_initialize_structures(xxemul_windows *process)
+{
+    xxemul_windows_process_description description;
+    xxemul_windows_process_memory memory = win_process_memory(process);
+    uint64_t heap = process->runtime_base + WIN_THREAD_TEB_OFFSET;
+    if (!win_write_wide(process, heap + 0xc00u, "C:\\Windows\\System32", 20u) ||
+        !win_process_description(process, &description)) return 0;
+    if (xxemul_windows_process_initialize(&memory, &description) != XXEMUL_STATUS_OK ||
+        win_thread_initialize_structures(process, &process->threads[0]) != XXEMUL_STATUS_OK) return 0;
+    if (win_critical_initialize(process, description.fast_peb_lock) != XXEMUL_STATUS_OK ||
+        win_critical_initialize(process, description.loader_lock) != XXEMUL_STATUS_OK) return 0;
+    process->structures_ready = 1u;
+    return win_process_sync_tls(process) == XXEMUL_STATUS_OK;
+}
+
+static int win_tls_slot_address(xxemul_windows *process, const win_thread_context *thread, unsigned slot,
+                                  int create, uint64_t *address)
+{
+    const xxemul_windows_process_layout *layout = xxemul_windows_process_get_layout(win_word_size(process->emulator) == 8u);
+    uint64_t expansion;
+    unsigned width = layout->pointer_size;
+    if (slot < 64u) { *address = thread->teb_base + layout->tls_slots + slot * width; return 1; }
+    if (!win_load(process, thread->teb_base + layout->tls_expansion, (uint8_t)width, &expansion)) return 0;
+    if (!expansion && create) {
+        uint8_t zero[64u * 8u] = {0};
+        expansion = thread->teb_base + 0x1c00u;
+        if (!win_write(process, expansion, zero, 64u * width) ||
+            !win_store(process, thread->teb_base + layout->tls_expansion, (uint8_t)width, expansion)) return 0;
+    }
+    *address = expansion ? expansion + (slot - 64u) * width : 0u;
+    return 1;
+}
+
+static int win_tls_read_slots(xxemul_windows *process, win_thread_context *thread, uint64_t *values)
+{
+    unsigned index, width = win_word_size(process->emulator);
+    for (index = 0; index < WIN_MAX_TLS_SLOTS; ++index) {
+        uint64_t address;
+        if (!win_tls_slot_address(process, thread, index, 0, &address)) return 0;
+        values[index] = 0u;
+        if (address && !win_load(process, address, (uint8_t)width, &values[index])) return 0;
+    }
+    return 1;
+}
+
 static int win_prepare_runtime(xxemul_windows *process, const char *const *arguments, size_t argument_count)
 {
     xxemul *emulator = process->emulator;
@@ -1671,7 +2932,7 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
     if (!win_bootstrap_seh(process, &process->threads[0])) return 0;
 
     if (word_size == 4u) {
-        if (!win_store(process, process->runtime_base, 4u, process->threads[0].seh_head) ||
+        if (!win_store(process, win_current_teb(process), 4u, process->threads[0].seh_head) ||
             !win_store(process, process->runtime_base + 0x04u, 4u, process->runtime_base) ||
             !win_store(process, process->runtime_base + 0x08u, 4u, process->runtime_base - 0x40000u) ||
             !win_store(process, process->runtime_base + 0x18u, 4u, process->runtime_base) ||
@@ -1704,7 +2965,17 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
             !win_store(process, cwd_descriptor, 2u, 6u) || !win_store(process, cwd_descriptor + 2u, 2u, 8u) ||
             !win_store(process, cwd_descriptor + (word_size == 8u ? 8u : 4u), word_size, cwd_string)) return 0;
     }
+    if (emulator->arch == XXEMUL_ARCH_X86) {
+        emulator->x86.segment[XXEMUL_X86_CS] = word_size == 8u ? 0x33u : 0x23u;
+        emulator->x86.segment[XXEMUL_X86_SS] = 0x2bu;
+        emulator->x86.segment[XXEMUL_X86_DS] = 0x2bu;
+        emulator->x86.segment[XXEMUL_X86_ES] = 0x2bu;
+        emulator->x86.segment[XXEMUL_X86_FS] = 0x53u;
+        emulator->x86.segment[XXEMUL_X86_GS] = 0x2bu;
+        emulator->x86.flags |= 0x202u;
+    }
     if (emulator->arch == XXEMUL_ARCH_ARM) {
+        if (word_size == 4u) emulator->arm.pstate = (emulator->arm.pstate & ~UINT32_C(0x1f)) | 0x10u;
         /* AAPCS stack alignment and an explicit return-to-ExitProcess thunk.
          * Windows ARM64 reserves X18 for its TEB; ARM32 has no x86 segment. */
         emulator->arm.sp = stack_top & ~(uint64_t)(word_size == 8u ? 15u : 7u);
@@ -1712,7 +2983,7 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
         if (word_size == 8u) emulator->arm.gpr[18] = process->runtime_base;
     } else {
         uint64_t initial_sp = stack_top - (word_size == 8u ? 40u : 4u);
-        int is_dll = (win_le16(emulator->region_data + win_le32(emulator->region_data + 0x3cu) + 22u) & 0x2000u) != 0;
+        int is_dll = process->image_is_dll;
         if (is_dll && word_size == 4u) initial_sp = stack_top - 16u;
         if (!win_store(process, initial_sp, (uint8_t)word_size, process->runtime_base + WIN_PROCESS_RETURN_OFFSET)) return 0;
         if (is_dll) {
@@ -1725,7 +2996,7 @@ static int win_prepare_runtime(xxemul_windows *process, const char *const *argum
         }
         emulator->x86.gpr[XXEMUL_X86_RSP] = initial_sp;
     }
-    return 1;
+    return win_process_initialize_structures(process);
 }
 
 xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path, const char *working_directory, const char *const *arguments, size_t argument_count,
@@ -1773,6 +3044,11 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
     process->registry_next_handle = 0x10000u;
     process->random_state = 1u;
     process->image_size = image_size;
+    process->image_entry_rva = win_le32(optional + 16u);
+    process->image_subsystem = optional_size >= 70u ? win_le16(optional + 68u) : 0u;
+    process->image_subsystem_major = win_le16(optional + 48u);
+    process->image_subsystem_minor = win_le16(optional + 50u);
+    process->image_is_dll = (win_le16(bytes + pe_offset + 22u) & 0x2000u) != 0u;
     {
         size_t dir_off = is_64 ? 112u : 96u;
         if (optional_size >= dir_off + 24u) {
@@ -1787,6 +3063,7 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
         free(process);
         return NULL;
     }
+    process->threads[0].teb_base = process->runtime_base;
     process->threads[0].active = 1u;
     process->threads[0].id = 1u;
     process->threads[0].notify_started = 1u;
@@ -1811,16 +3088,30 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
     if (!win_copy(process->program_path, sizeof(process->program_path), program_path) ||
         !win_copy(process->working_directory, sizeof(process->working_directory), working_directory) ||
         !win_copy(process->guest_directory, sizeof(process->guest_directory), "C:\\") || process->heap_cursor >= process->heap_limit ||
-        !win_prepare_runtime(process, arguments, argument_count) || !win_primary_dll_register(process, optional, optional_size, is_64) ||
-        !win_bind_imports(process, optional, optional_size, is_64) ||
-        !win_bind_tls(process, optional, optional_size, is_64)) {
-        size_t tls_slot;
-        for (tls_slot = 0u; tls_slot < process->module_count; ++tls_slot) win_tls_release_image(process, &process->modules[tls_slot].tls);
-        win_tls_release_image(process, &process->main_tls);
-        for (tls_slot = 0u; tls_slot < WIN_MAX_THREADS; ++tls_slot) win_tls_thread_release(process, &process->threads[tls_slot]);
-        free(process);
+        !win_prepare_runtime(process, arguments, argument_count) || !win_primary_dll_register(process, optional, optional_size, is_64)) {
+        xxemul_windows_destroy(process);
         if (status != NULL) *status = XXEMUL_STATUS_INVALID_IMAGE;
         return NULL;
+    }
+    {
+        int context_error=win_actctx_prepare(process);
+        if(context_error){
+            xxemul_windows_destroy(process);
+            if(status)*status=context_error==8?XXEMUL_STATUS_OUT_OF_MEMORY:context_error==50?XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION:XXEMUL_STATUS_INVALID_IMAGE;
+            return NULL;
+        }
+    }
+    if (
+        !win_bind_imports(process, optional, optional_size, is_64) ||
+        !win_bind_tls(process, optional, optional_size, is_64)) {
+        /* Runtime/import preparation can already own canonical DLL images,
+         * TLS templates and per-thread buffers when a later validation fails. */
+        xxemul_windows_destroy(process);
+        if (status != NULL) *status = XXEMUL_STATUS_INVALID_IMAGE;
+        return NULL;
+    }
+    if (!win_memory_init(process,is_64 || emulator->arch==XXEMUL_ARCH_ARM || (optional_size>=72u && (win_le16(optional+70u)&0x100u)))) {
+        xxemul_windows_destroy(process);if(status)*status=XXEMUL_STATUS_OUT_OF_MEMORY;return NULL;
     }
     if (emulator->arch == XXEMUL_ARCH_X86) {
         size_t slot;
@@ -1880,11 +3171,20 @@ xxemul_status xxemul_windows_set_environment(xxemul_windows *process, const char
 
 static int win_mapping_flush(xxemul_windows *process, win_handle *mapping, uint64_t address, uint64_t length);
 
+static void win_window_properties_release(xxemul_windows *,win_gui_object *);
+static void win_window_release(xxemul_windows *,uint64_t);
 void xxemul_windows_destroy(xxemul_windows *process)
 {
     size_t i;
     if (process == NULL) return;
     win_children_destroy(process);
+    win_actctx_destroy(process);
+    /* The root tree container is freed by child teardown; atom cleanup below
+     * still needs a live owner pointer. Root registries are stored here. */
+    if(process->tree_owner)process->process_tree=NULL;
+    free(process->memory_pages);
+    for(i=0u;i<WIN_GUI_DIALOGS;++i)free(process->dialogs[i].plan);
+    for (i = 0u; i < WIN_GUI_OBJECTS; ++i) { win_window_properties_release(process,&process->gui_objects[i]); free(process->gui_objects[i].menu_items); free(process->gui_objects[i].region_rects); }
     for (i = 0; i < WIN_MAX_HANDLES; ++i) {
         if (process->handles[i].kind == WIN_HANDLE_MAPPING && process->handles[i].view_address)
             (void)win_mapping_flush(process, &process->handles[i], process->handles[i].view_address, 0u);
@@ -1894,9 +3194,14 @@ void xxemul_windows_destroy(xxemul_windows *process)
         free(process->handles[i].mapping_data);
     }
     for (i = 0u; i < process->registry_value_count; ++i) free(process->registry_values[i].data);
-    for (i = 0u; i < process->module_count; ++i) win_tls_release_image(process, &process->modules[i].tls);
+    for (i = 0u; i < process->module_count; ++i) { win_tls_release_image(process, &process->modules[i].tls); free(process->modules[i].canonical_file); }
     win_tls_release_image(process, &process->main_tls);
     for (i = 0u; i < WIN_MAX_THREADS; ++i) win_tls_thread_release(process, &process->threads[i]);
+    if (process->registered_messages) {
+        for (i = 0u; i < process->registered_messages->count; ++i) free(process->registered_messages->entries[i].name);
+        free(process->registered_messages);
+    }
+    if(process->global_atoms){for(i=0;i<process->global_atoms->count;i++)free(process->global_atoms->entries[i].name);free(process->global_atoms);}
     memset(process->registry_handles, 0, sizeof(process->registry_handles));
     free(process);
 }
@@ -1906,8 +3211,13 @@ uint64_t xxemul_windows_segment_base(const xxemul_windows *process, uint8_t segm
     if (process == NULL) return 0;
     if ((process->emulator->mode == XXEMUL_MODE_X86_32 && segment_index == XXEMUL_X86_FS) ||
         (process->emulator->mode == XXEMUL_MODE_X86_64 && segment_index == XXEMUL_X86_GS))
-        return process->runtime_base;
+        return win_current_teb(process);
     return 0;
+}
+
+uint64_t xxemul_windows_teb_address(const xxemul_windows *process)
+{
+    return process ? win_current_teb(process) : 0u;
 }
 
 uint32_t xxemul_windows_exit_code(const xxemul_windows *process)
@@ -1915,54 +3225,242 @@ uint32_t xxemul_windows_exit_code(const xxemul_windows *process)
     return process == NULL ? 0u : process->exit_code;
 }
 
+/* Debug metadata reads must not deliver guest faults, invoke memory hooks,
+ * change LastError, or acquire DLL references. Bound both the current PE
+ * view and the actual owned mapping before taking a host byte pointer. */
+static const uint8_t *win_symbol_rva(const xxemul_windows *process, const win_module *module,
+                                     uint64_t limit, uint64_t rva, uint64_t count)
+{
+    const xxemul *emulator = process->emulator;
+    uint64_t offset;
+    if (limit > module->image_size || rva > limit || count > limit - rva ||
+        module->base < emulator->region_address) return NULL;
+    offset = module->base - emulator->region_address;
+    if (offset > emulator->region_size || rva > emulator->region_size - offset ||
+        count > emulator->region_size - offset - rva) return NULL;
+    return emulator->region_data + (size_t)(offset + rva);
+}
+static int win_symbol_string(const xxemul_windows *process, const win_module *module,
+                              uint64_t limit, uint32_t rva, char name[96], size_t *budget)
+{
+    size_t i;
+    /* Long valid C++ names must not hide unrelated short exports. Validate
+     * the entire bounded string, but only copy a representable selector. */
+    name[0] = 0;
+    for (i = 0u; i < 4096u; ++i) {
+        const uint8_t *byte = win_symbol_rva(process, module, limit, (uint64_t)rva + i, 1u);
+        if (!byte || !*budget) return 0;
+        --*budget;
+        if (i < 96u) name[i] = (char)*byte;
+        if (!*byte) { if (i >= 96u) name[0] = 0; return 1; }
+    }
+    return 0;
+}
+static int win_symbol_representable(const char *name, int module)
+{
+    const unsigned char *at = (const unsigned char *)name;
+    if (!*at || (!module && *at == '#')) return 0;
+    for (; *at; ++at)
+        if (*at < (module ? 0x21u : 0x20u) || *at >= 0x7fu || *at == '!' ||
+            (module && (*at == '/' || *at == '\\' || *at == ':'))) return 0;
+    return 1;
+}
+static xxemul_status win_image_owner_base(xxemul_windows *process, uint64_t address, uint64_t *base)
+{
+    uint64_t owner = 0u, size = process->image_size;
+    uint64_t limit = win_word_size(process->emulator) == 4u ? UINT32_MAX : UINT64_MAX;
+    int found = 0;
+    size_t i;
+    if (!address) { *base = 0u; return XXEMUL_STATUS_OK; }
+    if (size) {
+        if (process->image_base > limit || size - 1u > limit - process->image_base)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        if (address >= process->image_base && address - process->image_base < size) {
+            owner = process->image_base; found = 1;
+        }
+    }
+    for (i = 0u; i < process->module_count; ++i) {
+        const win_module *module = &process->modules[i];
+        if (!module->live) continue;
+        /* Modeled CRT headers can advertise shared globals beyond their own
+         * reserved PE slot. Only that slot gives exclusive image ownership. */
+        size = module->real ? module->image_size : module->canonical_file_size;
+        if (!size) continue;
+        if (module->base > limit || size - 1u > limit - module->base)
+            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        if (address < module->base || address - module->base >= size) continue;
+        /* Main DLLs also have a primary record at the same base. */
+        if (found && owner != module->base) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        owner = module->base; found = 1;
+    }
+    *base = found ? owner : 0u;
+    return XXEMUL_STATUS_OK;
+}
+static const char *win_real_symbol(xxemul_windows *process, uint64_t address)
+{
+    const win_module *module = NULL;
+    const uint8_t *header, *optional, *directory, *functions, *names, *ordinals;
+    uint64_t limit, optional_rva, wanted;
+    uint32_t nt, directory_offset, exports, export_size, count, named, ordinal_base, headers;
+    uint32_t i, best_ordinal = UINT32_MAX;
+    uint16_t optional_size, sections;
+    char best_name[96] = {0}, name[96];
+    size_t string_budget = 8u * 1024u * 1024u;
+    int matched = 0;
+    /* An exact, unique mapped owner is required. No nearest-symbol lookup. */
+    for (i = 0u; i < process->module_count; ++i) {
+        const win_module *candidate = &process->modules[i];
+        if (!candidate->live || !candidate->real || address < candidate->base ||
+            address - candidate->base >= candidate->image_size) continue;
+        if (module) return NULL;
+        module = candidate;
+    }
+    if (!module || !memchr(module->name, 0, sizeof(module->name)) ||
+        !win_symbol_representable(module->name, 1)) return NULL;
+    limit = module->image_size;
+    header = win_symbol_rva(process, module, limit, 0u, 64u);
+    if (!header || header[0] != 'M' || header[1] != 'Z') return NULL;
+    nt = win_le32(header + 0x3cu);
+    header = win_symbol_rva(process, module, limit, nt, 24u);
+    if (!header || memcmp(header, "PE\0\0", 4u) ||
+        win_le16(header + 4u) != (win_word_size(process->emulator) == 8u ? 0x8664u : 0x14cu)) return NULL;
+    optional_size = win_le16(header + 20u);
+    sections = win_le16(header + 6u);
+    optional_rva = (uint64_t)nt + 24u;
+    directory_offset = win_word_size(process->emulator) == 8u ? 112u : 96u;
+    if (optional_size < directory_offset + 8u) return NULL;
+    optional = win_symbol_rva(process, module, limit, optional_rva, optional_size);
+    if (!optional || win_le16(optional) != (directory_offset == 112u ? 0x20bu : 0x10bu) ||
+        !win_le32(optional + directory_offset - 4u)) return NULL;
+    limit = win_le32(optional + 56u);
+    if (!limit || limit > module->image_size || optional_rva > limit || optional_size > limit - optional_rva) return NULL;
+    headers = win_le32(optional + 60u);
+    if (!sections || sections > 96u || headers > limit || optional_rva > headers ||
+        optional_size > headers - optional_rva || (uint64_t)sections * 40u > headers - optional_rva - optional_size) return NULL;
+    wanted = address - module->base;
+    if (wanted >= limit || wanted > UINT32_MAX) return NULL;
+    exports = win_le32(optional + directory_offset);
+    export_size = win_le32(optional + directory_offset + 4u);
+    if (!exports || export_size < 40u ||
+        !(directory = win_symbol_rva(process, module, limit, exports, export_size))) return NULL;
+    /* An address in this range names forwarder text, never its terminal API. */
+    if (wanted >= exports && wanted - exports < export_size) return NULL;
+    ordinal_base = win_le32(directory + 16u);
+    count = win_le32(directory + 20u); named = win_le32(directory + 24u);
+    if (!count || count > 65536u || named > 65536u || !win_le32(directory + 28u) ||
+        (named && (!win_le32(directory + 32u) || !win_le32(directory + 36u)))) return NULL;
+    functions = win_symbol_rva(process, module, limit, win_le32(directory + 28u), (uint64_t)count * 4u);
+    names = win_symbol_rva(process, module, limit, win_le32(directory + 32u), (uint64_t)named * 4u);
+    ordinals = win_symbol_rva(process, module, limit, win_le32(directory + 36u), (uint64_t)named * 2u);
+    if (!functions || (named && (!names || !ordinals))) return NULL;
+    for (i = 0u; i < count; ++i) {
+        uint32_t rva = win_le32(functions + i * 4u);
+        if (rva && rva >= limit) return NULL;
+        if (!rva || rva != wanted) continue;
+        matched = 1;
+        if (ordinal_base <= UINT16_MAX && i <= UINT16_MAX - ordinal_base &&
+            ordinal_base + i < best_ordinal) best_ordinal = ordinal_base + i;
+    }
+    if (!matched) return NULL;
+    for (i = 0u; i < named; ++i) {
+        uint16_t index = win_le16(ordinals + i * 2u);
+        if (index >= count || !win_symbol_string(process, module, limit, win_le32(names + i * 4u), name, &string_budget)) return NULL;
+        /* The existing qualified resolver treats #selectors as numeric.
+         * Prefer another exact alias, otherwise the real EAT ordinal. */
+        if (!win_symbol_representable(name, 0) || win_le32(functions + index * 4u) != wanted) continue;
+        if (!best_name[0] || strcmp(name, best_name) < 0) memcpy(best_name, name, strlen(name) + 1u);
+    }
+    if (best_name[0]) {
+        /* Reject an ambiguous duplicated public name, including unsorted
+         * tables; do not assume which entry a forward resolver will choose. */
+        for (i = 0u; i < named; ++i) {
+            if (!win_symbol_string(process, module, limit, win_le32(names + i * 4u), name, &string_budget)) return NULL;
+            if (!strcmp(name, best_name) && win_le32(functions + win_le16(ordinals + i * 2u) * 4u) != wanted) return NULL;
+        }
+        snprintf(process->native_symbol, sizeof(process->native_symbol), "%s!%s", module->name, best_name);
+    } else {
+        if (best_ordinal == UINT32_MAX) return NULL;
+        snprintf(process->native_symbol, sizeof(process->native_symbol), "%s!#%u", module->name, (unsigned)best_ordinal);
+    }
+    return process->native_symbol;
+}
+
 const char *xxemul_windows_thunk_name(const xxemul *emulator, uint64_t address)
 {
-    const xxemul_windows *process;
+    xxemul_windows *process;
     size_t index;
+    const char *name, *separator;
     if (emulator == NULL || emulator->windows == NULL) return NULL;
     process = emulator->windows;
+    process->native_symbol[0] = 0;
     {
         const char *data_name = win_data_symbol(process, address, 0);
         if (data_name) return data_name;
     }
     index = win_api_index(process, address);
-    return index < process->api_count ? process->apis[index].name : NULL;
+    if (index < process->api_count) return process->apis[index].name;
+    name = win_real_symbol(process, address);
+    separator = name ? strchr(name, '!') : NULL;
+    return separator ? separator + 1 : name;
 }
 
 const char *xxemul_windows_thunk_qualified_name(const xxemul *emulator, uint64_t address)
 {
-    const xxemul_windows *process;
+    xxemul_windows *process;
     size_t index;
     if (emulator == NULL || emulator->windows == NULL) return NULL;
     process = emulator->windows;
+    process->native_symbol[0] = 0;
     {
         const char *data_name = win_data_symbol(process, address, 1);
         if (data_name) return data_name;
     }
     index = win_api_index(process, address);
-    return index < process->api_count ? process->apis[index].qualified : NULL;
+    return index < process->api_count ? process->apis[index].qualified : win_real_symbol(process, address);
 }
 
 /* These are readable modeled modules, not copies of host DLLs. Each module
  * contains its own address-dispatched API thunks in its .text section. */
 static const char *win_export_owner(const char *name)
 {
+    size_t explicit_index;
+    const win_catalogue_export *catalogue;
+    if(win_prefix(name,"DefDlgProc")||win_prefix(name,"DialogBoxIndirectParam")||win_prefix(name,"CreateDialogIndirectParam")||win_prefix(name,"CallMsgFilter")||win_prefix(name,"GetClassName"))return "user32.dll";
+    if(win_prefix(name,"GlobalGetAtomName"))return "kernel32.dll";
+    if(win_equal(name,"GetParent"))return "user32.dll";
+    if(win_equal(name,"SetWindowPos")||win_equal(name,"GetWindowRect")||win_equal(name,"GetClientRect")||win_equal(name,"IsWindowVisible")||win_equal(name,"IsWindowUnicode")||win_equal(name,"IsIconic")||win_prefix(name,"SystemParametersInfo"))return "user32.dll";
+    if(win_equal(name,"WaitMessage"))return "user32.dll";
+    if(win_prefix(name,"SetProp")||win_prefix(name,"GetProp")||win_prefix(name,"RemoveProp")||win_prefix(name,"GetWindowLong")||win_prefix(name,"SetWindowLong")||win_prefix(name,"GetClassLong")||win_prefix(name,"SetClassLong")||win_prefix(name,"CallWindowProc"))return "user32.dll";
+    if (win_prefix(name,"CreateWindow") || win_prefix(name,"DefWindowProc") || win_equal(name,"DestroyWindow") || win_equal(name,"ShowWindow") || win_equal(name,"UpdateWindow") || win_prefix(name,"GetMessage") || win_prefix(name,"PeekMessage") || win_prefix(name,"DispatchMessage") || win_prefix(name,"PostMessage") || win_equal(name,"PostQuitMessage") || win_equal(name,"TranslateMessage") || win_equal(name,"CreateMenu") || win_equal(name,"CreatePopupMenu") || win_prefix(name,"AppendMenu") || win_equal(name,"SetMenu") || win_prefix(name,"GetMenu") || win_equal(name,"DestroyMenu")) return "user32.dll";
+    for (explicit_index = 0u; explicit_index < sizeof(win_explicit_exports) / sizeof(win_explicit_exports[0]); ++explicit_index)
+        if (win_explicit_exports[explicit_index].name && !strcmp(name, win_explicit_exports[explicit_index].name))
+            return win_explicit_exports[explicit_index].module;
+    /* Retain NTDLL ownership and the separately admitted Kernel32 alias. */
+    if (win_equal(name, "RtlUnwind")) return "ntdll.dll";
+    catalogue = win_catalogue_export_of(name);
+    if (catalogue) return catalogue->module;
+    if(win_equal(name,"GetDC")||win_equal(name,"ReleaseDC")||win_equal(name,"CreateIcon")||win_equal(name,"DestroyIcon")||win_equal(name,"MonitorFromWindow")||win_prefix(name,"GetMonitorInfo")||win_equal(name,"EnumDisplayMonitors"))return "user32.dll";
+    if(win_equal(name,"GetDeviceCaps")||win_equal(name,"CreateDIBitmap")||win_equal(name,"CreateCompatibleDC")||win_equal(name,"CreateCompatibleBitmap")||win_equal(name,"DeleteDC")||win_equal(name,"SelectObject")||win_equal(name,"BitBlt")||win_equal(name,"StretchBlt")||win_equal(name,"CreateBitmap")||win_equal(name,"GetBitmapBits")||win_equal(name,"SetBkColor")||win_equal(name,"SetTextColor")||win_equal(name,"SetBkMode"))return "gdi32.dll";
     if (win_equal(name, "FindWindowA") || win_equal(name, "FindWindowW")) return "user32.dll";
     if (win_equal(name, "GetWindowsDirectoryA") || win_equal(name, "GetWindowsDirectoryW")) return "kernel32.dll";
     if(win_equal(name,"CheckSumMappedFile"))return "imagehlp.dll";
     if (win_equal(name, "SetTimer") || win_equal(name, "MoveWindow")) return "user32.dll";
     if (win_prefix(name,"DialogBox") || win_prefix(name,"EndDialog") || win_prefix(name,"GetDlgItem") || win_prefix(name,"SetDlgItem") || win_prefix(name,"SendDlgItem") || win_prefix(name,"SendMessage") || win_prefix(name,"LoadIcon")) return "user32.dll";
     if (win_prefix(name,"CreateFontIndirect") || win_equal(name,"GetObjectA") || win_equal(name,"GetObjectW") || win_equal(name,"DeleteObject")) return "gdi32.dll";
-    if (win_equal(name,"InitCommonControlsEx")) return "comctl32.dll";
+    if (win_equal(name,"InitCommonControls") || win_equal(name,"InitCommonControlsEx")) return "comctl32.dll";
     if (win_equal(name, "_lcreat") || win_equal(name, "_lwrite")) return "kernel32.dll";
     if (win_equal(name, "_lopen") || win_equal(name, "_lread") || win_equal(name, "_lclose") || win_equal(name, "_llseek")) return "kernel32.dll";
     if (win_equal(name, "LoadBitmapA") || win_equal(name, "DialogBoxParamA")) return "user32.dll";
     if (win_equal(name, "KillTimer") || win_equal(name, "wsprintfA") || win_equal(name, "wsprintfW") ||
         win_equal(name, "wvsprintfA") || win_equal(name, "wvsprintfW")) return "user32.dll";
     if (win_equal(name, "timeGetTime")) return "winmm.dll";
+    if (win_equal(name, "__C_specific_handler")) return "ntdll.dll";
     if (win_crt_api(name) || name[0] == '_' ||
         (islower((unsigned char)name[0]) && !win_prefix(name, "lstr"))) return "msvcrt.dll";
-    if (win_prefix(name, "Rtl") || win_prefix(name, "Nt") || win_prefix(name, "Zw")) return "ntdll.dll";
+    if (win_prefix(name, "Rtl") || win_prefix(name, "Nt") || win_prefix(name, "Zw") || win_equal(name, "__C_specific_handler")) return "ntdll.dll";
+    if (win_equal(name, "RegisterWindowMessageA") || win_equal(name, "RegisterWindowMessageW")) return "user32.dll";
+    if (win_equal(name, "CoInitialize") || win_equal(name, "CoInitializeEx") || win_equal(name, "CoUninitialize")) return "ole32.dll";
+    if (win_prefix(name, "RegisterClass") || win_prefix(name, "GetClassInfo") || win_prefix(name, "UnregisterClass")) return "user32.dll";
     if (win_prefix(name, "Reg") || win_prefix(name, "Lsa") || win_prefix(name, "LookupPrivilege") ||
         win_prefix(name, "ConvertSid") || win_prefix(name, "ConvertStringSid") ||
         strcmp(name, "OpenProcessToken") == 0 || strcmp(name, "GetTokenInformation") == 0 ||
@@ -1984,6 +3482,9 @@ static const char *win_export_owner(const char *name)
 static int win_export_for_module(const char *module, const char *name)
 {
     const char *owner = win_export_owner(name);
+    if (win_equal(name, "RtlUnwind") && win_equal(module, "kernel32.dll")) return 1;
+    if (win_equal(name, "__C_specific_handler") &&
+        (win_equal(module, "ntdll.dll") || win_equal(module, "msvcrt.dll") || win_equal(module, "ucrtbase.dll"))) return 1;
     if (win_equal(module, "coredll.dll")) return !win_equal(owner, "msvcrt.dll");
     if (win_equal(module, "kernelbase.dll") || win_prefix(module, "api-ms-win-core-")) return win_equal(owner, "kernel32.dll");
     if (win_equal(module, "ucrtbase.dll") || win_prefix(module, "api-ms-win-crt-")) return win_equal(owner, "msvcrt.dll");
@@ -1993,9 +3494,10 @@ static int win_export_for_module(const char *module, const char *name)
 static int win_module_exports(xxemul_windows *process, win_module *module)
 {
     static const char *const data_names[] = {"_iob", "__initenv", "__mb_cur_max", "_acmdln", "_commode", "_fmode", "_adjust_fdiv"};
-    struct { const char *name; uint64_t address; } entries[WIN_MAX_APIS + 7u];
+    struct { const char *name; uint64_t address; uint16_t ordinal; win_api *api; } entries[WIN_MAX_APIS + 7u];
     uint8_t *image;
-    size_t order[WIN_MAX_APIS + 7u], count = 0u, i, j, cursor;
+    size_t order[WIN_MAX_APIS + 7u], count = 0u, named_count = 0u, i, j, cursor;
+    uint32_t ordinal_base = UINT16_MAX, ordinal_end = 0u, next_ordinal = 1u;
     uint32_t optional, directories, section, thunk_rva;
     int wide = win_word_size(process->emulator) == 8u;
     int bootstrap = process->emulator->arch == XXEMUL_ARCH_X86 && !wide && win_equal(module->name, "kernel32.dll");
@@ -2005,29 +3507,73 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
     if (image == NULL) return 0;
     for (i = 0u; i < process->api_count; ++i) {
         if (!win_equal(process->apis[i].module, module->name)) continue;
-        entries[count].name = process->apis[i].name;
+        entries[count].name = process->apis[i].export_unnamed ? NULL : process->apis[i].name;
         entries[count].address = process->apis[i].address;
-        image[entries[count].address - module->base] = 0x90u;
-        image[entries[count].address - module->base + 1u] = 0xc3u;
+        entries[count].ordinal = process->apis[i].export_ordinal;
+        entries[count].api = &process->apis[i];
+        {
+            size_t at=(size_t)(entries[count].address-module->base);
+            /* The owning entry is intercepted as an OS service. A copied
+             * x86/x64 stub must reach that same entry without changing the
+             * caller's registers, flags, return address, or argument frame. */
+            if(process->emulator->arch==XXEMUL_ARCH_X86){
+                if(wide){
+                    image[at]=0xffu;image[at+1u]=0x25u; /* jmp qword [rip+0] */
+                    win_put64(image+at+6u,entries[count].address);
+                }else{
+                    if(entries[count].address>UINT32_MAX){free(image);return 0;}
+                    image[at]=0x68u;win_put32(image+at+1u,(uint32_t)entries[count].address);
+                    image[at+5u]=0xc3u; /* push owner; ret */
+                }
+            }else{
+                /* Existing non-x86 address-dispatched representation;
+                 * copied ARM/other-machine stubs are not claimed here. */
+                image[at]=0x90u;image[at+1u]=0xc3u;
+            }
+        }
         ++count;
     }
     for (i = 0u; i < sizeof(data_names) / sizeof(data_names[0]); ++i) {
         if (!win_export_for_module(module->name, data_names[i])) continue;
         entries[count].name = data_names[i]; entries[count].address = win_resolve(process, module->name, data_names[i]);
+        entries[count].ordinal = 0u; entries[count].api = NULL;
         /* CRT globals retain their existing shared mutable arena. Other
          * modeled DLLs describe only their own reserved PE allocation. */
         image_size = process->runtime_base + WIN_RUNTIME_SIZE - module->base;
         ++count;
     }
+    /* The name table is sorted independently from the sparse ordinal table.
+     * Existing named-only modules keep their alphabetical Base=1 ordinals. */
     for (i = 0u; i < count; ++i) {
-        j = i;
+        if (!entries[i].name) continue;
+        j = named_count;
         while (j > 0u && strcmp(entries[order[j - 1u]].name, entries[i].name) > 0) {
             order[j] = order[j - 1u]; --j;
         }
-        order[j] = i;
+        order[j] = i; ++named_count;
     }
-    /* A module slot has room for 512 exports including all names. */
-    if (count > 512u) { free(image); return 0; }
+    for (i = 0u; i < count; ++i) if (entries[i].ordinal) {
+        for (j = 0u; j < i; ++j) if (entries[j].ordinal == entries[i].ordinal) { free(image); return 0; }
+    }
+    for (i = 0u; i < named_count; ++i) {
+        size_t index = order[i];
+        if (entries[index].ordinal) continue;
+        for (;;) {
+            int used = 0;
+            for (j = 0u; j < count; ++j) if (entries[j].ordinal == next_ordinal) { used = 1; break; }
+            if (!used) break;
+            if (++next_ordinal > UINT16_MAX) { free(image); return 0; }
+        }
+        entries[index].ordinal = (uint16_t)next_ordinal++;
+    }
+    for (i = 0u; i < count; ++i) {
+        if (!entries[i].ordinal) { free(image); return 0; }
+        if (entries[i].ordinal < ordinal_base) ordinal_base = entries[i].ordinal;
+        if (entries[i].ordinal > ordinal_end) ordinal_end = entries[i].ordinal;
+    }
+    if (!count) ordinal_base = 1u;
+    /* Each fixed EAT/name/ordinal array has 512 slots.  Gaps remain zero. */
+    if (count > 512u || (count && ordinal_end - ordinal_base >= 512u)) { free(image); return 0; }
     image[0] = 'M'; image[1] = 'Z'; win_put32(image + 0x3cu, 0x80u);
     memcpy(image + 0x80u, "PE\0\0", 4u);
     win_put16(image + 0x84u, process->emulator->arch == XXEMUL_ARCH_ARM ? (wide ? 0xaa64u : 0x1c0u) : (wide ? 0x8664u : 0x14cu));
@@ -2067,23 +3613,51 @@ static int win_module_exports(xxemul_windows *process, win_module *module)
         win_put32(image + section + 116u, 0x60000020u);
         memcpy(image + WIN_BOOTSTRAP_SEH_OFFSET, handler, sizeof(handler));
     }
-    win_put32(image + 0x100cu, 0x1040u); win_put32(image + 0x1010u, 1u);
-    win_put32(image + 0x1014u, (uint32_t)count); win_put32(image + 0x1018u, (uint32_t)count);
-    win_put32(image + 0x101cu, 0x1100u); win_put32(image + 0x1020u, 0x1900u); win_put32(image + 0x1024u, 0x2100u);
+    win_put32(image + 0x100cu, 0x1040u); win_put32(image + 0x1010u, ordinal_base);
+    win_put32(image + 0x1014u, count ? ordinal_end - ordinal_base + 1u : 0u);
+    win_put32(image + 0x1018u, (uint32_t)named_count);
+    win_put32(image + 0x101cu, count ? 0x1100u : 0u);
+    win_put32(image + 0x1020u, named_count ? 0x1900u : 0u);
+    win_put32(image + 0x1024u, named_count ? 0x2100u : 0u);
     memcpy(image + 0x1040u, module->name, strlen(module->name) + 1u);
+    for (i = 0u; i < count; ++i)
+        win_put32(image + 0x1100u + (entries[i].ordinal - ordinal_base) * 4u,
+                  (uint32_t)(entries[i].address - module->base));
     cursor = 0x2500u;
-    for (i = 0u; i < count; ++i) {
+    for (i = 0u; i < named_count; ++i) {
         const char *name = entries[order[i]].name;
         size_t bytes = strlen(name) + 1u;
         if (cursor > (size_t)WIN_MODULE_THUNK_RVA || bytes > (size_t)WIN_MODULE_THUNK_RVA - cursor) { free(image); return 0; }
-        win_put32(image + 0x1100u + i * 4u, (uint32_t)(entries[order[i]].address - module->base));
         win_put32(image + 0x1900u + i * 4u, (uint32_t)cursor);
-        win_put16(image + 0x2100u + i * 2u, (uint16_t)i);
+        win_put16(image + 0x2100u + i * 2u, (uint16_t)(entries[order[i]].ordinal - ordinal_base));
         memcpy(image + cursor, name, bytes); cursor += bytes;
     }
     i = (size_t)win_write(process, module->base, image, slot_size);
-    if (i) module->image_size = image_size;
+    if (i) {
+        for (j = 0u; j < count; ++j)
+            if (entries[j].api) entries[j].api->effective_export_ordinal = entries[j].ordinal;
+        module->image_size = image_size;
+        free(module->canonical_file);
+        module->canonical_file=image;module->canonical_file_size=slot_size;image=NULL;
+    }
     free(image); return i != 0u;
+}
+
+static int win_loader_module_path(xxemul_windows *process, const win_module *module, char *path, size_t capacity)
+{
+    size_t index, length;
+    const char *relative;
+    char root[2048];
+    if (!module->real) return snprintf(path, capacity, "C:\\Windows\\System32\\%s", module->name) < (int)capacity;
+    if (!win_working_root(process, root, sizeof(root))) return 0;
+    length = strlen(root);
+    while (length > 1u && root[length - 1u] == '/') --length;
+    if (strncmp(module->file_path, root, length) || (module->file_path[length] && module->file_path[length] != '/')) return 0;
+    relative = module->file_path + length;
+    while (*relative == '/' || *relative == '\\') ++relative;
+    if (snprintf(path, capacity, "C:\\%s", relative) >= (int)capacity) return 0;
+    for (index = 0; path[index]; ++index) if (path[index] == '/') path[index] = '\\';
+    return 1;
 }
 
 static int win_loader_lists(xxemul_windows *process)
@@ -2099,23 +3673,45 @@ static int win_loader_lists(xxemul_windows *process)
     for (i = 0u; i < count; ++i) {
         uint64_t entry = process->runtime_base + 0x10000u + i * 0x100u;
         uint64_t text = process->runtime_base + 0x15000u + i * 0x100u;
-        uint64_t base = i == 0u ? process->image_base : process->modules[order[i - 1u]].base;
-        const char *name = i == 0u ? guest_program : process->modules[order[i - 1u]].name;
+        win_module *module = i ? &process->modules[order[i - 1u]] : NULL;
+        uint64_t base = module ? module->base : process->image_base;
+        uint64_t entry_point = module ? (module->entry_rva ? base + module->entry_rva : 0u) :
+            (process->image_entry_rva ? base + process->image_entry_rva : 0u);
         uint64_t name_offset = word == 8u ? 0x48u : 0x24u;
-        size_t length = strlen(name);
+        char full[1024];
+        const char *tail;
+        size_t length, tail_offset;
+        if (!module) { if (!win_copy(full, sizeof(full), guest_program)) return 0; text = process->runtime_base + 0x17000u; }
+        else if (!win_loader_module_path(process, module, full, sizeof(full))) return 0;
+        length = strlen(full);
+        tail = strrchr(full, '\\'); tail = tail ? tail + 1u : full;
+        tail_offset = (size_t)(tail - full);
+        if (module && length >= 128u) {
+            uint64_t needed = (length + 1u) * 2u;
+            if (module->ldr_name_capacity < needed) {
+                uint64_t replacement = win_heap_alloc(process, needed);
+                win_allocation *old;
+                if (!replacement) return 0;
+                old = win_find_allocation(process, module->ldr_name);
+                if (old) old->active = 0u;
+                module->ldr_name = replacement; module->ldr_name_capacity = needed;
+            }
+            text = module->ldr_name;
+        }
         if (!win_store(process, entry + (word == 8u ? 0x30u : 0x18u), word, base) ||
-            !win_store(process, entry + (word == 8u ? 0x40u : 0x20u), 4u,
-                       i == 0u ? process->image_size : process->modules[order[i - 1u]].image_size) ||
-            !win_write_wide(process, i == 0u ? process->runtime_base + 0x17000u : text, name, i == 0u ? 1024u : 128u)) return 0;
+            !win_store(process, entry + (word == 8u ? 0x38u : 0x1cu), word, entry_point) ||
+            !win_store(process, entry + (word == 8u ? 0x40u : 0x20u), 4u, module ? module->image_size : process->image_size) ||
+            !win_store(process, entry + (word == 8u ? 0x6cu : 0x38u), 2u,
+                module ? (module->references > 0xffffu ? 0xffffu : module->references) : 0xffffu) ||
+            !win_store(process, entry + (word == 8u ? 0x6eu : 0x3au), 2u,
+                module && module->tls.present ? module->tls.index : 0xffffu) ||
+            !win_write_wide(process, text, full, module && length < 128u ? 128u : 1024u)) return 0;
         for (list = 0u; list < 2u; ++list) {
             uint64_t descriptor = entry + name_offset + list * (word == 8u ? 16u : 8u);
-            uint64_t string_address = i == 0u ? process->runtime_base + (list == 0u ? 0x17000u : 0x17800u) : text;
-            size_t string_length = length;
-            if (i == 0u && list == 1u) {
-                string_length -= 3u;
-                if (!win_write_wide(process, string_address, name + 3u, 1024u)) return 0;
-            }
-            if (!win_store(process, descriptor, 2u, string_length * 2u) || !win_store(process, descriptor + 2u, 2u, (string_length + 1u) * 2u) ||
+            uint64_t string_address = text + (list ? tail_offset * 2u : 0u);
+            size_t string_length = list ? length - tail_offset : length;
+            if (!win_store(process, descriptor, 2u, string_length * 2u) ||
+                !win_store(process, descriptor + 2u, 2u, (string_length + 1u) * 2u) ||
                 !win_store(process, descriptor + (word == 8u ? 8u : 4u), word, string_address)) return 0;
         }
     }
@@ -2167,6 +3763,7 @@ static win_module *win_find_module(xxemul_windows *process, const char *name, in
         memcpy(normalized + i, ".dll", 5u);
     }
     for (i = 0u; i < process->module_count; ++i) if (process->modules[i].live && win_equal(process->modules[i].name, normalized)) return &process->modules[i];
+    if(create&&win_native_required(process,normalized)){process->last_error=120u;return NULL;}
     if (!create || process->module_count == WIN_MAX_MODULES) return NULL;
     module = &process->modules[process->module_count];
     memcpy(module->name, normalized, strlen(normalized) + 1u);
@@ -2179,6 +3776,15 @@ static win_module *win_find_module(xxemul_windows *process, const char *name, in
                 module->base += WIN_MODULE_STRIDE;
     }
     module->building = 1u; module->live = 1u; ++process->module_count; checkpoint = process->api_count;
+    for (i = 0u; i < sizeof(win_explicit_exports) / sizeof(win_explicit_exports[0]); ++i)
+        if (win_equal(module->name, win_explicit_exports[i].module) && !win_resolve_spec(process, &win_explicit_exports[i])) goto failed;
+    /* Legacy CE aggregation keeps its prior surface/budget. The documented
+     * NT DLL catalogue and existing KernelBase/core aliases are initialized
+     * before any guest manual export-table walk or lazy named lookup. */
+    if (!win_equal(module->name, "coredll.dll"))
+        for (i = 0u; i < sizeof(win_catalogue_exports) / sizeof(win_catalogue_exports[0]); ++i)
+            if (win_export_for_module(module->name, win_catalogue_exports[i].name) &&
+                !win_resolve(process, module->name, win_catalogue_exports[i].name)) goto failed;
     for (i = 0u; i < sizeof(win_export_names) / sizeof(win_export_names[0]); ++i)
         if (win_export_for_module(module->name, win_export_names[i]) && !win_resolve(process, module->name, win_export_names[i])) goto failed;
     for (i = 0u; i < sizeof(win_extra_export_names) / sizeof(win_extra_export_names[0]); ++i)
@@ -2189,7 +3795,7 @@ static win_module *win_find_module(xxemul_windows *process, const char *name, in
     if (!win_module_exports(process, module) || (process->loader_ready && !win_loader_lists(process))) goto failed;
     return module;
 failed:
-    process->api_count = checkpoint; --process->module_count; memset(module, 0, sizeof(*module)); return NULL;
+    process->api_count = checkpoint; --process->module_count; free(module->canonical_file); memset(module, 0, sizeof(*module)); return NULL;
 }
 
 static uint64_t win_module_handle(xxemul_windows *process, const char *name)
@@ -2210,12 +3816,13 @@ static int win_loadable_module(xxemul_windows *process, const char *name)
         "rpcrt4.dll", "secur32.dll", "crypt32.dll", "bcrypt.dll", "wininet.dll",
         "winhttp.dll", "iphlpapi.dll", "psapi.dll", "imagehlp.dll", "dbghelp.dll",
         "setupapi.dll", "netapi32.dll", "userenv.dll", "imm32.dll", "powrprof.dll",
-        "mpr.dll", "lz32.dll", "wintrust.dll", "dwmapi.dll", "winspool.drv"
+        "mpr.dll", "lz32.dll", "wintrust.dll", "dwmapi.dll", "winspool.drv", "oledlg.dll", "msimg32.dll"
     };
     const char *base = name, *at;
     char normalized[48];
     size_t length, index;
     if (!name || !*name) return 0;
+    if(win_native_required(process,name))return 0;
     if (win_find_module(process, name, 0)) return 1;
     for (at = name; *at; ++at) if (*at == '/' || *at == '\\') base = at + 1;
     if (!win_copy(normalized, sizeof(normalized), base)) return 0;
@@ -2269,6 +3876,24 @@ static int win_working_root(xxemul_windows *process, char *root, size_t capacity
     free(resolved);
     return copied;
 #endif
+}
+
+static win_module *win_module_file_at(xxemul_windows *process,const char *path,char *canonical,size_t capacity)
+{
+    static const char prefix[]="C:\\Windows\\System32\\";
+    char normalized[sizeof(prefix)+48u],declared[sizeof(prefix)+48u];size_t i,length;
+    if(!path||(length=strlen(path))>=sizeof(normalized))return NULL;
+    for(i=0u;i<=length;++i)normalized[i]=path[i]=='/'?'\\':path[i];
+    if(!win_prefix(normalized,prefix))return NULL;
+    for(i=0u;i<process->module_count;++i){win_module *module=&process->modules[i];
+        if(!module->live||module->real||!module->canonical_file)continue;
+        if(snprintf(declared,sizeof(declared),"%s%s",prefix,module->name)<0)return NULL;
+        if(win_equal(normalized,declared)){
+            if(canonical&&!win_copy(canonical,capacity,declared))return NULL;
+            return module;
+        }
+    }
+    return NULL;
 }
 
 static int win_guest_path(xxemul_windows *process, const char *guest, char *host, size_t capacity)
@@ -2331,6 +3956,11 @@ static int win_guest_path(xxemul_windows *process, const char *guest, char *host
         ++i;
     }
     relative[j] = 0;
+    /* Canonical modeled files belong to the immutable virtual namespace.
+     * Do not let any host-path operation mutate or substitute a shadow file,
+     * including paths normalized through relative/dot components above. */
+    memcpy(combined,"C:\\",3u);memcpy(combined+3u,relative,j+1u);
+    if(win_module_file_at(process,combined,NULL,0u))return 0;
     if (root_length + (j ? 1u : 0u) + j >= capacity) return 0;
     memcpy(host, root, root_length + 1u);
     if (j) {
@@ -2366,6 +3996,7 @@ static int win_guest_path(xxemul_windows *process, const char *guest, char *host
     return 1;
 }
 
+#include "xxemul_windows_fls.inc"
 #include "xxemul_windows_dll.inc"
 
 /* Process-local registry: no host registry, preloaded license data, or persistence. */
@@ -2374,6 +4005,8 @@ static int win_memory_span(const xxemul_windows *process, uint64_t address, uint
     uint64_t base = process->emulator->region_address, size = process->emulator->region_size;
     return address >= base && count <= size && address - base <= size - count;
 }
+
+#include "xxemul_windows_memory.inc"
 
 static uint16_t win_reg_fold(uint16_t c)
 {
@@ -2424,6 +4057,56 @@ static int win_reg_name_equal(const uint16_t *a, const uint16_t *b)
     }
     return *a == *b;
 }
+
+/* Registered messages live for the modeled session (one process tree),
+ * independently of the thread/process which first registered their names. */
+static xxemul_status win_register_window_message(xxemul_windows *process, uint64_t address, int wide, uint64_t *result)
+{
+    uint16_t name[256], link;
+    uint32_t error, hash = UINT32_C(2166136261), bucket;
+    size_t length;
+    xxemul_windows *owner = process->process_tree ? process->process_tree->root : process;
+    win_registered_message_registry *registry;
+    win_registered_message *entry;
+    *result = 0u;
+    error = win_reg_name(process, address, wide, name, sizeof(name) / sizeof(name[0]), 0);
+    if (error || !name[0]) {
+        process->last_error = error == 998u ? 998u : 87u;
+        return XXEMUL_STATUS_OK;
+    }
+    for (length = 0u; name[length]; ++length) {
+        uint16_t c = win_reg_fold(name[length]);
+        hash = (hash ^ (uint8_t)c) * UINT32_C(16777619);
+        hash = (hash ^ (uint8_t)(c >> 8u)) * UINT32_C(16777619);
+    }
+    if (!owner) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    registry = owner->registered_messages;
+    if (!registry) {
+        registry = (win_registered_message_registry *)calloc(1u, sizeof(*registry));
+        if (!registry) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
+        owner->registered_messages = registry;
+    }
+    bucket = hash & (WIN_REGISTERED_MESSAGE_BUCKETS - 1u);
+    for (link = registry->buckets[bucket]; link; link = registry->entries[link - 1u].next) {
+        entry = &registry->entries[link - 1u];
+        if (entry->hash == hash && win_reg_name_equal(entry->name, name)) {
+            *result = 0xc000u + link - 1u;
+            return XXEMUL_STATUS_OK;
+        }
+    }
+    if (registry->count == WIN_REGISTERED_MESSAGES) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
+    entry = &registry->entries[registry->count];
+    entry->name = (uint16_t *)malloc((length + 1u) * sizeof(name[0]));
+    if (!entry->name) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
+    memcpy(entry->name, name, (length + 1u) * sizeof(name[0]));
+    entry->hash = hash;
+    entry->next = registry->buckets[bucket];
+    registry->buckets[bucket] = (uint16_t)(registry->count + 1u);
+    *result = 0xc000u + registry->count++;
+    return XXEMUL_STATUS_OK;
+}
+
+#include "xxemul_windows_atoms.inc"
 
 static int win_reg_root(uint64_t h)
 {
@@ -2881,6 +4564,78 @@ done:
 
 #include "xxemul_windows_move.inc"
 
+typedef struct win_module_file_stream { uint8_t *data;size_t size;int64_t position; } win_module_file_stream;
+static ssize_t win_module_file_read(xx_io_device *self,void *buffer,size_t count)
+{
+    win_module_file_stream *file=(win_module_file_stream*)self->priv;size_t available;
+    if(file->position>=(int64_t)file->size)return 0;
+    available=file->size-(size_t)file->position;if(count>available)count=available;
+    if(count)memcpy(buffer,file->data+(size_t)file->position,count);
+    file->position+=(int64_t)count;return (ssize_t)count;
+}
+static int win_module_file_seek64(xx_io_device *self,int64_t offset,int origin)
+{
+    win_module_file_stream *file=(win_module_file_stream*)self->priv;int64_t base;
+    if(origin==SEEK_SET)base=0;
+    else if(origin==SEEK_CUR)base=file->position;
+    else if(origin==SEEK_END)base=(int64_t)file->size;
+    else return -1;
+    if(offset < -base || offset > INT64_MAX-base)return -1;
+    file->position=base+offset;return 0;
+}
+static int win_module_file_seek(xx_io_device *self,long offset,int origin)
+{return win_module_file_seek64(self,(int64_t)offset,origin);}
+static int64_t win_module_file_tell(xx_io_device *self)
+{return ((win_module_file_stream*)self->priv)->position;}
+static int64_t win_module_file_size(xx_io_device *self)
+{return (int64_t)((win_module_file_stream*)self->priv)->size;}
+static int win_module_file_close(xx_io_device *self)
+{
+    win_module_file_stream *file=(win_module_file_stream*)self->priv;
+    free(file->data);free(file);free(self);return 0;
+}
+static xx_io_device *win_module_file_device(uint8_t *data,size_t size)
+{
+    win_module_file_stream *file=(win_module_file_stream*)calloc(1,sizeof(*file));
+    xx_io_device *device=(xx_io_device*)calloc(1,sizeof(*device));
+    if(!file||!device){free(file);free(device);return NULL;}
+    file->data=data;file->size=size;device->priv=file;
+    device->read=win_module_file_read;device->seek=win_module_file_seek;device->seek64=win_module_file_seek64;
+    device->tell=win_module_file_tell;device->total_size=win_module_file_size;device->get_total_size=win_module_file_size;
+    device->size=win_module_file_size;device->close=win_module_file_close;return device;
+}
+
+static int win_module_file_open(xxemul_windows *process,const char *path,uint32_t access,uint32_t disposition,uint32_t share,uint32_t flags,uint64_t *result)
+{
+    char canonical[128];size_t i,slot;
+    win_module *module=win_module_file_at(process,path,canonical,sizeof(canonical));
+    win_handle *entry;uint8_t *copy;xx_io_device *io;
+    if(!module)return 0;
+    *result=WIN_INVALID_HANDLE;
+    if(disposition<1u||disposition>5u||(share&~7u)){process->last_error=87u;return 1;}
+    if(disposition==1u){process->last_error=80u;return 1;} /* Existing virtual file. */
+    if((access&~UINT32_C(0xa01200a9))||disposition==2u||disposition==5u||(flags&0x04000000u)){
+        process->last_error=5u;return 1;
+    }
+    for(i=0u;i<WIN_MAX_HANDLES;++i){win_handle *other=&process->handles[i];
+        if(!other->in_use||other->kind!=WIN_HANDLE_FILE||!other->module_file_data||!win_equal(other->file_path,canonical))continue;
+        if(((access&0x80000001u)&&!(other->module_file_share&1u)) ||
+           ((other->file_access&0x80000001u)&&!(share&1u))){process->last_error=32u;return 1;}
+    }
+    for(slot=0u;slot<WIN_MAX_HANDLES&&process->handles[slot].in_use;++slot){}
+    if(slot==WIN_MAX_HANDLES){process->last_error=4u;return 1;}
+    copy=(uint8_t*)malloc(module->canonical_file_size);
+    if(!copy){process->last_error=8u;return 1;}
+    memcpy(copy,module->canonical_file,module->canonical_file_size);
+    io=win_module_file_device(copy,module->canonical_file_size);
+    if(!io){free(copy);process->last_error=8u;return 1;}
+    entry=&process->handles[slot];memset(entry,0,sizeof(*entry));
+    entry->kind=WIN_HANDLE_FILE;entry->io=io;entry->module_file_data=copy;entry->module_file_share=share;
+    entry->file_access=access;entry->references=1u;entry->root_slot=(uint16_t)slot;entry->in_use=1u;
+    (void)win_copy(entry->file_path,sizeof(entry->file_path),canonical);
+    process->last_error=disposition==4u?183u:0u;*result=0x100u+slot;return 1;
+}
+
 static uint64_t win_file_open(xxemul_windows *process, const char *guest_path, uint32_t access, uint32_t disposition)
 {
     char host_path[2048];
@@ -2980,7 +4735,7 @@ static int win_is_current_thread_handle(xxemul_windows *process, uint64_t handle
     return entry != NULL && entry->kind == WIN_HANDLE_THREAD && !entry->child_slot;
 }
 
-static uint64_t win_open_current_process(xxemul_windows *process, uint32_t process_id, uint32_t inherit)
+static uint64_t win_open_current_process(xxemul_windows *process, uint32_t process_id, uint32_t inherit, uint32_t access)
 {
     size_t slot;
     size_t child_slot=0u;
@@ -3001,6 +4756,7 @@ static uint64_t win_open_current_process(xxemul_windows *process, uint32_t proce
     entry = &process->handles[slot];
     memset(entry, 0, sizeof(*entry));
     entry->kind = WIN_HANDLE_PROCESS;
+    entry->process_access = access;
     entry->child_slot=(uint16_t)child_slot;
     entry->references = 1u;
     entry->root_slot = (uint16_t)slot;
@@ -3008,6 +4764,21 @@ static uint64_t win_open_current_process(xxemul_windows *process, uint32_t proce
     entry->in_use = 1u;
     process->last_error = 0u;
     return 0x100u + slot;
+}
+
+static xxemul_windows *win_process_by_id(xxemul_windows *process, uint32_t id, unsigned depth)
+{
+    size_t index;
+    if (!process || depth > WIN_MAX_CHILDREN) return NULL;
+    if (process->process_id == id) return process;
+    for (index = 0u; index < WIN_MAX_CHILDREN; ++index) {
+        win_child_process *child = &process->children[index];
+        xxemul_windows *found;
+        if (!child->active || !child->emulator) continue;
+        found = win_process_by_id(child->emulator->windows, id, depth + 1u);
+        if (found) return found;
+    }
+    return NULL;
 }
 
 static xx_io_device *win_handle_io(xxemul_windows *process, uint64_t handle)
@@ -3143,6 +4914,7 @@ static uint64_t win_duplicate_handle(xxemul_windows *process, uint64_t source, i
         entry = &process->handles[slot];
         memset(entry, 0, sizeof(*entry));
         entry->kind = WIN_HANDLE_PROCESS;
+        entry->process_access = 0x1fffffu;
         entry->references = 1u;
         entry->root_slot = (uint16_t)slot;
         entry->flags = inherit ? 1u : 0u;
@@ -3355,7 +5127,7 @@ static xxemul_status win_critical_write(xxemul_windows *process, const win_criti
     uint64_t address = entry->address;
     uint32_t lock_count = entry->recursion == 0u ? UINT32_MAX : entry->recursion - 1u;
     if (!win_store(process, address + word_size, 4u, lock_count) || !win_store(process, address + word_size + 4u, 4u, entry->recursion) ||
-        !win_store(process, address + (word_size == 8u ? 16u : 12u), word_size, entry->recursion == 0u ? 0u : 1u))
+        !win_store(process, address + (word_size == 8u ? 16u : 12u), word_size, entry->recursion == 0u ? 0u : entry->owner_id))
         return XXEMUL_STATUS_ADDRESS_FAULT;
     return XXEMUL_STATUS_OK;
 }
@@ -3376,10 +5148,37 @@ static xxemul_status win_critical_initialize(xxemul_windows *process, uint64_t a
         }
     }
     if (entry == NULL) return XXEMUL_STATUS_OUT_OF_MEMORY;
-    if (!win_write(process, address, zero, process->emulator->mode == XXEMUL_MODE_X86_64 ? 40u : 24u)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    if (!win_write(process, address, zero, win_word_size(process->emulator) == 8u ? 40u : 24u)) return XXEMUL_STATUS_ADDRESS_FAULT;
     entry->address = address;
     entry->recursion = 0u;
+    entry->owner_id = 0u;
     entry->active = 1u;
+    return win_critical_write(process, entry);
+}
+
+/* The loader is serialized by the same modeled critical section published in
+ * the PEB.  Preserve any additional recursive acquisition made by guest code. */
+static xxemul_status win_loader_lock_sync(xxemul_windows *process)
+{
+    win_critical_section *entry;
+    uint32_t owner;
+    int held;
+    if (!process->structures_ready) return XXEMUL_STATUS_OK;
+    held = process->startup_pending || process->dll_depth != 0u;
+    if (held == process->loader_lock_held) return XXEMUL_STATUS_OK;
+    entry = win_critical_at(process, process->runtime_base + WIN_THREAD_TEB_OFFSET + 0xb80u);
+    if (!entry) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    owner = process->dll_depth ? process->dll_frames[0].owner_id : process->threads[process->thread_current].id;
+    if (held) {
+        if (entry->recursion && entry->owner_id != owner) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        if (entry->recursion == UINT32_MAX) return XXEMUL_STATUS_INVALID_ARGUMENT;
+        entry->owner_id = owner;
+        ++entry->recursion;
+    } else {
+        if (!entry->recursion) return XXEMUL_STATUS_INVALID_ARGUMENT;
+        if (!--entry->recursion) entry->owner_id = 0u;
+    }
+    process->loader_lock_held = (uint8_t)held;
     return win_critical_write(process, entry);
 }
 
@@ -3389,6 +5188,8 @@ static uint64_t win_file_read(xxemul_windows *process, uint64_t handle, uint64_t
     uint8_t *bytes;
     ssize_t result;
     if (bytes_read != 0 && !win_store(process, bytes_read, 4u, 0)) return 0;
+    {win_handle *file=win_handle_at(process,handle);
+     if(file&&file->module_file_data&&!(file->file_access&0x80000001u)){process->last_error=5u;return 0;}}
     if (io == NULL || count > WIN_MAX_IO) {
         process->last_error = 6u;
         return 0;
@@ -3419,6 +5220,8 @@ static uint64_t win_file_write(xxemul_windows *process, uint64_t handle, uint64_
     ssize_t result;
     size_t i;
     if (bytes_written != 0 && !win_store(process, bytes_written, 4u, 0)) return 0;
+    {win_handle *file=win_handle_at(process,handle);
+     if(file&&file->module_file_data){process->last_error=5u;return 0;}}
     if (count > WIN_MAX_IO) {
         process->last_error = 8u;
         return 0;
@@ -3571,52 +5374,100 @@ static int win_get_arg(xxemul_windows *process, uint8_t index, uint64_t *argumen
     return win_load(process, sp + 40u + (uint64_t)(index - 4u) * 8u, 8u, argument);
 }
 
-static xxemul_status win_capture_thread_context(xxemul_windows *process, uint64_t address, uint8_t word_size, uint64_t *result)
+static void win_thread_shadow(xxemul *shadow, const win_thread_context *thread)
 {
-    const xxemul_x86_state *state = &process->emulator->x86;
-    uint32_t architecture_flag = word_size == 8u ? 0x100000u : 0x10000u;
-    uint64_t flags, return_address, next_sp;
-    size_t index;
-    if (!win_load(process, address + (word_size == 8u ? 48u : 0u), 4u, &flags) || !win_load(process, state->gpr[XXEMUL_X86_RSP], word_size, &return_address))
-        return XXEMUL_STATUS_ADDRESS_FAULT;
-    if ((flags & architecture_flag) == 0u || (flags & 7u) == 0u) {
-        process->last_error = 87u;
-        return XXEMUL_STATUS_OK;
-    }
-    if ((flags & ~(uint64_t)(architecture_flag | 7u)) != 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-    next_sp = state->gpr[XXEMUL_X86_RSP] + (word_size == 8u ? 8u : 12u);
-    if (word_size == 8u) {
-        if ((flags & 1u) != 0u && (!win_store(process, address + 56u, 2u, state->segment[XXEMUL_X86_CS]) ||
-                                   !win_store(process, address + 66u, 2u, state->segment[XXEMUL_X86_SS]) || !win_store(process, address + 68u, 4u, state->flags) ||
-                                   !win_store(process, address + 152u, 8u, next_sp) || !win_store(process, address + 248u, 8u, return_address)))
-            return XXEMUL_STATUS_ADDRESS_FAULT;
-        if ((flags & 2u) != 0u) {
-            for (index = 0; index < XXEMUL_X86_GPR_COUNT; ++index) {
-                uint64_t value = index == XXEMUL_X86_RAX ? 1u : state->gpr[index];
-                if (index != XXEMUL_X86_RSP && !win_store(process, address + 120u + index * 8u, 8u, value)) return XXEMUL_STATUS_ADDRESS_FAULT;
-            }
-        }
-        if ((flags & 4u) != 0u &&
-            (!win_store(process, address + 58u, 2u, state->segment[XXEMUL_X86_DS]) || !win_store(process, address + 60u, 2u, state->segment[XXEMUL_X86_ES]) ||
-             !win_store(process, address + 62u, 2u, state->segment[XXEMUL_X86_FS]) || !win_store(process, address + 64u, 2u, state->segment[XXEMUL_X86_GS])))
-            return XXEMUL_STATUS_ADDRESS_FAULT;
+    shadow->x86 = thread->cpu;
+    shadow->arm = thread->arm_cpu; shadow->mode = thread->cpu_mode;
+    shadow->arm_thread_pointer = thread->arm_thread_pointer;
+    shadow->arm_thread_pointer_valid = thread->arm_thread_pointer_valid;
+    memcpy(shadow->arm_break_value, thread->arm_break_value, sizeof(thread->arm_break_value));
+    memcpy(shadow->arm_watch_value, thread->arm_watch_value, sizeof(thread->arm_watch_value));
+    memcpy(shadow->arm_break_control, thread->arm_break_control, sizeof(thread->arm_break_control));
+    memcpy(shadow->arm_watch_control, thread->arm_watch_control, sizeof(thread->arm_watch_control));
+    memcpy(shadow->x87_raw, thread->x87_raw, sizeof(shadow->x87_raw)); shadow->x87_tags = thread->x87_tags;
+    memcpy(shadow->x87_stack, thread->x87_stack, sizeof(thread->x87_stack));
+    memcpy(shadow->x87_int_val, thread->x87_int_val, sizeof(thread->x87_int_val));
+    memcpy(shadow->x87_is_int, thread->x87_is_int, sizeof(thread->x87_is_int));
+    shadow->x87_depth = thread->x87_depth; shadow->x87_top = thread->x87_top;
+    shadow->x87_control = thread->x87_control; shadow->x87_status = thread->x87_status;
+    memcpy(shadow->x86_debug, thread->x86_debug, sizeof(thread->x86_debug));
+    shadow->x86_mxcsr = thread->x86_mxcsr;
+}
+
+static win_thread_context *win_context_thread(xxemul_windows *process, uint64_t handle, unsigned width)
+{
+    win_handle *entry;
+    if (handle == (width == 8u ? UINT64_MAX - 1u : UINT32_MAX - 1u)) return &process->threads[process->thread_current];
+    entry = win_handle_at(process, handle);
+    if (!entry || entry->kind != WIN_HANDLE_THREAD || entry->child_slot || entry->thread_finished ||
+        entry->thread_slot >= WIN_MAX_THREADS || !process->threads[entry->thread_slot].active ||
+        process->threads[entry->thread_slot].id != entry->object_id) return NULL;
+    return &process->threads[entry->thread_slot];
+}
+
+static xxemul_status win_capture_thread_context(xxemul_windows *process, uint64_t handle,
+                                                 uint64_t address, uint8_t word_size, uint64_t *result)
+{
+    xxemul shadow = *process->emulator;
+    win_thread_context *thread = win_context_thread(process, handle, word_size);
+    uint8_t bytes[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+    size_t size = xxemul_windows_context_size(&shadow);
+    uint32_t flags;
+    uint64_t return_address;
+    xxemul_status status;
+    if (!thread) { process->last_error = 6u; return XXEMUL_STATUS_OK; }
+    if (!win_read(process, address, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    flags = win_le32(bytes + (shadow.arch == XXEMUL_ARCH_X86 && word_size == 8u ? 48u : 0u));
+    if (thread != &process->threads[process->thread_current]) win_thread_shadow(&shadow, thread);
+    else if (shadow.arch == XXEMUL_ARCH_X86) {
+        if (!win_load(process, shadow.x86.gpr[XXEMUL_X86_RSP], word_size, &return_address)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        shadow.x86.ip = return_address;
+        shadow.x86.gpr[XXEMUL_X86_RSP] += word_size == 8u ? 8u : 12u;
+        shadow.x86.gpr[XXEMUL_X86_RAX] = 1u;
     } else {
-        static const uint8_t integer_gpr[] = {XXEMUL_X86_RDI, XXEMUL_X86_RSI, XXEMUL_X86_RBX, XXEMUL_X86_RDX, XXEMUL_X86_RCX, XXEMUL_X86_RAX};
-        if ((flags & 1u) != 0u && (!win_store(process, address + 180u, 4u, state->gpr[XXEMUL_X86_RBP]) || !win_store(process, address + 184u, 4u, return_address) ||
-                                   !win_store(process, address + 188u, 4u, state->segment[XXEMUL_X86_CS]) || !win_store(process, address + 192u, 4u, state->flags) ||
-                                   !win_store(process, address + 196u, 4u, next_sp) || !win_store(process, address + 200u, 4u, state->segment[XXEMUL_X86_SS])))
-            return XXEMUL_STATUS_ADDRESS_FAULT;
-        if ((flags & 2u) != 0u) {
-            for (index = 0; index < sizeof(integer_gpr); ++index) {
-                uint64_t value = integer_gpr[index] == XXEMUL_X86_RAX ? 1u : state->gpr[integer_gpr[index]];
-                if (!win_store(process, address + 156u + index * 4u, 4u, value)) return XXEMUL_STATUS_ADDRESS_FAULT;
-            }
-        }
-        if ((flags & 4u) != 0u &&
-            (!win_store(process, address + 140u, 4u, state->segment[XXEMUL_X86_GS]) || !win_store(process, address + 144u, 4u, state->segment[XXEMUL_X86_FS]) ||
-             !win_store(process, address + 148u, 4u, state->segment[XXEMUL_X86_ES]) || !win_store(process, address + 152u, 4u, state->segment[XXEMUL_X86_DS])))
-            return XXEMUL_STATUS_ADDRESS_FAULT;
+        return_address = shadow.arm.gpr[word_size == 8u ? 30u : 14u];
+        shadow.arm.pc = return_address & (word_size == 8u ? UINT64_MAX : ~UINT64_C(1));
+        if (word_size == 4u) shadow.arm.pstate = (shadow.arm.pstate & ~UINT32_C(0x20)) | (return_address & 1u ? 0x20u : 0u);
+        shadow.arm.gpr[0] = 1u;
     }
+    status = shadow.arch == XXEMUL_ARCH_ARM ?
+        xxemul_windows_context_capture_arm(&shadow, &shadow.arm, bytes, size, flags) :
+        xxemul_windows_context_capture(&shadow, &shadow.x86, bytes, size, flags);
+    if (status != XXEMUL_STATUS_OK) { process->last_error = 87u; return XXEMUL_STATUS_OK; }
+    if (!win_write(process, address, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    *result = 1u;
+    return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status win_set_thread_context(xxemul_windows *process, uint64_t handle, uint64_t address, uint64_t *result)
+{
+    xxemul shadow = *process->emulator;
+    win_thread_context *thread = win_context_thread(process, handle, win_word_size(&shadow));
+    uint8_t bytes[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+    size_t size = xxemul_windows_context_size(&shadow);
+    xxemul_status status;
+    if (!thread) { process->last_error = 6u; return XXEMUL_STATUS_OK; }
+    if (thread == &process->threads[process->thread_current] || !thread->suspended) {
+        process->last_error = 87u; return XXEMUL_STATUS_OK;
+    }
+    if (!win_read(process, address, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    win_thread_shadow(&shadow, thread);
+    status = xxemul_windows_context_restore(&shadow, bytes, size);
+    if (status != XXEMUL_STATUS_OK) { process->last_error = 87u; return XXEMUL_STATUS_OK; }
+    thread->cpu = shadow.x86;
+    thread->arm_cpu = shadow.arm; thread->cpu_mode = shadow.mode;
+    memcpy(thread->arm_break_value, shadow.arm_break_value, sizeof(thread->arm_break_value));
+    memcpy(thread->arm_watch_value, shadow.arm_watch_value, sizeof(thread->arm_watch_value));
+    memcpy(thread->arm_break_control, shadow.arm_break_control, sizeof(thread->arm_break_control));
+    memcpy(thread->arm_watch_control, shadow.arm_watch_control, sizeof(thread->arm_watch_control));
+    memcpy(thread->x87_raw, shadow.x87_raw, sizeof(thread->x87_raw)); thread->x87_tags = shadow.x87_tags;
+    memcpy(thread->x87_stack, shadow.x87_stack, sizeof(thread->x87_stack));
+    memcpy(thread->x87_int_val, shadow.x87_int_val, sizeof(thread->x87_int_val));
+    memcpy(thread->x87_is_int, shadow.x87_is_int, sizeof(thread->x87_is_int));
+    thread->x87_depth = shadow.x87_depth; thread->x87_top = shadow.x87_top;
+    thread->x87_control = shadow.x87_control; thread->x87_status = shadow.x87_status;
+    memcpy(thread->x86_debug, shadow.x86_debug, sizeof(thread->x86_debug));
+    thread->x86_mxcsr = shadow.x86_mxcsr;
     *result = 1u;
     return XXEMUL_STATUS_OK;
 }
@@ -4705,7 +6556,11 @@ static xxemul_status win_crt_fputc(xxemul_windows *process, uint8_t ch, uint64_t
 static uint64_t win_heap_owner(xxemul_windows *process, uint64_t handle)
 {
     win_handle *entry;
-    if (handle == 0x400u) return handle;
+    size_t index;
+    if (handle == 0x400u || handle == process->runtime_base + WIN_THREAD_TEB_OFFSET) return 0x400u;
+    for (index = 0; index < WIN_MAX_HANDLES; ++index)
+        if (process->handles[index].in_use && process->handles[index].kind == WIN_HANDLE_HEAP &&
+            process->handles[index].heap_address == handle) return 0x100u + index;
     entry = win_handle_at(process, handle);
     if (entry == NULL || entry->kind != WIN_HANDLE_HEAP) return 0u;
     return 0x100u + (uint64_t)(entry - process->handles);
@@ -5192,7 +7047,8 @@ static uint64_t win_gui_new(xxemul_windows *process, uint8_t kind, uint64_t pare
     size_t i;
     for (i=0u;i<WIN_GUI_OBJECTS;++i) if (!process->gui_objects[i].active) {
         win_gui_object *object=&process->gui_objects[i];
-        memset(object,0,sizeof(*object));object->active=1u;object->kind=kind;object->parent=parent;
+        if(process->gui_generation==UINT64_MAX)return 0u;
+        memset(object,0,sizeof(*object));object->generation=++process->gui_generation;object->active=1u;object->kind=kind;object->parent=parent;
         object->maximum=100;object->increment=10;
         return UINT64_C(0x10000)+i;
     }
@@ -5206,10 +7062,13 @@ static int win_gui_resource(xxemul_windows *process,unsigned type,unsigned name,
     return type<=UINT16_MAX&&name<=UINT16_MAX&&
         win_resource_lookup(process,0u,&type_key,&name_key,0,0u,&image,&entry,address,size)&&*size&&*size<=0x10000u;
 }
-typedef struct win_dialog_reader{xxemul_windows *process;uint64_t at,end;}win_dialog_reader;
+typedef struct win_dialog_reader{xxemul_windows *process;uint64_t at,end;xxemul_status status;}win_dialog_reader;
 static int win_dialog_value(win_dialog_reader *reader,unsigned width,uint64_t *value)
 {
-    if(reader->at>reader->end || width>reader->end-reader->at || !win_load(reader->process,reader->at,(uint8_t)width,value))return 0;
+    uint64_t limit=win_word_size(reader->process->emulator)==4u?UINT32_MAX:UINT64_MAX;
+    if(reader->at>limit || width-1u>limit-reader->at){reader->status=XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;return 0;}
+    if(reader->at>reader->end || width>reader->end-reader->at)return 0;
+    if(!win_load(reader->process,reader->at,(uint8_t)width,value)){reader->status=XXEMUL_STATUS_ADDRESS_FAULT;return 0;}
     reader->at+=width;return 1;
 }
 static int win_dialog_string(win_dialog_reader *reader,uint16_t *text,size_t capacity,uint16_t *ordinal)
@@ -5225,80 +7084,29 @@ static int win_dialog_string(win_dialog_reader *reader,uint16_t *text,size_t cap
         if(++used>=256u || !win_dialog_value(reader,2u,&value))return 0;
     }
 }
-static void win_gui_discard(xxemul_windows *process,uint64_t dialog)
+static void win_gui_discard_owned(xxemul_windows *process,uint64_t root,uint64_t generation)
 {
-    size_t i;
-    for(i=0u;i<WIN_GUI_OBJECTS;++i){
-        win_gui_object *object=&process->gui_objects[i];
-        if(object->active && (UINT64_C(0x10000)+i==dialog || object->parent==dialog))memset(object,0,sizeof(*object));
+    uint8_t marked[WIN_GUI_OBJECTS]={0};size_t i,pass;win_gui_object *o=win_gui_at(process,root);
+    if(!o||(generation&&o->generation!=generation))return;
+    marked[(size_t)(o-process->gui_objects)]=1;
+    for(pass=0;pass<WIN_GUI_OBJECTS;pass++){
+        int changed=0;
+        for(i=0;i<WIN_GUI_OBJECTS;i++){uint64_t parent=process->gui_objects[i].parent;
+            if(!marked[i]&&process->gui_objects[i].active&&parent>=0x10000&&parent-0x10000<WIN_GUI_OBJECTS&&marked[parent-0x10000]){marked[i]=1;changed=1;}}
+        if(!changed)break;
+    }
+    for(i=0;i<WIN_GUI_OBJECTS;i++)if(marked[i]&&process->gui_objects[i].active){
+        o=&process->gui_objects[i];
+        if(o->kind==WIN_GUI_WINDOW||o->kind==WIN_GUI_DIALOG||o->kind==WIN_GUI_CONTROL)win_window_release(process,0x10000+i);
+        else{free(o->menu_items);free(o->region_rects);memset(o,0,sizeof(*o));}
     }
 }
-static uint64_t win_gui_template(xxemul_windows *process,uint64_t address,uint32_t size)
-{
-    win_dialog_reader r={process,address,address+size};
-    uint64_t version,signature,style,count,ignored,dialog=0u,font=0u,control,value;
-    unsigned extended,i;uint16_t face[256],menu[256],dialog_class[256],ordinal=0u;win_gui_object *object,*font_object;
-    if(!win_dialog_value(&r,2u,&version)||!win_dialog_value(&r,2u,&signature))return 0u;
-    extended=version==1u&&signature==0xffffu;
-    r.at=address;
-    if(extended){
-        if(!win_dialog_value(&r,4u,&ignored)||!win_dialog_value(&r,4u,&ignored)||
-           !win_dialog_value(&r,4u,&ignored)||!win_dialog_value(&r,4u,&style)||!win_dialog_value(&r,2u,&count))return 0u;
-    }else if(!win_dialog_value(&r,4u,&style)||!win_dialog_value(&r,4u,&ignored)||!win_dialog_value(&r,2u,&count))return 0u;
-    if(count>64u || !win_dialog_value(&r,8u,&ignored) || !win_dialog_string(&r,menu,256u,&ordinal) ||menu[0]||ordinal||
-       !win_dialog_string(&r,dialog_class,256u,&ordinal)||dialog_class[0]||ordinal)return 0u;
-    dialog=win_gui_new(process,WIN_GUI_DIALOG,0u);if(!dialog)return 0u;
-    object=win_gui_at(process,dialog);object->style=(uint32_t)style;
-    /* Empty template class selects the predefined dialog class (WC_DIALOG). */
-    object->class_ordinal=0x8002u;
-    {static const uint16_t name[]={'#','3','2','7','7','0',0};memcpy(object->class_name,name,sizeof(name));}
-    if(!win_dialog_string(&r,object->text,256u,NULL))goto bad;
-    if(style&0x40u){
-        uint64_t points,weight=400u,italic=0u,charset=1u;
-        if(!win_dialog_value(&r,2u,&points))goto bad;
-        if(extended && (!win_dialog_value(&r,2u,&weight)||!win_dialog_value(&r,1u,&italic)||!win_dialog_value(&r,1u,&charset)))goto bad;
-        if(!win_dialog_string(&r,face,256u,NULL))goto bad;
-        font=win_gui_new(process,WIN_GUI_FONT,dialog);if(!font)goto bad;
-        font_object=win_gui_at(process,font);
-        /* Headless logical fonts retain the template's point size/family.
-         * The GUI model has a fixed logical 96-DPI coordinate system. */
-        win_put32(font_object->logfont,(uint32_t)(-(int32_t)((points*4u+1u)/3u)));
-        win_put32(font_object->logfont+16u,(uint32_t)weight);font_object->logfont[20u]=(uint8_t)italic;font_object->logfont[23u]=(uint8_t)charset;
-        for(i=0u;i<31u&&face[i];++i){font_object->logfont[28u+i]=win_reg_unansi(face[i]);font_object->text[i]=face[i];}
-        object->font=font;
-    }
-    for(i=0u;i<count;++i){
-        r.at=(r.at+3u)&~UINT64_C(3);
-        control=win_gui_new(process,WIN_GUI_CONTROL,dialog);if(!control)goto bad;
-        object=win_gui_at(process,control);object->font=font;
-        if(extended && !win_dialog_value(&r,4u,&ignored))goto bad;
-        if(extended){if(!win_dialog_value(&r,4u,&ignored)||!win_dialog_value(&r,4u,&style))goto bad;}
-        else if(!win_dialog_value(&r,4u,&style)||!win_dialog_value(&r,4u,&ignored))goto bad;
-        object->style=(uint32_t)style;
-        if(!win_dialog_value(&r,8u,&ignored)||!win_dialog_value(&r,extended?4u:2u,&value))goto bad;
-        object->id=(uint32_t)value;
-        if(!win_dialog_string(&r,object->class_name,64u,&object->class_ordinal)||
-           !win_dialog_string(&r,object->text,256u,NULL)||!win_dialog_value(&r,2u,&value))goto bad;
-        /* Standard creation-data size includes its WORD; extended extraCount
-         * counts only the following bytes. Zero means no creation data. */
-        if(!extended&&value){if(value<2u)goto bad;value-=2u;}
-        if(value>r.end-r.at)goto bad;
-        if(object->class_ordinal && (object->class_ordinal<0x80u||object->class_ordinal>0x85u))goto bad;
-        if(!object->class_ordinal){
-            char class_name[64];unsigned k;
-            for(k=0u;k<63u&&object->class_name[k];++k){if(object->class_name[k]>127u)goto bad;class_name[k]=(char)object->class_name[k];}class_name[k]=0;
-            if(!win_equal(class_name,"msctls_progress32") && !win_equal(class_name,"static") && !win_equal(class_name,"button") &&
-               !win_equal(class_name,"edit") && !win_equal(class_name,"listbox") && !win_equal(class_name,"scrollbar") && !win_equal(class_name,"combobox"))goto bad;
-        }
-        r.at+=value;
-    }
-    return dialog;
-bad:win_gui_discard(process,dialog);return 0u;
-}
+static void win_gui_discard(xxemul_windows *process,uint64_t root)
+{win_gui_discard_owned(process,root,0);}
 static uint64_t win_gui_child(xxemul_windows *process,uint64_t parent,uint32_t id)
 {
     size_t i;
-    for(i=0u;i<WIN_GUI_OBJECTS;++i)if(process->gui_objects[i].active&&process->gui_objects[i].kind==WIN_GUI_CONTROL&&
+    for(i=0u;i<WIN_GUI_OBJECTS;++i)if(process->gui_objects[i].active&&(process->gui_objects[i].kind==WIN_GUI_CONTROL||(process->gui_objects[i].kind==WIN_GUI_WINDOW&&(process->gui_objects[i].style&0x40000000u)))&&
         process->gui_objects[i].parent==parent&&process->gui_objects[i].id==id)return UINT64_C(0x10000)+i;
     return 0u;
 }
@@ -5322,6 +7130,16 @@ static int win_gui_text(xxemul_windows *process,uint64_t address,int wide,uint16
     }
     return 0;
 }
+#include "xxemul_windows_classes.inc"
+static xxemul_status win_gui_message(xxemul_windows *,uint64_t,uint32_t,uint64_t,uint64_t,int,uint64_t *);
+static void win_dialog_signal_message(xxemul_windows *,uint64_t);
+#include "xxemul_windows_window.inc"
+#include "xxemul_windows_vcl.inc"
+#include "xxemul_windows_region.inc"
+#include "xxemul_windows_gdi.inc"
+#include "xxemul_windows_cbt.inc"
+#include "xxemul_windows_dialog.inc"
+
 static xxemul_status win_gui_find_window(xxemul_windows *process,const uint64_t *arg,int wide,uint64_t *result)
 {
     uint16_t class_name[256],title[256];size_t i;
@@ -5333,7 +7151,7 @@ static xxemul_status win_gui_find_window(xxemul_windows *process,const uint64_t 
      * is queried, and FindWindow leaves LastError unchanged on either result. */
     for(i=0u;i<WIN_GUI_OBJECTS;++i){
         const win_gui_object *object=&process->gui_objects[i];
-        if(!object->active||object->kind!=WIN_GUI_DIALOG||(object->style&0x40000000u))continue;
+        if(!object->active||(object->kind!=WIN_GUI_DIALOG&&object->kind!=WIN_GUI_WINDOW)||(object->style&0x40000000u))continue;
         if(arg[0]&&(atom?object->class_ordinal!=(uint16_t)arg[0]:!win_reg_name_equal(object->class_name,class_name)))continue;
         if(arg[1]&&!win_reg_name_equal(object->text,title))continue;
         *result=UINT64_C(0x10000)+i;break;
@@ -5358,7 +7176,7 @@ static xxemul_status win_gui_read_text(xxemul_windows *process,const win_gui_obj
 static xxemul_status win_gui_message(xxemul_windows *process,uint64_t handle,uint32_t message,uint64_t wparam,uint64_t lparam,int wide,uint64_t *result)
 {
     win_gui_object *object=win_gui_at(process,handle),*other;uint16_t temporary[256];size_t i;
-    if(!object || (object->kind!=WIN_GUI_DIALOG && object->kind!=WIN_GUI_CONTROL)){process->last_error=1400u;return XXEMUL_STATUS_OK;}
+    if(!object || (object->kind!=WIN_GUI_DIALOG && object->kind!=WIN_GUI_CONTROL && object->kind!=WIN_GUI_WINDOW)){process->last_error=1400u;return XXEMUL_STATUS_OK;}
     if(message==0x30u){
         other=win_gui_at(process,wparam);if(wparam && (!other||other->kind!=WIN_GUI_FONT)){process->last_error=6u;return XXEMUL_STATUS_OK;}
         object->font=wparam;return XXEMUL_STATUS_OK;
@@ -5410,6 +7228,98 @@ static void win_managed_output(void *context, unsigned stream, const char *data,
     }
 }
 
+/* Only scalar ImplMap declarations with proven native layouts enter here.
+ * Objects, strings, refs, floating values and reverse CLR callbacks remain
+ * explicit unsupported services, not host pointers or host DLL invocations. */
+static xxemul_status win_managed_native(void *context, xxemul_dotnet_vm *vm, const xxemul_dotnet_method_info *method,
+                                        const xxemul_dotnet_value *arguments, size_t count, xxemul_dotnet_value *value,
+                                        uint32_t *last_error, uint64_t *remaining_budget)
+{
+    xxemul_windows *process = context;
+    const xxemul_dotnet_pinvoke_info *binding = method ? method->pinvoke : NULL;
+    xxemul_windows_native_call call = {0};
+    xxemul_windows_native_result result;
+    uint64_t bits[16];
+    uint8_t widths[16];
+    unsigned width;
+    size_t i;
+    xxemul_status status;
+    if (!process || !vm || !binding || !binding->supported || !value || !last_error || !remaining_budget ||
+        count != binding->parameter_count || count > 16u || (count && !arguments)) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    width = win_word_size(process->emulator);
+    if (xxemul_dotnet_pointer_size(xxemul_dotnet_vm_get_program(vm)) != width) return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+    if (!*remaining_budget) return XXEMUL_STATUS_LIMIT_REACHED;
+    call.module = binding->module_name;
+    call.entry = binding->entry_point;
+    call.arguments = bits;
+    call.argument_widths = widths;
+    call.argument_count = count;
+    call.instruction_limit = *remaining_budget;
+    switch (binding->flags & 0x700u) {
+        case 0x100u: case 0x300u: call.convention = width == 8u ? XXEMUL_WINDOWS_NATIVE_WIN64 : XXEMUL_WINDOWS_NATIVE_STDCALL; break;
+        case 0x200u: call.convention = width == 8u ? XXEMUL_WINDOWS_NATIVE_WIN64 : XXEMUL_WINDOWS_NATIVE_CDECL; break;
+        default: return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    }
+    for (i = 0u; i < count; ++i) {
+        uint8_t type = binding->parameter_types[i];
+        bits[i] = arguments[i].bits;
+        if (type == 0x0au || type == 0x0bu) {
+            if (arguments[i].kind != XXEMUL_DOTNET_VALUE_I8) return XXEMUL_STATUS_INVALID_ARGUMENT;
+            widths[i] = 8u;
+        } else if (type == 0x18u || type == 0x19u) {
+            if (arguments[i].kind != XXEMUL_DOTNET_VALUE_NATIVE) return XXEMUL_STATUS_INVALID_ARGUMENT;
+            widths[i] = (uint8_t)width;
+            if (width == 4u) bits[i] = (uint32_t)bits[i];
+        } else {
+            if (arguments[i].kind != XXEMUL_DOTNET_VALUE_I4) return XXEMUL_STATUS_INVALID_ARGUMENT;
+            widths[i] = 4u;
+            switch (type) {
+                case 0x02u: bits[i] = (uint32_t)bits[i] != 0u; break;
+                case 0x04u: bits[i] = (uint32_t)(int32_t)(int8_t)(uint8_t)bits[i]; break;
+                case 0x05u: bits[i] = (uint8_t)bits[i]; break;
+                case 0x06u: bits[i] = (uint32_t)(int32_t)(int16_t)(uint16_t)bits[i]; break;
+                case 0x07u: bits[i] = (uint16_t)bits[i]; break;
+                case 0x08u: case 0x09u: bits[i] = (uint32_t)bits[i]; break;
+                default: return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            }
+        }
+    }
+    switch (binding->return_type) {
+        case 0x01u: call.return_width = 0u; break;
+        case 0x0au: case 0x0bu: call.return_width = 8u; break;
+        case 0x18u: case 0x19u: call.return_width = (uint8_t)width; break;
+        case 0x02u: case 0x04u: case 0x05u: case 0x06u: case 0x07u: case 0x08u: case 0x09u: call.return_width = 4u; break;
+        default: return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    }
+    status = xxemul_windows_invoke_native(process, &call, &result);
+    if (result.instructions > *remaining_budget) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    *remaining_budget -= result.instructions;
+    *last_error = result.last_error;
+    if (status != XXEMUL_STATUS_OK) {
+        char text[512];
+        int length = snprintf(text, sizeof(text), "native P/Invoke %s!%s failed: phase=%u status=%u PC=0x%llx thread=%u steps=%llu LastError=%u %s\n",
+            binding->module_name, binding->entry_point, (unsigned)result.phase, (unsigned)status,
+            (unsigned long long)result.stopped_state.ip, (unsigned)result.stopped_thread_id,
+            (unsigned long long)result.instructions, (unsigned)result.last_error, result.diagnostic);
+        if (length > 0) win_managed_output(process, 2u, text, (size_t)length < sizeof(text) ? (size_t)length : sizeof(text) - 1u);
+        return status;
+    }
+    value->bits = result.value;
+    value->kind = XXEMUL_DOTNET_VALUE_I4;
+    switch (binding->return_type) {
+        case 0x01u: value->kind = XXEMUL_DOTNET_VALUE_VOID; value->bits = 0u; break;
+        case 0x02u: value->bits = (uint32_t)value->bits != 0u; break;
+        case 0x04u: value->bits = (uint32_t)(int32_t)(int8_t)(uint8_t)value->bits; break;
+        case 0x05u: value->bits = (uint8_t)value->bits; break;
+        case 0x06u: value->bits = (uint32_t)(int32_t)(int16_t)(uint16_t)value->bits; break;
+        case 0x07u: value->bits = (uint16_t)value->bits; break;
+        case 0x0au: case 0x0bu: value->kind = XXEMUL_DOTNET_VALUE_I8; break;
+        case 0x18u: case 0x19u: value->kind = XXEMUL_DOTNET_VALUE_NATIVE; break;
+        default: value->bits = (uint32_t)value->bits; break;
+    }
+    return XXEMUL_STATUS_OK;
+}
+
 /* This CLR bootstrap executes the managed entry through the CIL interpreter.
  * It does not return a fabricated success from an unresolved mscoree import. */
 static xxemul_status win_managed_entry(xxemul_windows *process, uint64_t *return_value)
@@ -5439,6 +7349,7 @@ static xxemul_status win_managed_entry(xxemul_windows *process, uint64_t *return
     }
     program = xxemul_dotnet_create_file(process->program_path, &status);
     if (!program) goto done;
+    if (xxemul_dotnet_pointer_size(program) != word_size) { status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; goto done; }
     config.max_instructions = UINT64_C(0x100000);
     config.max_heap_bytes = 0x4000000;
     config.max_native_bytes = 0x4000000;
@@ -5450,6 +7361,8 @@ static xxemul_status win_managed_entry(xxemul_windows *process, uint64_t *return
     config.output_context = process;
     host = xxemul_dotnet_bcl_host_create(&config, &status);
     if (!host) goto done;
+    status = xxemul_dotnet_bcl_set_pinvoke_callback(host, win_managed_native, process, UINT64_C(0x4000000));
+    if (status != XXEMUL_STATUS_OK) goto done;
     status = xxemul_dotnet_bcl_execute(host, program, (int)count, (const char *const *)arguments, &result);
     if (status == XXEMUL_STATUS_OK) {
         if (result.value.kind != XXEMUL_DOTNET_VALUE_VOID && result.value.kind != XXEMUL_DOTNET_VALUE_I4) {
@@ -5475,6 +7388,79 @@ done:
 }
 #endif
 
+#include "xxemul_windows_actctx_xml.inc"
+#include "xxemul_windows_actctx.inc"
+
+/* Original Kimi codec; tracked NT API integration and service policy by Codex. */
+#include "xxemul_windows_lznt1.inc"
+
+static xxemul_status win_rtl_decompress_buffer(xxemul_windows *process,
+                                              const uint64_t *arg, uint64_t *result)
+{
+    uint16_t format = (uint16_t)arg[0];
+    uint32_t algorithm = (uint32_t)(format & 0x00ffu);
+    uint32_t capacity = (uint32_t)arg[2], source_size = (uint32_t)arg[4];
+    uint8_t *source = NULL, *staged = NULL;
+    size_t produced = 0u;
+    xxemul_status status = XXEMUL_STATUS_OK;
+
+    /* Engine bits are ignored, as a documented reference-compatibility policy. */
+    if (algorithm == 0u || algorithm == 1u) {
+        *result = UINT32_C(0xc000000d); /* STATUS_INVALID_PARAMETER */
+        return XXEMUL_STATUS_OK;
+    }
+    if (algorithm != 2u) {
+        *result = UINT32_C(0xc000025f); /* STATUS_UNSUPPORTED_COMPRESSION */
+        return XXEMUL_STATUS_OK;
+    }
+    /* Service allocation bound, not a universal Windows API limit. */
+    if (source_size > WIN_MAX_IO || capacity > WIN_MAX_IO) {
+        *result = UINT32_C(0xc0000017); /* STATUS_NO_MEMORY */
+        return XXEMUL_STATUS_OK;
+    }
+    if (source_size < 2u) {
+        *result = UINT32_C(0xc0000242); /* STATUS_BAD_COMPRESSION_BUFFER */
+        return XXEMUL_STATUS_OK;
+    }
+    source = (uint8_t *)malloc((size_t)source_size);
+    if (capacity) staged = (uint8_t *)malloc((size_t)capacity);
+    if (!source || (capacity && !staged)) {
+        *result = UINT32_C(0xc0000017);
+        goto finish;
+    }
+    /* Snapshot the complete declared source before any possible aliased write. */
+    if (!win_read(process, arg[3], source, (size_t)source_size)) {
+        status = XXEMUL_STATUS_ADDRESS_FAULT;
+        goto finish;
+    }
+    if (!xx_win_lznt1_decode(source, (size_t)source_size, staged, (size_t)capacity, &produced)) {
+        *result = UINT32_C(0xc0000242);
+        goto finish;
+    }
+    /* Validate both actual write spans before committing either. No guest code
+     * or callback runs between these checks and the tracked writes below. */
+    if (!xxemul_windows_memory_access(process, arg[1], (uint64_t)produced, 1u, 1)) {
+        win_guest_memory_fault(process, arg[1], produced, 1u);
+        status = XXEMUL_STATUS_ADDRESS_FAULT;
+        goto finish;
+    }
+    if (!xxemul_windows_memory_access(process, arg[5], 4u, 1u, 1)) {
+        win_guest_memory_fault(process, arg[5], 4u, 1u);
+        status = XXEMUL_STATUS_ADDRESS_FAULT;
+        goto finish;
+    }
+    if ((produced && !win_write(process, arg[1], staged, produced)) ||
+        !win_store(process, arg[5], 4u, (uint32_t)produced)) {
+        status = XXEMUL_STATUS_ADDRESS_FAULT;
+        goto finish;
+    }
+    *result = UINT32_C(0); /* STATUS_SUCCESS; exactly a32-bit NTSTATUS. */
+finish:
+    free(staged);
+    free(source);
+    return status;
+}
+
 static xxemul_status win_call(xxemul_windows *process, const win_api *api, const uint64_t *arg, uint64_t *result)
 {
     const char *name = api->name;
@@ -5485,12 +7471,32 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     int wide;
 
     *result = 0;
+    if (!strcmp(name, "RtlDecompressBuffer")) return win_rtl_decompress_buffer(process, arg, result);
+    if (win_fls_exit_name(name) && win_fls_current(process)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (win_fls_api_name(name)) return win_fls_api(process, name, arg, result);
+    if (win_fls_unsupported_name(name)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if(win_actctx_api_name(name)||(process->emulator->windows_default_actctx&&
+       (!strcmp(name,"CreateActCtxA")||!strcmp(name,"CreateActCtxW"))))
+        return win_actctx_api(process,name,arg,result);
+    if(process->emulator->windows_default_actctx&&win_actctx_unsupported_name(name))return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (win_equal(name, "_except_handler3") || win_equal(name, "_except_handler4_common") ||
+        win_equal(name, "__CxxFrameHandler3") || win_equal(name, "__CxxFrameHandler4"))
+        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
 #if XXEMUL_ENABLE_DOTNET
     if (win_equal(api->module, "mscoree.dll") && !strcmp(name, "_CorExeMain")) return win_managed_entry(process, result);
 #endif
     /* The bounded CIL host does not implement the desktop CLR hosting/JIT
      * contract. Unknown mscoree services must not fall through as S_OK. */
     if (win_equal(api->module, "mscoree.dll")) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (win_equal(name, "RtlAllocateHeap") || win_equal(name, "RtlReAllocateHeap") || win_equal(name, "RtlFreeHeap") ||
+        win_equal(name, "RtlSizeHeap") || win_equal(name, "RtlValidateHeap")) {
+        win_api alias = *api;
+        const char *target = win_equal(name, "RtlAllocateHeap") ? "HeapAlloc" : win_equal(name, "RtlReAllocateHeap") ? "HeapReAlloc" :
+            win_equal(name, "RtlFreeHeap") ? "HeapFree" : win_equal(name, "RtlSizeHeap") ? "HeapSize" : "HeapValidate";
+        (void)win_copy(alias.name, sizeof(alias.name), target);
+        return win_call(process, &alias, arg, result);
+    }
+
     if(win_equal(name,"CheckSumMappedFile")){
         uint64_t nt,signature,magic,header;uint32_t sum;const uint8_t *raw;
         uint32_t length=(uint32_t)arg[1];
@@ -5500,6 +7506,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
            nt>length-24u || length-(nt+24u)<68u || (nt&1u) || !win_load(process,arg[0]+nt,4u,&signature) || signature!=0x4550u ||
            !win_load(process,arg[0]+nt+24u,2u,&magic) || (magic!=0x10bu && magic!=0x20bu)){
             (void)win_store(process,arg[2],4u,0u);process->last_error=193u;return XXEMUL_STATUS_OK;}
+        if(!xxemul_windows_memory_access(process,arg[0],length,0u,1))return XXEMUL_STATUS_ADDRESS_FAULT;
         raw=process->emulator->region_data+(size_t)(arg[0]-process->image_base);
         if(!win_load(process,arg[0]+nt+24u+64u,4u,&header))return XXEMUL_STATUS_ADDRESS_FAULT;
         sum=xx_pe_checksum(raw,length,(size_t)nt+24u+64u);
@@ -5531,64 +7538,153 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         }
         module->thread_callbacks_disabled=1u;*result=1u;return XXEMUL_STATUS_OK;
     }
+    {xxemul_status atom_status;if(win_global_atom_call(process,name,arg,result,&atom_status))return atom_status;}
+    {xxemul_status hook_status;if(win_cbt_api(process,api,arg,result,&hook_status))return hook_status;}
+    {xxemul_status region_status;if(win_region_call(process,name,arg,result,&region_status))return region_status;}
+    {xxemul_status vcl_status;if(win_vcl_call(process,name,arg,result,&vcl_status))return vcl_status;}
+    {xxemul_status gdi_status;if(win_gdi_call(process,name,arg,result,&gdi_status))return gdi_status;}
     if (win_resource_call(process,name,arg,result)) return XXEMUL_STATUS_OK;
+    {xxemul_status memory_status;if(win_memory_api(process,name,arg,result,&memory_status))return memory_status;}
+    if (win_gui_class_call(process,name,arg,result)) return XXEMUL_STATUS_OK;
+    { xxemul_status window_status; if(win_window_call(process,name,arg,result,&window_status))return window_status; }
+    if (win_equal(name, "CoInitialize") || win_equal(name, "CoInitializeEx")) {
+        win_thread_context *thread = &process->threads[process->thread_current];
+        uint32_t flags = win_equal(name, "CoInitialize") ? 2u : (uint32_t)arg[1];
+        uint8_t apartment = flags & 2u ? 2u : 1u;
+        if (arg[0] || (flags & ~UINT32_C(0x0e))) { *result = UINT32_C(0x80070057); return XXEMUL_STATUS_OK; }
+        if (thread->com_references && thread->com_apartment != apartment) {
+            *result = UINT32_C(0x80010106); return XXEMUL_STATUS_OK;
+        }
+        if (thread->com_references == UINT32_MAX) { *result = UINT32_C(0x8007000e); return XXEMUL_STATUS_OK; }
+        *result = thread->com_references ? 1u : 0u;
+        thread->com_apartment = apartment;
+        ++thread->com_references;
+        return XXEMUL_STATUS_OK;
+    }
+    if (win_equal(name, "CoUninitialize")) {
+        win_thread_context *thread = &process->threads[process->thread_current];
+        if (thread->com_references && !--thread->com_references) thread->com_apartment = 0u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (win_equal(name, "RegisterWindowMessageA") || win_equal(name, "RegisterWindowMessageW"))
+        return win_register_window_message(process, arg[0], win_suffix(name, "W"), result);
     if (win_equal(name, "SetTimer") || win_equal(name, "MoveWindow")) {
         /* Correct observed GUI ABIs without claiming unimplemented timer,
          * layout, painting, or window-message effects. */
         process->last_error = 120u;
         return XXEMUL_STATUS_OK;
     }
-    if(strcmp(name,"IsBadReadPtr")==0){
-        uint64_t maximum=word_size==8u?UINT64_MAX:UINT32_MAX;
-        /* The current Windows memory model exposes a flat readable mapping;
-         * page protections are not enforced by VirtualProtect or CPU reads.
-         * Test that real mapping without dereferencing guest/host addresses,
-         * consuming a guard page, or changing LastError. */
-        *result=arg[1] && (arg[0]>maximum || arg[1]-1u>maximum-arg[0] ||
-                           !win_memory_span(process,arg[0],arg[1]));
-        return XXEMUL_STATUS_OK;
+    if (win_equal(name, "NtQueryInformationThread") || win_equal(name, "ZwQueryInformationThread")) {
+        uint8_t bytes[48] = {0};
+        uint32_t needed = word_size == 8u ? 48u : 28u;
+        win_thread_context *thread = win_context_thread(process, arg[0], word_size);
+        if ((uint32_t)arg[1] != 0u) { *result = 0xc0000003u; return XXEMUL_STATUS_OK; }
+        if (!thread) { *result = 0xc0000008u; return XXEMUL_STATUS_OK; }
+        if (arg[4] && !win_memory_span(process, arg[4], 4u)) { *result = 0xc0000005u; return XXEMUL_STATUS_OK; }
+        if (arg[3] < needed) {
+            if (arg[4]) (void)win_store(process, arg[4], 4u, needed);
+            *result = 0xc0000004u; return XXEMUL_STATUS_OK;
+        }
+        if (!win_memory_span(process, arg[2], needed)) { *result = 0xc0000005u; return XXEMUL_STATUS_OK; }
+        win_put32(bytes, thread->active ? 0x103u : thread->exit_code);
+        if (word_size == 8u) {
+            win_put64(bytes + 8u, thread->teb_base);
+            win_put64(bytes + 16u, process->process_id); win_put64(bytes + 24u, thread->id);
+            win_put64(bytes + 32u, process->process_affinity);
+            win_put32(bytes + 40u, 8u + process->thread_priority); win_put32(bytes + 44u, 8u);
+        } else {
+            win_put32(bytes + 4u, (uint32_t)thread->teb_base);
+            win_put32(bytes + 8u, process->process_id); win_put32(bytes + 12u, thread->id);
+            win_put32(bytes + 16u, (uint32_t)process->process_affinity);
+            win_put32(bytes + 20u, 8u + process->thread_priority); win_put32(bytes + 24u, 8u);
+        }
+        if (!win_write(process, arg[2], bytes, needed) || (arg[4] && !win_store(process, arg[4], 4u, needed))) {
+            *result = 0xc0000005u; return XXEMUL_STATUS_OK;
+        }
+        *result = 0u; return XXEMUL_STATUS_OK;
+    }
+    if (win_equal(name, "ZwQueryInformationProcess")) {
+        win_api alias = *api;
+        (void)win_copy(alias.name, sizeof(alias.name), "NtQueryInformationProcess");
+        return win_call(process, &alias, arg, result);
+    }
+    if(strcmp(name,"NtQueryInformationProcess")==0){
+        win_handle *handle;win_child_process *child;
+        *result=UINT32_C(0xc0000002); /* STATUS_NOT_IMPLEMENTED */
+        if ((uint32_t)arg[1] == 0u) {
+            xxemul_windows *target = process;
+            uint8_t bytes[48] = {0};
+            uint32_t needed = word_size == 8u ? 48u : 24u;
+            handle = win_handle_at(process, arg[0]); child = win_child_at(process, handle);
+            if (!win_is_current_process_handle(process, arg[0], word_size)) {
+                if (!handle || handle->kind != WIN_HANDLE_PROCESS || !child) { *result = 0xc0000008u; return XXEMUL_STATUS_OK; }
+                target = child->emulator->windows;
+            }
+            if (arg[4] && !win_memory_span(process, arg[4], 4u)) { *result = 0xc0000005u; return XXEMUL_STATUS_OK; }
+            if (arg[3] < needed) {
+                if (arg[4]) (void)win_store(process, arg[4], 4u, needed);
+                *result = 0xc0000004u; return XXEMUL_STATUS_OK;
+            }
+            if (!win_memory_span(process, arg[2], needed)) { *result = 0xc0000005u; return XXEMUL_STATUS_OK; }
+            win_put32(bytes, target->process_terminated ? target->exit_code : 0x103u);
+            if (word_size == 8u) {
+                win_put64(bytes + 8u, target->runtime_base + 0x2000u); win_put64(bytes + 16u, target->process_affinity);
+                win_put32(bytes + 24u, 8u); win_put64(bytes + 32u, target->process_id); win_put64(bytes + 40u, target->parent_process_id);
+            } else {
+                win_put32(bytes + 4u, (uint32_t)(target->runtime_base + 0x2000u)); win_put32(bytes + 8u, (uint32_t)target->process_affinity);
+                win_put32(bytes + 12u, 8u); win_put32(bytes + 16u, target->process_id); win_put32(bytes + 20u, target->parent_process_id);
+            }
+            if (!win_write(process, arg[2], bytes, needed) || (arg[4] && !win_store(process, arg[4], 4u, needed))) {
+                *result = 0xc0000005u; return XXEMUL_STATUS_OK;
+            }
+            *result = 0u; return XXEMUL_STATUS_OK;
+        }
+        if((uint32_t)arg[1]!=7u)return XXEMUL_STATUS_OK;
+        handle=win_handle_at(process,arg[0]);child=win_child_at(process,handle);
+        if(!win_is_current_process_handle(process,arg[0],word_size) &&
+           !(handle&&handle->kind==WIN_HANDLE_PROCESS&&child)){
+            *result=UINT32_C(0xc0000008);return XXEMUL_STATUS_OK; /* STATUS_INVALID_HANDLE */
+        }
+        if(arg[4]&&!win_memory_span(process,arg[4],4u)){
+            *result=UINT32_C(0xc0000005);return XXEMUL_STATUS_OK; /* STATUS_ACCESS_VIOLATION */
+        }
+        if((uint32_t)arg[3]!=word_size){
+            if(arg[4])(void)win_store(process,arg[4],4u,word_size);
+            *result=UINT32_C(0xc0000004);return XXEMUL_STATUS_OK; /* STATUS_INFO_LENGTH_MISMATCH */
+        }
+        if(!win_memory_span(process,arg[2],word_size)){
+            *result=UINT32_C(0xc0000005);return XXEMUL_STATUS_OK;
+        }
+        /* The virtual Windows process model has no guest debug-port attach
+         * operation or debug object, including for guest child processes.
+         * Debugger frontends observe the emulator rather than attaching an
+         * in-guest Windows debug port. Unknown classes remain unsupported. */
+        (void)win_store(process,arg[2],word_size,0u);
+        if(arg[4])(void)win_store(process,arg[4],4u,word_size);
+        *result=0u;return XXEMUL_STATUS_OK;
     }
     if(strcmp(name,"CreateToolhelp32Snapshot")==0){*result=win_toolhelp_create(process,(uint32_t)arg[0],(uint32_t)arg[1]);return XXEMUL_STATUS_OK;}
     if(strcmp(name,"Process32First")==0 || strcmp(name,"Process32FirstW")==0 || strcmp(name,"Process32Next")==0 || strcmp(name,"Process32NextW")==0)
         return win_toolhelp_process_entry(process,arg,win_suffix(name,"W"),win_prefix(name,"Process32First"),result);
     if (strcmp(name,"FindWindowA")==0 || strcmp(name,"FindWindowW")==0)
         return win_gui_find_window(process,arg,win_suffix(name,"W"),result);
-    if (strcmp(name,"DialogBoxParamA")==0 || strcmp(name,"DialogBoxParamW")==0) {
-        uint64_t resource,dialog,event;uint32_t size;size_t index;
-        win_dialog_frame *frame;
-        *result=word_size==8u?UINT64_MAX:UINT32_MAX;
-        if(arg[2]){win_gui_object *parent=win_gui_at(process,arg[2]);
-            if(!parent||(parent->kind!=WIN_GUI_DIALOG&&parent->kind!=WIN_GUI_CONTROL)){process->last_error=1400u;*result=0u;return XXEMUL_STATUS_OK;}}
-        if(process->emulator->arch!=XXEMUL_ARCH_X86)return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        if(arg[0]&&arg[0]!=process->image_base){process->last_error=1812u;return XXEMUL_STATUS_OK;}
-        if(arg[1]>0xffffu)return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        if(!arg[3]||!win_memory_span(process,arg[3],1u)){process->last_error=87u;return XXEMUL_STATUS_OK;}
-        if(!win_gui_resource(process,5u,(unsigned)arg[1],&resource,&size)){process->last_error=1814u;return XXEMUL_STATUS_OK;}
-        for(index=0u;index<WIN_GUI_DIALOGS&&process->dialogs[index].active;++index){}
-        if(index==WIN_GUI_DIALOGS){process->last_error=8u;return XXEMUL_STATUS_OK;}
-        dialog=win_gui_template(process,resource,size);
-        if(!dialog){process->last_error=1813u;return XXEMUL_STATUS_OK;}
-        event=win_create_sync(process,WIN_HANDLE_EVENT,1u,0u,0u);
-        if(!event){win_gui_discard(process,dialog);process->last_error=8u;return XXEMUL_STATUS_OK;}
-        frame=&process->dialogs[index];memset(frame,0,sizeof(*frame));
-        frame->active=1u;frame->handle=dialog;frame->event=event;frame->procedure=arg[3];frame->parameter=arg[4];
-        frame->owner_id=process->threads[process->thread_current].id;frame->wide=(uint8_t)win_suffix(name,"W");
-        frame->sequence=++process->dialog_sequence;process->dialog_pending=(unsigned)index+1u;
-        return XXEMUL_STATUS_OK;
-    }
+    {xxemul_status dialog_status;if(win_dialog_api(process,name,arg,result,&dialog_status))return dialog_status;}
     if(strcmp(name,"EndDialog")==0){
-        size_t i;
-        for(i=0u;i<WIN_GUI_DIALOGS;++i){win_dialog_frame *frame=&process->dialogs[i];
-            if(frame->active&&frame->handle==arg[0]){win_handle *event=win_handle_at(process,frame->event);
-                if(!frame->ended){frame->ended=1u;frame->result=arg[1];if(event)event->signaled=1u;}
-                *result=1u;return XXEMUL_STATUS_OK;
+        size_t i;win_gui_object *dialog=win_hwnd_at(process,arg[0]);
+        if(!dialog||dialog->kind!=WIN_GUI_DIALOG){process->last_error=1400u;return XXEMUL_STATUS_OK;}
+        dialog->dialog_result=arg[1];dialog->dialog_ended=1;dialog->visible=0;dialog->style&=~UINT32_C(0x10000000);
+        for(i=0;i<WIN_GUI_DIALOGS;i++){win_dialog_frame *frame=&process->dialogs[i];
+            if(frame->active&&frame->handle==arg[0]&&frame->root_generation==dialog->generation&&!frame->modeless){
+                win_handle *event=win_handle_at(process,frame->event);
+                if(!frame->ended){frame->ended=1;frame->result=arg[1];if(event)event->signaled=1;}
             }
         }
-        process->last_error=1400u;return XXEMUL_STATUS_OK;
+        (void)win_window_post(process,arg[0],0,0,0);
+        *result=1;return XXEMUL_STATUS_OK;
     }
     if(strcmp(name,"GetDlgItem")==0){
         win_gui_object *parent=win_gui_at(process,arg[0]);
-        if(!parent||(parent->kind!=WIN_GUI_DIALOG&&parent->kind!=WIN_GUI_CONTROL)){process->last_error=1400u;return XXEMUL_STATUS_OK;}
+        if(!parent||(parent->kind!=WIN_GUI_DIALOG&&parent->kind!=WIN_GUI_CONTROL&&parent->kind!=WIN_GUI_WINDOW)){process->last_error=1400u;return XXEMUL_STATUS_OK;}
         *result=win_gui_child(process,arg[0],(uint32_t)arg[1]);return XXEMUL_STATUS_OK;
     }
     if(strcmp(name,"SetWindowTextA")==0||strcmp(name,"SetWindowTextW")==0 ||
@@ -5620,7 +7716,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         win_gui_object *object=win_gui_at(process,arg[0]);uint8_t bytes[92];unsigned i;int wide=win_suffix(name,"W");unsigned amount=wide?92u:60u;
         if(!object||object->kind!=WIN_GUI_FONT){process->last_error=6u;return XXEMUL_STATUS_OK;}
         if(!arg[2]){*result=amount;return XXEMUL_STATUS_OK;}
-        if(arg[1]<amount){process->last_error=87u;return XXEMUL_STATUS_OK;}
+        if((int32_t)arg[1]<(int32_t)amount){process->last_error=87u;return XXEMUL_STATUS_OK;}
         memcpy(bytes,object->logfont,28u);
         for(i=0u;i<32u;++i){uint16_t ch=object->text[i]?object->text[i]:win_reg_ansi(object->logfont[28u+i]);
             if(wide){bytes[28u+i*2u]=(uint8_t)ch;bytes[29u+i*2u]=(uint8_t)(ch>>8u);}else bytes[28u+i]=win_reg_unansi(ch);}
@@ -5639,20 +7735,46 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     }
     if(strcmp(name,"LoadIconA")==0||strcmp(name,"LoadIconW")==0){
         uint64_t group,kind,count,id,image,handle;uint32_t group_size,image_size;win_gui_object *object;
-        if(!arg[0])return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        if(!arg[0]){
+            size_t slot;
+            if(arg[1]<32512u||arg[1]>32518u){process->last_error=1814u;return XXEMUL_STATUS_OK;}
+            /* LoadIcon uses shared resources. The headless profile stores the
+             * canonical system identifier and logical96-DPI32px dimensions;
+             * it does not claim to rasterize the platform artwork. */
+            for(slot=0u;slot<WIN_GUI_OBJECTS;slot++){
+                object=&process->gui_objects[slot];
+                if(object->active&&object->kind==WIN_GUI_ICON&&!object->instance&&!object->resource&&object->id==(uint32_t)arg[1]){*result=0x10000u+slot;return XXEMUL_STATUS_OK;}
+            }
+            handle=win_gui_new(process,WIN_GUI_ICON,0u);if(!handle){process->last_error=8u;return XXEMUL_STATUS_OK;}
+            object=win_gui_at(process,handle);object->id=(uint32_t)arg[1];object->width=object->height=32;object->style=1u;*result=handle;return XXEMUL_STATUS_OK;
+        }
         if(arg[0]!=process->image_base){process->last_error=1812u;return XXEMUL_STATUS_OK;}
-        if(arg[1]>0xffffu)return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-        if(!win_gui_resource(process,14u,(unsigned)arg[1],&group,&group_size)||group_size<20u||
-            !win_load(process,group+2u,2u,&kind)||kind!=1u||!win_load(process,group+4u,2u,&count)||!count||count>32u||
-            group_size<6u+count*14u||!win_load(process,group+18u,2u,&id)||
-            !win_gui_resource(process,3u,(unsigned)id,&image,&image_size)){process->last_error=1814u;return XXEMUL_STATUS_OK;}
-        handle=win_gui_new(process,WIN_GUI_ICON,0u);if(!handle){process->last_error=8u;return XXEMUL_STATUS_OK;}
-        object=win_gui_at(process,handle);object->resource=image;object->resource_size=image_size;*result=handle;
+        {
+            win_resource_key type_key,name_key;win_resource_image resource_image;uint32_t resource_entry;unsigned selected=0u,i;uint64_t w,h;
+            memset(&type_key,0,sizeof(type_key));type_key.id=14u;
+            if(!win_resource_key_read(process,arg[1],win_suffix(name,"W"),&name_key))return XXEMUL_STATUS_ADDRESS_FAULT;
+            if(!win_resource_lookup(process,arg[0],&type_key,&name_key,0,0u,&resource_image,&resource_entry,&group,&group_size)||group_size<20u||
+                !win_load(process,group+2u,2u,&kind)||kind!=1u||!win_load(process,group+4u,2u,&count)||!count||count>32u||group_size<6u+count*14u){process->last_error=1814u;return XXEMUL_STATUS_OK;}
+            /* The headless profile uses32px icons at96DPI. Prefer an exact
+             *32px resource; retain the first image as bounded fallback. */
+            for(i=0u;i<(unsigned)count;i++){
+                if(!win_load(process,group+6u+i*14u,1u,&w)||!win_load(process,group+7u+i*14u,1u,&h))return XXEMUL_STATUS_ADDRESS_FAULT;
+                if(w==32u&&h==32u){selected=i;break;}
+            }
+            if(!win_load(process,group+18u+selected*14u,2u,&id)||!win_gui_resource(process,3u,(unsigned)id,&image,&image_size)){process->last_error=1814u;return XXEMUL_STATUS_OK;}
+            for(i=0u;i<WIN_GUI_OBJECTS;i++){
+                object=&process->gui_objects[i];if(object->active&&object->kind==WIN_GUI_ICON&&object->instance==arg[0]&&object->resource==image){*result=0x10000u+i;return XXEMUL_STATUS_OK;}
+            }
+            handle=win_gui_new(process,WIN_GUI_ICON,0u);if(!handle){process->last_error=8u;return XXEMUL_STATUS_OK;}
+            object=win_gui_at(process,handle);object->resource=image;object->resource_size=image_size;object->instance=arg[0];object->style=1u;
+            if(!win_load(process,group+6u+selected*14u,1u,&w)||!win_load(process,group+7u+selected*14u,1u,&h)){memset(object,0,sizeof(*object));return XXEMUL_STATUS_ADDRESS_FAULT;}
+            object->width=w?(int32_t)w:256;object->height=h?(int32_t)h:256;*result=handle;
+        }
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "VirtualFreeEx") == 0 || strcmp(name, "VirtualProtectEx") == 0 || strcmp(name, "VirtualAllocEx") == 0) {
+    if (strcmp(name, "VirtualFreeEx") == 0 || strcmp(name, "VirtualProtectEx") == 0 || strcmp(name, "VirtualAllocEx") == 0 || strcmp(name,"VirtualQueryEx")==0) {
         win_api alias = *api;
-        const char *plain = strcmp(name, "VirtualFreeEx") == 0 ? "VirtualFree" : strcmp(name, "VirtualProtectEx") == 0 ? "VirtualProtect" : "VirtualAlloc";
+        const char *plain = strcmp(name, "VirtualFreeEx") == 0 ? "VirtualFree" : strcmp(name, "VirtualProtectEx") == 0 ? "VirtualProtect" : strcmp(name,"VirtualQueryEx")==0 ? "VirtualQuery" : "VirtualAlloc";
         if (!win_is_current_process_handle(process, arg[0], word_size)) {
             process->last_error = 6u;
             return XXEMUL_STATUS_OK;
@@ -5785,20 +7907,32 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         win_module *real_module=win_dll_at(process,arg[0]);
         const char *module = win_module_name(process, arg[0]);
         if(real_module&&real_module->real){
-            if(arg[1]<0x10000u)snprintf(text,sizeof(text),"#%u",(unsigned)arg[1]);
-            else if(!win_guest_string(process,arg[1],text,sizeof(text),0))return XXEMUL_STATUS_ADDRESS_FAULT;
-            *result=win_dll_export(process,real_module,text,0u,arg[1]<0x10000u);
+            /* Keep the modeled-service text/profile limits unchanged. */
+            char native_name[4097];
+            if(arg[1]<0x10000u)snprintf(native_name,sizeof(native_name),"#%u",(unsigned)arg[1]);
+            else if(!win_guest_string(process,arg[1],native_name,sizeof(native_name),0))return XXEMUL_STATUS_ADDRESS_FAULT;
+            *result=win_dll_export(process,real_module,native_name,0u,arg[1]<0x10000u);
             if(!*result)process->last_error=127u;
             return XXEMUL_STATUS_OK;
         }
         if (module != NULL && arg[1] >= 0x10000u) {
-            size_t export_index;
-            int available;
             if (!win_guest_string(process, arg[1], text, sizeof(text), 0)) return XXEMUL_STATUS_ADDRESS_FAULT;
             if (text[0] == '\0' || win_suffix(text, ".dll") || win_suffix(text, ".exe")) {
                 process->last_error = 127u;
                 return XXEMUL_STATUS_OK;
             }
+        }
+        if (module != NULL && win_explicit_module(module)) {
+            if (arg[1] < 0x10000u) *result = win_resolve_ordinal(process, module, (uint16_t)arg[1]);
+            else {
+                *result = win_resolve(process, module, text);
+            }
+            if (!*result) process->last_error = 127u;
+            return XXEMUL_STATUS_OK;
+        }
+        if (module != NULL && arg[1] >= 0x10000u) {
+            size_t export_index;
+            int available;
             /* Lazy thunks permit importing APIs that the guest never calls.
              * An executed unsupported API is reported by the dispatcher.
              * CRT modules must still reject Windows-only function names. */
@@ -6817,66 +8951,47 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         *result = process->runtime_base + 0xbb03u;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "AddVectoredExceptionHandler") == 0) {
+    if (strcmp(name, "AddVectoredExceptionHandler") == 0 || strcmp(name, "AddVectoredContinueHandler") == 0) {
         win_vectored_handler *entry;
-        if (arg[1] == 0) {
-            process->last_error = 87u;
-            return XXEMUL_STATUS_OK;
+        size_t index;
+        if (!arg[1]) { process->last_error = 87u; return XXEMUL_STATUS_OK; }
+        for (index = 0u; index < process->vectored_handler_count && process->vectored_handlers[index].active; ++index) {}
+        if (index == WIN_MAX_VECTORED_HANDLERS || process->vectored_sequence >= 0xffffffu) {
+            process->last_error = 8u; return XXEMUL_STATUS_OK;
         }
-        if (process->vectored_handler_count >= WIN_MAX_VECTORED_HANDLERS) {
-            process->last_error = 8u;
-            return XXEMUL_STATUS_OK;
-        }
-        entry = &process->vectored_handlers[process->vectored_handler_count];
+        if (index == process->vectored_handler_count) ++process->vectored_handler_count;
+        entry = &process->vectored_handlers[index];
+        memset(entry, 0, sizeof(*entry));
         entry->callback = arg[1];
-        entry->first = (uint8_t)(arg[0] != 0);
+        entry->first = (uint8_t)(arg[0] != 0u);
         entry->active = 1u;
-        entry->handle = process->runtime_base + WIN_VECTORED_HANDLE_OFFSET + process->vectored_handler_count * 16u;
-        ++process->vectored_handler_count;
+        entry->continuation = strcmp(name, "AddVectoredContinueHandler") == 0;
+        entry->order = ++process->vectored_sequence;
+        entry->handle = process->runtime_base + WIN_VECTORED_HANDLE_OFFSET + entry->order * 16u;
         *result = entry->handle;
+        if (win_process_sync_exception_flags(process) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "RemoveVectoredExceptionHandler") == 0) {
+    if (strcmp(name, "RemoveVectoredExceptionHandler") == 0 || strcmp(name, "RemoveVectoredContinueHandler") == 0) {
         size_t index;
+        int continuation = strcmp(name, "RemoveVectoredContinueHandler") == 0;
         for (index = 0; index < process->vectored_handler_count; ++index) {
             win_vectored_handler *entry = &process->vectored_handlers[index];
-            if (entry->active && entry->handle == arg[0]) {
-                entry->active = 0u;
-                *result = 1u;
+            if (entry->active && entry->handle == arg[0] && entry->continuation == continuation) {
+                entry->active = 0u; *result = 1u;
+                if (win_process_sync_exception_flags(process) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
                 return XXEMUL_STATUS_OK;
             }
         }
-        process->last_error = 6u;
+        *result = 0u;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "ExitProcess") == 0 || strcmp(name, "exit") == 0) {
         process->exit_code = (uint32_t)arg[0];
         process->emulator->exit_code = (uint8_t)arg[0];
         process->emulator->halted = 1;
-        process->process_terminated = 1u;
+        win_runtime_abandon_process(process);process->process_terminated = 1u;
         return XXEMUL_STATUS_HALTED;
-    }
-    if (strcmp(name, "RaiseException") == 0) {
-        if (arg[0] == 0xe06d7363u) {
-            uint64_t exit_code = 0;
-            if (arg[3] != 0 && arg[2] >= 2) {
-                uint64_t p_obj = 0;
-                if (win_load(process, arg[3] + 8u, 8u, &p_obj) && p_obj != 0) {
-                    win_load(process, p_obj, 4u, &exit_code);
-                }
-            }
-            process->exit_code = (int32_t)exit_code;
-            *result = 0u;
-            return XXEMUL_STATUS_HALTED;
-        }
-        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-    }
-    if (strcmp(name, "VirtualProtect") == 0) {
-        uint64_t base = process->emulator->region_address;
-        uint64_t span = process->emulator->region_size;
-        if (arg[0] >= base && arg[1] <= span && arg[0] - base <= span - arg[1] && win_store(process, arg[3], 4u, 0x40u)) *result = 1u;
-        else process->last_error = 487u;
-        return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "CacheSync") == 0) {
         /* WinCE exposes this as a void API. ARM instructions are decoded
@@ -6890,63 +9005,51 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         else process->last_error = 487u;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "VirtualAlloc") == 0) {
-        if (arg[0] != 0) {
-            uint64_t base = process->emulator->region_address;
-            uint64_t span = process->emulator->region_size;
-            if (arg[0] >= base && arg[1] <= span && arg[0] - base <= span - arg[1]) *result = arg[0];
-        } else {
-            *result = win_heap_alloc(process, arg[1]);
+    if (strcmp(name, "PathFindExtensionA") == 0 || strcmp(name, "PathFindExtensionW") == 0) {
+        uint64_t cursor = arg[0], dot = 0u;
+        uint64_t limit = win_word_size(process->emulator) == 4u ? UINT32_MAX : UINT64_MAX;
+        uint8_t width = win_suffix(name, "W") ? 2u : 1u;
+        size_t unit;
+        if (!cursor) return XXEMUL_STATUS_OK;
+        /* ACP1252 has no DBCS lead bytes; W examines opaque UTF-16 units.
+         * The bounded scan never probes past a successfully read NUL. */
+        for (unit = 0u; unit < 0x10000u; ++unit) {
+            uint64_t character;
+            if (!win_load(process, cursor, width, &character)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            if (!character) {
+                *result = dot ? dot : cursor;
+                return XXEMUL_STATUS_OK;
+            }
+            if (character == '\\' || character == ' ') dot = 0u;
+            else if (character == '.') dot = cursor;
+            if (cursor > limit - width) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            cursor += width;
         }
-        if (*result == 0) process->last_error = 8u;
-        return XXEMUL_STATUS_OK;
+        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
-    if (strcmp(name, "VirtualFree") == 0) {
-        uint64_t base = process->emulator->region_address;
-        *result = arg[0] >= base && arg[0] < base + process->emulator->region_size;
-        return XXEMUL_STATUS_OK;
-    }
-    if (strcmp(name, "VirtualQuery") == 0) {
-        uint64_t base = process->emulator->region_address;
-        uint64_t size = process->emulator->region_size;
-        uint64_t query = arg[0];
-        uint64_t block_base, block_size;
-        uint32_t type;
-        uint32_t structure_size = word_size == 8u ? 48u : 28u;
-        uint8_t data[48] = {0};
-        if (query < base || query - base >= size || arg[2] < structure_size) {
-            process->last_error = 87u;
-            return XXEMUL_STATUS_OK;
+    if (strcmp(name, "PathFindFileNameA") == 0 || strcmp(name, "PathFindFileNameW") == 0) {
+        uint64_t cursor = arg[0], candidate = cursor;
+        uint64_t limit = win_word_size(process->emulator) == 4u ? UINT32_MAX : UINT64_MAX;
+        uint8_t width = win_suffix(name, "W") ? 2u : 1u;
+        int previous_separator = 0;
+        size_t unit;
+        if (!cursor) return XXEMUL_STATUS_OK;
+        /* ACP1252 is single-byte; W examines opaque UTF-16 units. Deferring
+         * the separator decision avoids reading beyond a successfully read
+         * NUL, including when a path ends in a separator. */
+        for (unit = 0u; unit < 0x10000u; ++unit) {
+            uint64_t character;
+            if (!win_load(process, cursor, width, &character)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            if (!character) {
+                *result = candidate;
+                return XXEMUL_STATUS_OK;
+            }
+            if (previous_separator && character != '\\' && character != '/') candidate = cursor;
+            previous_separator = character == '\\' || character == '/' || character == ':';
+            if (cursor > limit - width) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            cursor += width;
         }
-        if (query < process->image_base + process->image_size) {
-            block_base = process->image_base;
-            block_size = process->image_size;
-            type = 0x1000000u; /* MEM_IMAGE */
-        } else {
-            block_base = process->image_base + process->image_size;
-            block_size = size - process->image_size;
-            type = 0x20000u; /* MEM_PRIVATE */
-        }
-        if (word_size == 8u) {
-            win_put64(data, block_base);
-            win_put64(data + 8u, block_base);
-            win_put32(data + 16u, 0x40u);
-            win_put64(data + 24u, block_size);
-            win_put32(data + 32u, 0x1000u);
-            win_put32(data + 36u, 0x40u);
-            win_put32(data + 40u, type);
-        } else {
-            win_put32(data, (uint32_t)block_base);
-            win_put32(data + 4u, (uint32_t)block_base);
-            win_put32(data + 8u, 0x40u);
-            win_put32(data + 12u, (uint32_t)block_size);
-            win_put32(data + 16u, 0x1000u);
-            win_put32(data + 20u, 0x40u);
-            win_put32(data + 24u, type);
-        }
-        if (!win_write(process, arg[1], data, structure_size)) return XXEMUL_STATUS_ADDRESS_FAULT;
-        *result = structure_size;
-        return XXEMUL_STATUS_OK;
+        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
     if (strcmp(name, "CharNextA") == 0 || strcmp(name, "CharNextW") == 0) {
         uint64_t value;
@@ -6998,6 +9101,13 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         char message[1024], caption[256], line[1320];
         size_t index, length;
         int wide = win_suffix(name, "W");
+        /* This inherited headless service has no window/message pump. Do not
+         * silently omit a registered current-thread hook's real callbacks. */
+        for(index=0;index<WIN_HOOK_SLOTS;index++){
+            const win_hook_record *hook=&process->hooks.records[index];
+            if(hook->allocated&&hook->enabled&&hook->owner_id==process->threads[process->thread_current].id)
+                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        }
         if (!win_guest_string(process, arg[1], message, sizeof(message), wide) ||
             !win_guest_string(process, arg[2], caption, sizeof(caption), wide)) return XXEMUL_STATUS_ADDRESS_FAULT;
         snprintf(line, sizeof(line), "[MessageBox] %s: %s\n", caption, message);
@@ -7011,12 +9121,16 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetLastError") == 0) {
+        uint64_t error;
+        if (!win_load(process, win_current_teb(process) + (word_size == 8u ? 0x68u : 0x34u), 4u, &error))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        process->last_error = (uint32_t)error;
         *result = process->last_error;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "SetLastError") == 0) {
         process->last_error = (uint32_t)arg[0];
-        address = process->runtime_base + (word_size == 8u ? 0x68u : 0x34u);
+        address = win_current_teb(process) + (word_size == 8u ? 0x68u : 0x34u);
         if (!win_store(process, address, 4u, arg[0])) return XXEMUL_STATUS_ADDRESS_FAULT;
         return XXEMUL_STATUS_OK;
     }
@@ -7076,7 +9190,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "OpenProcess") == 0) {
-        *result = win_open_current_process(process, (uint32_t)arg[2], (uint32_t)arg[1]);
+        *result = win_open_current_process(process, (uint32_t)arg[2], (uint32_t)arg[1], (uint32_t)arg[0]);
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetCurrentThread") == 0) {
@@ -7149,8 +9263,9 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
             process->last_error = 6u;
             return XXEMUL_STATUS_OK;
         }
-        return win_capture_thread_context(process, arg[1], word_size, result);
+        return win_capture_thread_context(process, arg[0], arg[1], word_size, result);
     }
+    if (strcmp(name, "SetThreadContext") == 0) return win_set_thread_context(process, arg[0], arg[1], result);
     if (strcmp(name, "ResumeThread") == 0 || strcmp(name, "SuspendThread") == 0 || strcmp(name, "SetThreadContext") == 0) {
         if (!win_is_current_thread_handle(process, arg[0], word_size)) {
             process->last_error = 6u;
@@ -7242,36 +9357,58 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         }
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "TlsAlloc") == 0 || strcmp(name, "FlsAlloc") == 0) {
-        if (process->tls_count >= WIN_MAX_TLS_SLOTS) {
-            process->last_error = 8u;
-            *result = UINT32_MAX;
+    if (strcmp(name, "TlsAlloc") == 0) {
+        unsigned index;
+        size_t slot;
+        for (index = 0; index < WIN_MAX_TLS_SLOTS && process->tls_allocated[index]; ++index) {}
+        if (index == WIN_MAX_TLS_SLOTS) { process->last_error = 8u; *result = UINT32_MAX; return XXEMUL_STATUS_OK; }
+        for (slot = 0; slot < WIN_MAX_THREADS; ++slot) {
+            win_thread_context *thread = &process->threads[slot];
+            uint64_t address;
+            if (!thread->active) continue;
+            if (!win_tls_slot_address(process, thread, index, 1, &address) ||
+                !win_store(process, address, word_size, 0u)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            thread->tls_values[index] = 0u;
+        }
+        process->tls_allocated[index] = 1u;
+        process->tls_values[index] = 0u;
+        if (process->tls_count <= index) process->tls_count = index + 1u;
+        if (win_process_sync_tls(process) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = index;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "TlsGetValue") == 0 || strcmp(name, "TlsGetValue2") == 0) {
+        int preserve_error = win_equal(name, "TlsGetValue2");
+        if (arg[0] >= WIN_MAX_TLS_SLOTS || !process->tls_allocated[arg[0]]) {
+            if (!preserve_error) process->last_error = 87u;
         } else {
-            *result = process->tls_count++;
-            process->tls_values[*result] = 0u;
+            uint64_t address;
+            if (!win_tls_slot_address(process, &process->threads[process->thread_current], (unsigned)arg[0], 0, &address)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            if (address && !win_load(process, address, word_size, result)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            process->tls_values[arg[0]] = *result;
+            if (!preserve_error) process->last_error = 0u;
         }
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "TlsGetValue") == 0 || strcmp(name, "FlsGetValue") == 0 || strcmp(name, "FlsGetValue2") == 0) {
-        if (arg[0] >= process->tls_count) {
-            process->last_error = 87u;
-        } else {
-            process->last_error = 0u;
-            *result = process->tls_values[arg[0]];
-        }
-        return XXEMUL_STATUS_OK;
-    }
-    if (strcmp(name, "TlsSetValue") == 0 || strcmp(name, "FlsSetValue") == 0) {
-        if (arg[0] >= process->tls_count) {
-            process->last_error = 87u;
-        } else {
+    if (strcmp(name, "TlsSetValue") == 0) {
+        if (arg[0] >= WIN_MAX_TLS_SLOTS || !process->tls_allocated[arg[0]]) process->last_error = 87u;
+        else {
+            uint64_t address;
+            if (!win_tls_slot_address(process, &process->threads[process->thread_current], (unsigned)arg[0], 1, &address) ||
+                !win_store(process, address, word_size, arg[1])) return XXEMUL_STATUS_ADDRESS_FAULT;
             process->tls_values[arg[0]] = arg[1];
+            process->threads[process->thread_current].tls_values[arg[0]] = arg[1];
             *result = 1u;
         }
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "TlsFree") == 0 || strcmp(name, "FlsFree") == 0) {
-        *result = 1u;
+    if (strcmp(name, "TlsFree") == 0) {
+        if (arg[0] >= WIN_MAX_TLS_SLOTS || !process->tls_allocated[arg[0]]) process->last_error = 87u;
+        else {
+            process->tls_allocated[arg[0]] = 0u;
+            if (win_process_sync_tls(process) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
+            *result = 1u;
+        }
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetSystemTimeAsFileTime") == 0) {
@@ -7282,33 +9419,59 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         if (!win_store(process, arg[0], 8u, file_time)) return XXEMUL_STATUS_ADDRESS_FAULT;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "IsDebuggerPresent") == 0) return XXEMUL_STATUS_OK;
+    if (strcmp(name, "IsDebuggerPresent") == 0) {
+        uint64_t peb;
+        if (!win_load(process, win_current_teb(process) + (word_size == 8u ? 0x60u : 0x30u), word_size, &peb) ||
+            !win_load(process, peb + 2u, 1u, result)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = *result != 0u;
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "DebugBreak") == 0) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     if (strcmp(name, "OutputDebugStringA") == 0) {
         if (!win_guest_string(process, arg[0], text, sizeof(text), 0)) return XXEMUL_STATUS_ADDRESS_FAULT;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "InitializeCriticalSection") == 0 || strcmp(name, "InitializeCriticalSectionAndSpinCount") == 0 ||
-        strcmp(name, "InitializeCriticalSectionEx") == 0) {
-        *result = 1u;
+    if (win_equal(name, "RtlAcquirePebLock") || win_equal(name, "RtlReleasePebLock")) {
+        win_api alias = *api;
+        uint64_t peb, lock, arguments[1];
+        if (!win_load(process, win_current_teb(process) + (word_size == 8u ? 0x60u : 0x30u), word_size, &peb) ||
+            !win_load(process, peb + (word_size == 8u ? 0x38u : 0x1cu), word_size, &lock)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        arguments[0] = lock;
+        (void)win_copy(alias.name, sizeof(alias.name), win_equal(name, "RtlAcquirePebLock") ? "EnterCriticalSection" : "LeaveCriticalSection");
+        return win_call(process, &alias, arguments, result);
+    }
+    if (win_equal(name, "InitializeCriticalSection") || win_equal(name, "InitializeCriticalSectionAndSpinCount") ||
+        win_equal(name, "InitializeCriticalSectionEx") || win_equal(name, "RtlInitializeCriticalSection") ||
+        win_equal(name, "RtlInitializeCriticalSectionAndSpinCount") || win_equal(name, "RtlInitializeCriticalSectionEx")) {
+        *result = win_prefix(name, "Rtl") ? 0u : 1u;
         return win_critical_initialize(process, arg[0]);
     }
-    if (strcmp(name, "DeleteCriticalSection") == 0 || strcmp(name, "EnterCriticalSection") == 0 || strcmp(name, "LeaveCriticalSection") == 0 ||
-        strcmp(name, "TryEnterCriticalSection") == 0) {
+    if (win_equal(name, "DeleteCriticalSection") || win_equal(name, "EnterCriticalSection") || win_equal(name, "LeaveCriticalSection") ||
+        win_equal(name, "TryEnterCriticalSection") || win_equal(name, "RtlDeleteCriticalSection") || win_equal(name, "RtlEnterCriticalSection") ||
+        win_equal(name, "RtlLeaveCriticalSection") || win_equal(name, "RtlTryEnterCriticalSection")) {
         win_critical_section *entry = win_critical_at(process, arg[0]);
-        if (entry == NULL) {
-            if (strcmp(name, "TryEnterCriticalSection") == 0) *result = 1u;
-            return XXEMUL_STATUS_OK;
-        }
-        if (strcmp(name, "DeleteCriticalSection") == 0) {
+        win_thread_context *thread = &process->threads[process->thread_current];
+        const char *operation = win_prefix(name, "Rtl") ? name + 3u : name;
+        if (!entry) return XXEMUL_STATUS_INVALID_ARGUMENT;
+        if (win_equal(operation, "DeleteCriticalSection")) {
+            if (entry->recursion) return XXEMUL_STATUS_INVALID_ARGUMENT;
             entry->active = 0u;
             return XXEMUL_STATUS_OK;
         }
-        if (strcmp(name, "LeaveCriticalSection") == 0) {
-            if (entry->recursion > 0u) --entry->recursion;
+        if (win_equal(operation, "LeaveCriticalSection")) {
+            if (!entry->recursion || entry->owner_id != thread->id) return XXEMUL_STATUS_INVALID_ARGUMENT;
+            if (!--entry->recursion) entry->owner_id = 0u;
+        } else if (entry->recursion && entry->owner_id != thread->id) {
+            if (win_equal(operation, "TryEnterCriticalSection")) { *result = 0u; return XXEMUL_STATUS_OK; }
+            thread->blocked = 3u;
+            thread->wait_handles[0] = entry->address;
+            thread->deadline = UINT64_MAX;
+            return XXEMUL_STATUS_OK;
         } else {
-            if (entry->recursion < UINT32_MAX) ++entry->recursion;
-            if (strcmp(name, "TryEnterCriticalSection") == 0) *result = 1u;
+            if (entry->recursion == UINT32_MAX) return XXEMUL_STATUS_INVALID_ARGUMENT;
+            entry->owner_id = thread->id;
+            ++entry->recursion;
+            if (win_equal(operation, "TryEnterCriticalSection")) *result = 1u;
         }
         return win_critical_write(process, entry);
     }
@@ -7439,6 +9602,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetSystemDirectoryA") == 0 || strcmp(name, "GetSystemDirectoryW") == 0 ||
+        strcmp(name, "GetSystemWindowsDirectoryA") == 0 || strcmp(name, "GetSystemWindowsDirectoryW") == 0 ||
         strcmp(name, "GetWindowsDirectoryA") == 0 || strcmp(name, "GetWindowsDirectoryW") == 0) {
         const char *path = win_prefix(name, "GetSystemDirectory") ? "C:\\Windows\\System32" : "C:\\Windows";
         uint8_t bytes[40] = {0};
@@ -7485,6 +9649,8 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         *result = UINT32_MAX;
         if (!arg[0] || !win_guest_string(process, arg[0], text, sizeof(text), win_suffix(name, "W"))) {
             process->last_error = 998u;
+        } else if(win_module_file_at(process,text,NULL,0u)){
+            *result=1u; /* FILE_ATTRIBUTE_READONLY, not authentic vendor metadata. */
         } else if (!win_guest_path(process, text, host, sizeof(host))) {
             process->last_error = 5u;
         } else {
@@ -7567,6 +9733,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     }
     if (strcmp(name, "CreateFileA") == 0 || strcmp(name, "CreateFileW") == 0) {
         if (!win_guest_string(process, arg[0], text, sizeof(text), win_suffix(name, "W"))) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if(win_module_file_open(process,text,(uint32_t)arg[1],(uint32_t)arg[4],(uint32_t)arg[2],(uint32_t)arg[5],result))return XXEMUL_STATUS_OK;
         *result = win_file_open(process, text, (uint32_t)arg[1], (uint32_t)arg[4]);
         return XXEMUL_STATUS_OK;
     }
@@ -7675,8 +9842,22 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "FlushFileBuffers") == 0) {
+        win_handle *file=win_handle_at(process,arg[0]);
+        if(file&&file->module_file_data){process->last_error=5u;return XXEMUL_STATUS_OK;}
         *result = arg[0] == 0x11u || arg[0] == 0x12u || win_handle_io(process, arg[0]) != NULL;
         return XXEMUL_STATUS_OK;
+    }
+    if(win_equal(name,"InterlockedCompareExchange")||win_equal(name,"InterlockedExchangeAdd")||win_equal(name,"InterlockedExchange")){
+        uint64_t old;uint32_t value;
+        /* Guest threads are cooperatively scheduled between API/instruction
+         * steps. This whole LONG32 read/modify/write is one atomic step. */
+        if(arg[0]&3u){process->emulator->windows_exception_code=0x80000002u;process->emulator->fault_address=arg[0];process->emulator->fault_access=1u;process->emulator->fault_address_valid=1;return XXEMUL_STATUS_ADDRESS_FAULT;}
+        if(!xxemul_windows_memory_access(process,arg[0],4u,1u,1)||!win_load(process,arg[0],4u,&old))return XXEMUL_STATUS_ADDRESS_FAULT;
+        value=win_equal(name,"InterlockedExchangeAdd")?(uint32_t)old+(uint32_t)arg[1]:(uint32_t)arg[1];
+        if(!win_equal(name,"InterlockedCompareExchange")||(uint32_t)old==(uint32_t)arg[2]){
+            if(!win_store(process,arg[0],4u,value))return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        *result=(uint32_t)old;return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "InterlockedIncrement") == 0 || strcmp(name, "InterlockedDecrement") == 0) {
         uint64_t value;
@@ -7686,20 +9867,58 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         *result = value;
         return XXEMUL_STATUS_OK;
     }
+    if (strcmp(name, "RtlGetCurrentPeb") == 0) {
+        if (!win_load(process, win_current_teb(process) + (word_size == 8u ? 0x60u : 0x30u), word_size, result))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "GetProcessHeap") == 0) {
-        *result = 0x400u;
+        const xxemul_windows_process_layout *layout = xxemul_windows_process_get_layout(word_size == 8u);
+        uint64_t peb;
+        if (!win_load(process, win_current_teb(process) + layout->peb_pointer, word_size, &peb) ||
+            !win_load(process, peb + layout->process_heap, word_size, result)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "GetProcessHeaps") == 0 || strcmp(name, "RtlGetProcessHeaps") == 0) {
+        xxemul_windows_process_description description;
+        size_t index;
+        if (!win_process_description(process, &description)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = description.heap_count;
+        if (arg[0] >= description.heap_count) {
+            if (!win_memory_span(process, arg[1], description.heap_count * word_size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            for (index = 0; index < description.heap_count; ++index)
+                if (!win_store(process, arg[1] + index * word_size, word_size, process->heap_descriptors[index])) return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "HeapCreate") == 0) {
+        xxemul_windows_process_description description;
+        xxemul_windows_process_memory memory = win_process_memory(process);
+        win_allocation *allocation;
+        uint64_t descriptor;
         size_t slot;
+        if (arg[2]) { process->last_error = 50u; return XXEMUL_STATUS_OK; }
+        if (!win_process_description(process, &description)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (description.heap_count >= description.heap_capacity) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
         for (slot = 0; slot < WIN_MAX_HANDLES; ++slot) if (!process->handles[slot].in_use) break;
         if (slot == WIN_MAX_HANDLES) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
+        descriptor = win_heap_alloc(process, 0x200u);
+        if (!descriptor) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
+        allocation = win_find_allocation(process, descriptor);
+        if (xxemul_windows_process_initialize_heap(&memory, word_size == 8u, descriptor,
+            description.heap_start, description.heap_limit, (uint32_t)arg[0] | 2u, 0u) != XXEMUL_STATUS_OK) {
+            if (allocation) allocation->active = 0u;
+            process->last_error = 8u; return XXEMUL_STATUS_OK;
+        }
         memset(&process->handles[slot], 0, sizeof(process->handles[slot]));
         process->handles[slot].kind = WIN_HANDLE_HEAP;
+        process->handles[slot].heap_address = descriptor;
         process->handles[slot].in_use = 1u;
         process->handles[slot].references = 1u;
         process->handles[slot].root_slot = (uint16_t)slot;
-        *result = 0x100u + slot;
+        if (allocation) allocation->heap_owner = UINT64_MAX;
+        if (win_process_sync_heaps(process) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = descriptor;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "HeapDestroy") == 0) {
@@ -7711,9 +9930,13 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         /* Destroying the heap invalidates every alias as well as its blocks. */
         for (index = 0u; index < WIN_MAX_HANDLES; ++index) {
             win_handle *entry = &process->handles[index];
-            if ((0x100u + index == owner) || (entry->kind == WIN_HANDLE_ALIAS && 0x100u + entry->root_slot == owner))
+            if ((0x100u + index == owner) || (entry->kind == WIN_HANDLE_ALIAS && 0x100u + entry->root_slot == owner)) {
+                win_allocation *descriptor = win_find_allocation(process, entry->heap_address);
+                if (descriptor) descriptor->active = 0u;
                 memset(entry, 0, sizeof(*entry));
+            }
         }
+        if (win_process_sync_heaps(process) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
         *result = 1u;
         return XXEMUL_STATUS_OK;
     }
@@ -7726,7 +9949,10 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         if (allocation == NULL) process->last_error = 8u;
         else {
             allocation->heap_owner = owner;
-            if ((arg[1] & 8u) != 0u) memset(process->emulator->region_data + (size_t)(*result - process->emulator->region_address), 0, (size_t)allocation->size);
+            if ((arg[1] & 8u) != 0u) {
+                if(!xxemul_windows_memory_access(process,*result,allocation->size,1u,1)){allocation->active=0u;return XXEMUL_STATUS_ADDRESS_FAULT;}
+                memset(process->emulator->region_data + (size_t)(*result - process->emulator->region_address), 0, (size_t)allocation->size);
+            }
         }
         return XXEMUL_STATUS_OK;
     }
@@ -7737,6 +9963,8 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         if (owner == 0u) { process->last_error = 6u; return XXEMUL_STATUS_OK; }
         if (allocation == NULL || allocation->heap_owner != owner) { process->last_error = 87u; return XXEMUL_STATUS_OK; }
         old_size = allocation->size;
+        if(new_size>allocation->capacity&&!xxemul_windows_memory_access(process,arg[2],old_size,0u,1))return XXEMUL_STATUS_ADDRESS_FAULT;
+        if(new_size<=allocation->capacity&&(arg[1]&8u)&&new_size>old_size&&!xxemul_windows_memory_access(process,arg[2]+old_size,new_size-old_size,1u,1))return XXEMUL_STATUS_ADDRESS_FAULT;
         if (new_size <= allocation->capacity) {
             allocation->size = new_size;
             *result = arg[2];
@@ -7747,6 +9975,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
             if (replacement != NULL) {
                 uint64_t base = process->emulator->region_address;
                 replacement->heap_owner = owner;
+                if(!xxemul_windows_memory_access(process,*result,new_size,1u,1)){replacement->active=0u;return XXEMUL_STATUS_ADDRESS_FAULT;}
                 memcpy(process->emulator->region_data + (size_t)(*result - base), process->emulator->region_data + (size_t)(arg[2] - base), (size_t)old_size);
                 allocation->active = 0u;
             }
@@ -7764,6 +9993,15 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         if (owner == 0u) { process->last_error = 6u; return XXEMUL_STATUS_OK; }
         if (strcmp(name, "HeapValidate") == 0 && arg[2] == 0u) {
             size_t index;
+            if (owner == 0x400u) {
+                xxemul_windows_process_description description;
+                xxemul_windows_process_memory memory = win_process_memory(process);
+                int valid = 0;
+                if (!win_process_description(process, &description) ||
+                    xxemul_windows_process_validate_heap(&memory, &description, &valid) != XXEMUL_STATUS_OK)
+                    return XXEMUL_STATUS_ADDRESS_FAULT;
+                if (!valid) { process->last_error = 87u; return XXEMUL_STATUS_OK; }
+            }
             uint64_t begin = process->emulator->region_address + process->image_size;
             for (index = 0u; index < process->allocation_count; ++index) {
                 win_allocation *item = &process->allocations[index];
@@ -7791,6 +10029,9 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     }
     if (strcmp(name, "LocalFree") == 0 || strcmp(name, "GlobalFree") == 0) {
         win_allocation *allocation = win_find_allocation(process, arg[0]);
+        if (allocation && allocation->heap_owner == UINT64_MAX) {
+            *result = arg[0]; process->last_error = 6u; return XXEMUL_STATUS_OK;
+        }
         if (allocation != NULL) allocation->active = 0u;
         *result = 0;
         return XXEMUL_STATUS_OK;
@@ -7803,15 +10044,20 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     }
     if (strcmp(name, "GlobalReAlloc") == 0 || strcmp(name, "LocalReAlloc") == 0) {
         win_allocation *allocation = win_find_allocation(process, arg[0]);
+        if (allocation && allocation->heap_owner == UINT64_MAX) {
+            process->last_error = 6u; return XXEMUL_STATUS_OK;
+        }
         if (allocation) {
             if ((arg[2] & 0x80u) || arg[1] <= allocation->size) {
                 if (!(arg[2] & 0x80u)) allocation->size = arg[1];
                 *result = allocation->address;
             } else {
                 uint64_t old_size = allocation->size;
+                if(!xxemul_windows_memory_access(process,arg[0],old_size,0u,1))return XXEMUL_STATUS_ADDRESS_FAULT;
                 *result = win_heap_alloc(process, arg[1]);
                 if (*result) {
                     uint64_t region_base = process->emulator->region_address;
+                    if(!xxemul_windows_memory_access(process,*result,old_size,1u,1)){win_find_allocation(process,*result)->active=0u;return XXEMUL_STATUS_ADDRESS_FAULT;}
                     memcpy(process->emulator->region_data + (size_t)(*result - region_base),
                         process->emulator->region_data + (size_t)(arg[0] - region_base), (size_t)old_size);
                     allocation->active = 0u;
@@ -7879,6 +10125,19 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     }
     if (strcmp(name, "GetVersion") == 0) {
         *result = (WIN_OS_VERSION_BUILD << 16u) | (WIN_OS_VERSION_MINOR << 8u) | WIN_OS_VERSION_MAJOR;
+        return XXEMUL_STATUS_OK;
+    }
+    if (win_equal(name, "GetProcessVersion")) {
+        xxemul_windows *target = process;
+        if ((uint32_t)arg[0] && (uint32_t)arg[0] != process->process_id) {
+            xxemul_windows *root = process->process_tree ? process->process_tree->root : process;
+            target = win_process_by_id(root, (uint32_t)arg[0], 0u);
+        }
+        if (!target || (word_size == 4u && win_word_size(target->emulator) != 4u)) {
+            process->last_error = 87u;
+            return XXEMUL_STATUS_OK;
+        }
+        *result = ((uint32_t)target->image_subsystem_major << 16u) | target->image_subsystem_minor;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetFileVersionInfoSizeA") == 0 || strcmp(name, "GetFileVersionInfoA") == 0) {
@@ -7973,7 +10232,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
             win_child_finish(child,(uint32_t)arg[1]);*result=1u;return XXEMUL_STATUS_OK;
         }
         if(win_is_current_process_handle(process,arg[0],word_size)) {
-            process->process_terminated=1u;process->exit_code=(uint32_t)arg[1];process->emulator->halted=1u;
+            win_runtime_abandon_process(process);process->process_terminated=1u;process->exit_code=(uint32_t)arg[1];process->emulator->halted=1u;
             return XXEMUL_STATUS_HALTED;
         }
         process->last_error=6u;return XXEMUL_STATUS_OK;
@@ -8013,6 +10272,33 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         if (length != basic) bytes[basic + 6u] = 1u; /* VER_NT_WORKSTATION */
         if (!win_write(process, arg[0], bytes, (size_t)length)) return XXEMUL_STATUS_ADDRESS_FAULT;
         *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (win_equal(name, "SysAllocStringByteLen")) {
+        uint32_t length = (uint32_t)arg[1];
+        uint64_t allocation;
+        if (arg[0] && length && !win_memory_span(process, arg[0], length)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if(arg[0]&&length&&!xxemul_windows_memory_access(process,arg[0],length,0u,1))return XXEMUL_STATUS_ADDRESS_FAULT;
+        allocation = win_heap_alloc(process, (uint64_t)length + 6u);
+        if (!allocation) return XXEMUL_STATUS_OK;
+        if(!xxemul_windows_memory_access(process,allocation,(uint64_t)length+6u,1u,1)){win_find_allocation(process,allocation)->active=0u;return XXEMUL_STATUS_ADDRESS_FAULT;}
+        /* Binary BSTR data is copied verbatim, including embedded NULs and
+         * odd byte counts. A NULL source deliberately leaves it uninitialized. */
+        if (!win_store(process, allocation, 4u, length) ||
+            !win_store(process, allocation + 4u + length, 2u, 0u)) {
+            win_allocation *block = win_find_allocation(process, allocation);
+            if (block) block->active = 0u;
+            return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        if (arg[0] && length)
+            memmove(process->emulator->region_data + (size_t)(allocation + 4u - process->emulator->region_address),
+                process->emulator->region_data + (size_t)(arg[0] - process->emulator->region_address), length);
+        *result = allocation + 4u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (win_equal(name, "SysStringByteLen")) {
+        if (!arg[0]) return XXEMUL_STATUS_OK;
+        if (arg[0] < 4u || !win_load(process, arg[0] - 4u, 4u, result)) return XXEMUL_STATUS_ADDRESS_FAULT;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "SysAllocStringLen") == 0) {
@@ -8088,10 +10374,6 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         *result = 1u;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "GetProcessHeap") == 0) {
-        *result = 0x10000u;
-        return XXEMUL_STATUS_OK;
-    }
     if (strcmp(name, "GetCurrentProcess") == 0) {
         *result = (uint64_t)(int64_t)-1;
         return XXEMUL_STATUS_OK;
@@ -8102,10 +10384,6 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
     }
     if (strcmp(name, "GetConsoleCP") == 0) {
         *result = 1252u;
-        return XXEMUL_STATUS_OK;
-    }
-    if (strcmp(name, "IsDebuggerPresent") == 0) {
-        *result = 0u;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetUserDefaultLCID") == 0 || strcmp(name, "GetThreadLocale") == 0) {
@@ -8124,14 +10402,36 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetLocalTime") == 0) {
+        uint8_t bytes[16];
+        if (arg[0] == 0u || !win_memory_span(process, arg[0], sizeof(bytes))) return XXEMUL_STATUS_ADDRESS_FAULT;
 #if defined(_WIN32)
         SYSTEMTIME st;
         GetLocalTime(&st);
-        win_write(process, arg[0], (const uint8_t *)&st, sizeof(st));
+        win_put16(bytes, st.wYear);
+        win_put16(bytes + 2u, st.wMonth);
+        win_put16(bytes + 4u, st.wDayOfWeek);
+        win_put16(bytes + 6u, st.wDay);
+        win_put16(bytes + 8u, st.wHour);
+        win_put16(bytes + 10u, st.wMinute);
+        win_put16(bytes + 12u, st.wSecond);
+        win_put16(bytes + 14u, st.wMilliseconds);
 #else
-        uint8_t zero16[16] = {0};
-        win_write(process, arg[0], zero16, 16u);
+        struct timespec now;
+        struct tm local;
+        /* Derive the local calendar and milliseconds from the same host instant.
+         * A failed host conversion must not become a successful zero calendar. */
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0 || localtime_r(&now.tv_sec, &local) == NULL ||
+            local.tm_year < -299 || local.tm_year > 28927) return XXEMUL_STATUS_IO_ERROR;
+        win_put16(bytes, (uint16_t)(local.tm_year + 1900));
+        win_put16(bytes + 2u, (uint16_t)(local.tm_mon + 1));
+        win_put16(bytes + 4u, (uint16_t)local.tm_wday);
+        win_put16(bytes + 6u, (uint16_t)local.tm_mday);
+        win_put16(bytes + 8u, (uint16_t)local.tm_hour);
+        win_put16(bytes + 10u, (uint16_t)local.tm_min);
+        win_put16(bytes + 12u, (uint16_t)local.tm_sec);
+        win_put16(bytes + 14u, (uint16_t)(now.tv_nsec / 1000000L));
 #endif
+        if (!win_write(process, arg[0], bytes, sizeof(bytes))) return XXEMUL_STATUS_ADDRESS_FAULT;
         *result = 0;
         return XXEMUL_STATUS_OK;
     }
@@ -8279,6 +10579,33 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         }
         if (!win_write(process, arg[0], bytes, length)) return XXEMUL_STATUS_ADDRESS_FAULT;
         if (extended) *result = 1u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "IsWow64Process") == 0) {
+        win_handle *entry = win_handle_at(process, arg[0]);
+        win_child_process *child = win_child_at(process, entry);
+        uint64_t pseudo = word_size == 8u ? UINT64_MAX : UINT32_MAX;
+        if (arg[0] != pseudo && (!entry || entry->kind != WIN_HANDLE_PROCESS ||
+            (!child && !win_is_current_process_handle(process, arg[0], word_size)))) {
+            process->last_error = 6u;
+            return XXEMUL_STATUS_OK;
+        }
+        /* OpenProcess retains requested process rights. Pseudo and newly
+         * created process handles carry full access in this owned profile. */
+        if (entry && !(entry->process_access & (0x1400u | 0x10000000u | 0x02000000u | 0x80000000u))) {
+            process->last_error = 5u;
+            return XXEMUL_STATUS_OK;
+        }
+        if (!arg[1] || !win_memory_span(process, arg[1], 4u) ||
+            !xxemul_windows_memory_access(process, arg[1], 4u, 1u, 0)) {
+            process->last_error = 998u;
+            return XXEMUL_STATUS_OK;
+        }
+        /* Match GetSystemInfo/GetNativeSystemInfo: each guest models native
+         * Win32 or native Win64. This does not report the host architecture
+         * and does not claim cross-architecture WoW64 execution. */
+        if (!win_store(process, arg[1], 4u, 0u)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = 1u;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "GetSystemInfo") == 0 || strcmp(name, "GetNativeSystemInfo") == 0) {
@@ -8640,7 +10967,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "_exit") == 0) {
-        process->process_terminated=1u;
+        win_runtime_abandon_process(process);process->process_terminated=1u;
         process->exit_code = (uint32_t)arg[0];
         return XXEMUL_STATUS_HALTED;
     }
@@ -8915,12 +11242,11 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "RtlPcToFileHeader") == 0) {
-        if (arg[1] != 0) win_store(process, arg[1], word_size, process->image_base);
-        *result = process->image_base;
-        return XXEMUL_STATUS_OK;
-    }
-    if (strcmp(name, "RtlUnwindEx") == 0 || strcmp(name, "RtlVirtualUnwind") == 0) {
-        *result = 0u;
+        uint64_t base = 0u;
+        xxemul_status status = win_image_owner_base(process, arg[0], &base);
+        if (status != XXEMUL_STATUS_OK) return status;
+        if (!win_store(process, arg[1], word_size, base)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        *result = base;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "DeviceIoControl") == 0) {
@@ -9215,6 +11541,58 @@ static xxemul_status win_qsort_continue(xxemul_windows *process, uint64_t curren
     return XXEMUL_STATUS_OK;
 }
 
+static int win_exception_api(xxemul_windows *process, const win_api *api, const uint64_t *arguments,
+                               uint64_t return_address, xxemul_step_info *info, xxemul_status *status);
+static xxemul_status win_seh_return(xxemul_windows *process, xxemul_step_info *info);
+static int win_seh_crt_api(xxemul_windows *, const char *, const uint64_t *, xxemul_status *);
+static int win_seh_crt_return(xxemul_windows *, win_seh_frame *, uint32_t, xxemul_status *);
+static int win_seh_crt_finish_target(xxemul_windows *, win_seh_frame *, xxemul_status *);
+static xxemul_status win_thread_yield(xxemul_windows *process, xxemul_step_info *info);
+static xxemul_status win_thread_finish(xxemul_windows *process, uint32_t code, xxemul_step_info *info);
+static void win_seh_abandon(xxemul_windows *process);
+static int win_exception_api_name(const char *name)
+{
+    return win_equal(name, "RtlAcquirePebLock") || win_equal(name, "RtlReleasePebLock") ||
+        win_equal(name, "InitializeCriticalSection") || win_equal(name, "InitializeCriticalSectionEx") ||
+        win_equal(name, "InitializeCriticalSectionAndSpinCount") || win_equal(name, "EnterCriticalSection") ||
+        win_equal(name, "LeaveCriticalSection") || win_equal(name, "TryEnterCriticalSection") || win_equal(name, "DeleteCriticalSection") ||
+        win_equal(name, "RtlInitializeCriticalSection") || win_equal(name, "RtlInitializeCriticalSectionEx") ||
+        win_equal(name, "RtlInitializeCriticalSectionAndSpinCount") || win_equal(name, "RtlEnterCriticalSection") ||
+        win_equal(name, "RtlLeaveCriticalSection") || win_equal(name, "RtlTryEnterCriticalSection") || win_equal(name, "RtlDeleteCriticalSection") ||
+        win_equal(name, "RaiseException") || win_equal(name, "RtlRaiseStatus") || win_equal(name, "RtlRaiseException") ||
+        win_equal(name, "NtRaiseException") || win_equal(name, "ZwRaiseException") || win_equal(name, "RtlUnwind") ||
+        win_equal(name, "RtlUnwindEx") || win_equal(name, "NtContinue") || win_equal(name, "ZwContinue") ||
+        win_equal(name, "RtlCaptureContext") || win_equal(name, "RtlRestoreContext") || win_equal(name, "RtlAddFunctionTable") ||
+        win_equal(name, "RtlDeleteFunctionTable") || win_equal(name, "RtlLookupFunctionEntry") || win_equal(name, "RtlVirtualUnwind") ||
+        win_equal(name, "RtlInstallFunctionTableCallback") ||
+        win_equal(name, "AddVectoredExceptionHandler") || win_equal(name, "RemoveVectoredExceptionHandler") ||
+        win_equal(name, "AddVectoredContinueHandler") || win_equal(name, "RemoveVectoredContinueHandler") ||
+        win_equal(name, "SetUnhandledExceptionFilter") || win_equal(name, "UnhandledExceptionFilter") || win_equal(name, "__C_specific_handler") ||
+        win_equal(name, "GetCurrentThread") || win_equal(name, "GetThreadContext") || win_equal(name, "SetThreadContext") ||
+        win_equal(name, "CreateThread") || win_equal(name, "ExitThread") || win_equal(name, "ResumeThread") ||
+        win_equal(name, "SuspendThread") || win_equal(name, "WaitForSingleObject") || win_equal(name, "WaitForMultipleObjects") ||
+        win_equal(name, "Sleep") || win_equal(name, "SleepEx") || win_equal(name, "SwitchToThread") ||
+        win_equal(name, "GetCurrentThreadId") || win_equal(name, "GetCurrentProcessId") || win_equal(name, "GetLastError") ||
+        win_equal(name, "SetLastError") || win_equal(name, "TlsAlloc") || win_equal(name, "TlsFree") ||
+        win_equal(name, "TlsGetValue") || win_equal(name, "TlsSetValue") || win_equal(name, "GetExitCodeThread") || win_equal(name, "CloseHandle") ||
+        win_equal(name, "RtlGetCurrentPeb") || win_equal(name, "IsDebuggerPresent") || win_equal(name, "CheckRemoteDebuggerPresent") ||
+        win_equal(name, "GetProcessHeap") || win_equal(name, "GetProcessHeaps") || win_equal(name, "RtlGetProcessHeaps") ||
+        win_equal(name, "RtlAllocateHeap") || win_equal(name, "RtlReAllocateHeap") || win_equal(name, "RtlFreeHeap") ||
+        win_equal(name, "RtlSizeHeap") || win_equal(name, "RtlValidateHeap") || win_equal(name, "HeapAlloc") ||
+        win_equal(name, "HeapFree") || win_equal(name, "HeapSize") || win_equal(name, "HeapValidate") || win_equal(name, "HeapReAlloc") ||
+        win_equal(name, "HeapCreate") || win_equal(name, "HeapDestroy") || win_equal(name, "GetCommandLineA") || win_equal(name, "GetCommandLineW") ||
+        win_equal(name, "GetEnvironmentVariableA") || win_equal(name, "GetEnvironmentVariableW") ||
+        win_equal(name, "SetEnvironmentVariableA") || win_equal(name, "SetEnvironmentVariableW") ||
+        win_equal(name, "GetEnvironmentStringsA") || win_equal(name, "GetEnvironmentStringsW") ||
+        win_equal(name, "FreeEnvironmentStringsA") || win_equal(name, "FreeEnvironmentStringsW") ||
+        win_equal(name, "GetCurrentDirectoryA") || win_equal(name, "GetCurrentDirectoryW") ||
+        win_equal(name, "SetCurrentDirectoryA") || win_equal(name, "SetCurrentDirectoryW") ||
+        win_equal(name, "GetModuleFileNameA") || win_equal(name, "GetModuleFileNameW") ||
+        win_equal(name, "GetVersion") || win_equal(name, "GetVersionExA") || win_equal(name, "GetVersionExW") ||
+        win_equal(name, "GetSystemInfo") || win_equal(name, "GetNativeSystemInfo") || win_equal(name, "NtQueryInformationProcess") ||
+        win_equal(name, "ZwQueryInformationProcess") || win_equal(name, "NtQueryInformationThread") || win_equal(name, "ZwQueryInformationThread");
+}
+
 static int win_arm_try_step(xxemul_windows *process, xxemul_step_info *info, xxemul_status *status)
 {
     xxemul *emulator = process->emulator;
@@ -9225,9 +11603,31 @@ static int win_arm_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
     unsigned i;
     win_api *api;
     xxemul_status call_status;
+    uint32_t timeout = 0u;
+    int wait_single, wait_multiple;
+    if (ip == process->runtime_base + WIN_THREAD_RETURN_OFFSET) {
+        *status = win_thread_finish(process, (uint32_t)emulator->arm.gpr[0], info); return 1;
+    }
+    if (ip == process->runtime_base + WIN_THREAD_START_OFFSET) {
+        win_thread_context *thread = &process->threads[process->thread_current];
+        thread->notify_started = 1u;
+        emulator->arm.pc = thread->start_address & (word_size == 8u ? UINT64_MAX : ~UINT64_C(1));
+        if (word_size == 4u) {
+            emulator->arm.pstate = (emulator->arm.pstate & ~UINT32_C(0x20)) | (thread->start_address & 1u ? 0x20u : 0u);
+            emulator->mode = emulator->arm.pstate & 0x20u ? XXEMUL_MODE_ARM_T32 : XXEMUL_MODE_ARM_A32;
+        }
+        *status = XXEMUL_STATUS_OK;
+        if (info) { memset(info, 0, sizeof(*info)); info->address = ip; info->next_address = emulator->arm.pc; }
+        return 1;
+    }
+    if (ip == process->runtime_base + WIN_SEH_RETURN_OFFSET) { *status = win_seh_return(process, info); return 1; }
     index = win_api_index(process, ip);
     if (index == SIZE_MAX) return 0;
     api = &process->apis[index];
+    if (api->unsupported) {
+        *status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        return 1;
+    }
     /* The shared implementations below use guest-memory addresses and
      * scalar arguments. Register-context and guest-callback APIs require
      * architecture-specific implementations and are deliberately rejected. */
@@ -9235,7 +11635,7 @@ static int win_arm_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
         strcmp(api->name, "LoadLibraryExW") && strcmp(api->name, "GetProcAddress") && strcmp(api->name, "VirtualProtect") &&
         strcmp(api->name, "FlushInstructionCache") && strcmp(api->name, "CacheSync") && strcmp(api->name, "ExitProcess") &&
         strcmp(api->name, "GetStdHandle") && strcmp(api->name, "WriteFile") && strcmp(api->name, "GetCurrentProcess") &&
-        strcmp(api->name, "GetModuleHandleA") && strcmp(api->name, "GetModuleHandleW")) {
+        strcmp(api->name, "GetModuleHandleA") && strcmp(api->name, "GetModuleHandleW") && !win_exception_api_name(api->name)) {
         *status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         return 1;
     }
@@ -9252,7 +11652,20 @@ static int win_arm_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
         *status = XXEMUL_STATUS_ADDRESS_FAULT;
         return 1;
     }
+    {
+        uint64_t error;
+        if (win_load(process, win_current_teb(process) + (word_size == 8u ? 0x68u : 0x34u), 4u, &error)) process->last_error = (uint32_t)error;
+    }
+    if (win_exception_api(process, api, arguments, return_address, info, status)) return 1;
+    if (win_equal(api->name, "ExitThread")) { *status = win_thread_finish(process, (uint32_t)arguments[0], info); return 1; }
+    wait_single = win_equal(api->name, "WaitForSingleObject");
+    wait_multiple = win_equal(api->name, "WaitForMultipleObjects");
+    if (wait_single || wait_multiple) {
+        unsigned index = wait_single ? 1u : 3u;
+        timeout = (uint32_t)arguments[index]; arguments[index] = 0u;
+    }
     call_status = win_call(process, api, arguments, &result);
+    (void)win_store(process, win_current_teb(process) + (word_size == 8u ? 0x68u : 0x34u), 4u, process->last_error);
     if (info != NULL) {
         info->address = ip;
         info->next_address = return_address & (word_size == 8u ? UINT64_MAX : ~UINT64_C(1));
@@ -9266,157 +11679,1415 @@ static int win_arm_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
             emulator->arm.pstate = (emulator->arm.pstate & ~UINT32_C(0x20)) | ((return_address & 1u) != 0u ? 0x20u : 0u);
             emulator->arm.pc = return_address & UINT32_C(0xfffffffe);
         } else emulator->arm.pc = return_address;
+        {
+            win_thread_context *thread = &process->threads[process->thread_current];
+            int yield = thread->blocked == 3u;
+            if ((wait_single || wait_multiple) && result == 0x102u && timeout) {
+                thread->blocked = 2u;
+                thread->deadline = timeout == UINT32_MAX ? UINT64_MAX : process->scheduler_tick + timeout;
+                thread->wait_count = wait_single ? 1u : (size_t)arguments[0];
+                thread->wait_all = (uint8_t)(wait_multiple && arguments[2]);
+                for (i = 0; i < thread->wait_count; ++i) {
+                    if (wait_single) thread->wait_handles[i] = arguments[0];
+                    else (void)win_load(process, arguments[1] + i * word_size, word_size, &thread->wait_handles[i]);
+                }
+                yield = 1;
+            }
+            if (win_equal(api->name, "Sleep") || win_equal(api->name, "SleepEx")) {
+                uint32_t delay = (uint32_t)arguments[0];
+                if (delay) { thread->blocked = 1u; thread->deadline = delay == UINT32_MAX ? UINT64_MAX : process->scheduler_tick + delay; }
+                yield = 1;
+            }
+            if ((win_equal(api->name, "CreateThread") && result) ||
+                ((win_equal(api->name, "ResumeThread") || win_equal(api->name, "SuspendThread")) && result != UINT32_MAX) ||
+                win_equal(api->name, "SwitchToThread")) yield = 1;
+            if (yield) { *status = win_thread_yield(process, info); return 1; }
+        }
     }
     *status = call_status;
     return 1;
 }
 
-static int win_seh_context(xxemul_windows *process, win_seh_frame *frame, int restore)
+/* Windows exceptions use guest stack records and asynchronous guest callbacks.
+ * The host never invokes a guest handler as a host function. */
+static uint64_t win_seh_sp(const xxemul_windows *process)
 {
-    static const unsigned registers[7] = {7, 6, 3, 2, 1, 0, 5};
-    static const unsigned segment_offsets[6] = {0x94, 0xbc, 0xc8, 0x98, 0x90, 0x8c};
-    xxemul_x86_state state = frame->saved;
-    uint64_t value;
-    unsigned index;
-    uint8_t zeros[0x2cc] = {0};
-    if (!restore && (!win_write(process, frame->context, zeros, sizeof(zeros)) ||
-                    !win_store(process, frame->context, 4u, 0x1003fu))) return 0;
-    for (index = 0; index < 7; ++index) {
-        if (restore) {
-            if (!win_load(process, frame->context + 0x9cu + index * 4u, 4u, &value)) return 0;
-            state.gpr[registers[index]] = value;
-        } else if (!win_store(process, frame->context + 0x9cu + index * 4u, 4u, state.gpr[registers[index]])) return 0;
-    }
-    for (index = 0; index < 6; ++index) {
-        if (restore) {
-            if (!win_load(process, frame->context + segment_offsets[index], 4u, &value)) return 0;
-            state.segment[index] = (uint16_t)value;
-        } else if (!win_store(process, frame->context + segment_offsets[index], 4u, state.segment[index])) return 0;
-    }
-    if (restore) {
-        if (!win_load(process, frame->context + 0xb8u, 4u, &state.ip) ||
-            !win_load(process, frame->context + 0xc0u, 4u, &state.flags) ||
-            !win_load(process, frame->context + 0xc4u, 4u, &state.gpr[XXEMUL_X86_RSP]) ||
-            !win_read(process, frame->context + 0x16cu, state.xmm, 8u * 16u)) return 0;
-        state.flags |= 2u;
-        process->emulator->x86 = state;
-    } else if (!win_store(process, frame->context + 0xb8u, 4u, state.ip) ||
-               !win_store(process, frame->context + 0xc0u, 4u, state.flags) ||
-               !win_store(process, frame->context + 0xc4u, 4u, state.gpr[XXEMUL_X86_RSP]) ||
-               !win_write(process, frame->context + 0x16cu, state.xmm, 8u * 16u)) return 0;
-    return 1;
+    return process->emulator->arch == XXEMUL_ARCH_ARM ? process->emulator->arm.sp : process->emulator->x86.gpr[XXEMUL_X86_RSP];
 }
 
-static int win_seh_next(xxemul_windows *process, win_seh_frame *frame)
+static uint64_t win_seh_ip(const xxemul_windows *process)
 {
-    uint64_t handler = 0, ignored;
-    size_t count = process->vectored_handler_count;
-    while (frame->vectored_cursor < count * 2u) {
-        size_t ordinal = frame->vectored_cursor++;
-        size_t index = ordinal < count ? count - ordinal - 1u : ordinal - count;
-        win_vectored_handler *entry = &process->vectored_handlers[index];
-        if (entry->active && (ordinal < count ? entry->first : !entry->first)) {
-            handler = entry->callback;
-            frame->vectored = 1;
-            break;
-        }
-    }
-    if (!handler) {
-        frame->vectored = 0;
-        if (!frame->registration || frame->registration == UINT32_MAX || ++frame->searched > 64u ||
-            !win_load(process, frame->registration + 4u, 4u, &handler)) return 0;
-    }
-    if (!handler || !win_load(process, handler, 1u, &ignored) ||
-        !win_store(process, frame->call_sp, 4u, process->runtime_base + WIN_SEH_RETURN_OFFSET) ||
-        !win_store(process, frame->call_sp + 4u, 4u, frame->vectored ? frame->record + 0x60u : frame->record) ||
-        !win_store(process, frame->call_sp + 8u, 4u, frame->registration) ||
-        !win_store(process, frame->call_sp + 12u, 4u, frame->context) ||
-        !win_store(process, frame->call_sp + 16u, 4u, 0u)) return 0;
-    if (!frame->vectored && (!win_store(process, frame->dispatcher, 4u, frame->registration) ||
-        !win_store(process, frame->dispatcher + 4u, 4u, 0u) || !win_store(process, process->runtime_base, 4u, frame->dispatcher))) return 0;
-    process->emulator->x86 = frame->saved;
-    process->emulator->x86.ip = handler;
-    process->emulator->x86.gpr[XXEMUL_X86_RSP] = frame->call_sp;
-    process->emulator->x86.flags &= ~UINT64_C(0x100);
-    process->emulator->halted = 0;
-    return 1;
+    return process->emulator->arch == XXEMUL_ARCH_ARM ? process->emulator->arm.pc : process->emulator->x86.ip;
 }
 
-int xxemul_windows_try_exception(xxemul_windows *process, const xxemul_x86_state *before, xxemul_status status, xxemul_step_info *info)
+static uint64_t win_seh_saved_sp(const xxemul_windows *process, const win_seh_frame *frame)
 {
-    win_seh_frame *frame;
-    uint64_t registration, frame_base, fault_address;
-    uint32_t code;
-    unsigned fault_access;
-    int has_vectored = 0;
-    size_t index;
-    if (!process || !before || process->emulator->mode != XXEMUL_MODE_X86_32 || process->seh_depth >= 8u ||
-        (status != XXEMUL_STATUS_BREAKPOINT && status != XXEMUL_WINDOWS_SINGLE_STEP_FAULT && status != XXEMUL_STATUS_ADDRESS_FAULT &&
-         status != XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION && status != XXEMUL_STATUS_DECODE_ERROR)) return 0;
-    fault_address = process->emulator->fault_address;
-    fault_access = process->emulator->fault_access;
-    for (index = 0; index < process->vectored_handler_count; ++index)
-        if (process->vectored_handlers[index].active) has_vectored = 1;
-    if (!win_load(process, process->runtime_base, 4u, &registration) ||
-        ((!registration || registration == UINT32_MAX) && !has_vectored) || before->gpr[XXEMUL_X86_RSP] < 0x500u) return 0;
-    frame_base = (before->gpr[XXEMUL_X86_RSP] - 0x400u) & ~UINT64_C(15);
-    frame = &process->seh_frames[process->seh_depth];
-    memset(frame, 0, sizeof(*frame));
-    frame->saved = *before;
-    if (status == XXEMUL_STATUS_BREAKPOINT) frame->saved.ip = process->emulator->x86.ip;
-    frame->call_sp = frame_base;
-    frame->record = frame_base + 0x20u;
-    frame->context = frame_base + 0x100u;
-    frame->registration = registration;
-    frame->original_registration = registration;
-    frame->dispatcher = frame_base + 0x90u;
-    frame->original_status = status;
-    code = status == XXEMUL_STATUS_BREAKPOINT ? 0x80000003u : status == XXEMUL_WINDOWS_SINGLE_STEP_FAULT ? 0x80000004u : status == XXEMUL_STATUS_ADDRESS_FAULT ? 0xc0000005u : 0xc000001du;
-    if (!win_seh_context(process, frame, 0) ||
-        !win_store(process, frame->record, 4u, code) || !win_store(process, frame->record + 4u, 4u, 0u) ||
-        !win_store(process, frame->record + 8u, 4u, 0u) || !win_store(process, frame->record + 12u, 4u, before->ip) ||
-        !win_store(process, frame->record + 16u, 4u, status == XXEMUL_STATUS_ADDRESS_FAULT ? 2u : 0u) ||
-        !win_store(process, frame->record + 20u, 4u, fault_access) ||
-        !win_store(process, frame->record + 24u, 4u, process->emulator->fault_address_valid ? fault_address : 0u) ||
-        !win_store(process, frame->record + 0x60u, 4u, frame->record) ||
-        !win_store(process, frame->record + 0x64u, 4u, frame->context) || !win_seh_next(process, frame)) return 0;
-    ++process->seh_depth;
+    return process->emulator->arch == XXEMUL_ARCH_ARM ? frame->saved_arm.sp : frame->saved.gpr[XXEMUL_X86_RSP];
+}
+
+static int win_seh_reader(void *context, uint64_t address, void *bytes, size_t size)
+{
+    return win_read((xxemul_windows *)context, address, bytes, size);
+}
+
+static void win_seh_step_info(xxemul_windows *process, xxemul_step_info *info, uint64_t address)
+{
     if (info) {
         memset(info, 0, sizeof(*info));
-        info->address = before->ip;
-        info->next_address = process->emulator->x86.ip;
+        info->address = address;
+        info->next_address = win_seh_ip(process);
     }
+}
+
+static xxemul_status win_seh_terminate(xxemul_windows *process, uint32_t code)
+{
+    size_t index;
+    process->exit_code = code;
+    process->emulator->exit_code = (uint8_t)code;
+    process->emulator->halted = 1u;
+    win_runtime_abandon_process(process);process->process_terminated = 1u;
+    for (index = 0; index < WIN_MAX_THREADS; ++index) {
+        if (process->threads[index].active) {
+            win_cbt_abandon_thread(process,process->threads[index].id);
+            process->threads[index].exit_code = code;
+            process->threads[index].active = 0u;
+        }
+    }
+    return XXEMUL_STATUS_HALTED;
+}
+
+static int win_seh_capture(xxemul_windows *process, win_seh_frame *frame)
+{
+    xxemul_status status;
+    size_t size = xxemul_windows_context_size(process->emulator);
+    memset(frame->saved_context, 0, sizeof(frame->saved_context));
+    if (process->emulator->arch == XXEMUL_ARCH_ARM)
+        status = xxemul_windows_context_capture_arm(process->emulator, &frame->saved_arm, frame->saved_context, size,
+                                                     xxemul_windows_context_all(process->emulator));
+    else status = xxemul_windows_context_capture(process->emulator, &frame->saved, frame->saved_context, size,
+                                                 xxemul_windows_context_all(process->emulator));
+    return status == XXEMUL_STATUS_OK && win_write(process, frame->context, frame->saved_context, size);
+}
+
+static int win_seh_record(xxemul_windows *process, win_seh_frame *frame)
+{
+    uint8_t bytes[0x98] = {0};
+    uint8_t width = win_word_size(process->emulator);
+    unsigned index;
+    win_put32(bytes, frame->code);
+    win_put32(bytes + 4u, frame->flags);
+    if (width == 8u) {
+        win_put64(bytes + 8u, frame->linked_record);
+        win_put64(bytes + 16u, frame->exception_address);
+        win_put32(bytes + 24u, frame->parameter_count);
+        for (index = 0; index < frame->parameter_count; ++index) win_put64(bytes + 32u + index * 8u, frame->information[index]);
+    } else {
+        win_put32(bytes + 8u, (uint32_t)frame->linked_record);
+        win_put32(bytes + 12u, (uint32_t)frame->exception_address);
+        win_put32(bytes + 16u, frame->parameter_count);
+        for (index = 0; index < frame->parameter_count; ++index) win_put32(bytes + 20u + index * 4u, (uint32_t)frame->information[index]);
+    }
+    return win_write(process, frame->record, bytes, width == 8u ? 0x98u : 0x50u) &&
+           win_store(process, frame->pointers, width, frame->record) &&
+           win_store(process, frame->pointers + width, width, frame->context);
+}
+
+static int win_seh_read_record(xxemul_windows *process, uint64_t address, win_seh_frame *frame)
+{
+    uint8_t bytes[0x98];
+    uint8_t width = win_word_size(process->emulator);
+    unsigned index;
+    if (!win_read(process, address, bytes, width == 8u ? 0x98u : 0x50u)) return 0;
+    frame->code = win_le32(bytes);
+    frame->flags = win_le32(bytes + 4u);
+    frame->linked_record = width == 8u ? win_le64(bytes + 8u) : win_le32(bytes + 8u);
+    frame->exception_address = width == 8u ? win_le64(bytes + 16u) : win_le32(bytes + 12u);
+    frame->parameter_count = win_le32(bytes + (width == 8u ? 24u : 16u));
+    if (frame->parameter_count > 15u) return 0;
+    for (index = 0; index < frame->parameter_count; ++index)
+        frame->information[index] = width == 8u ? win_le64(bytes + 32u + index * 8u) : win_le32(bytes + 20u + index * 4u);
     return 1;
+}
+
+static void win_seh_snapshot_vectored(xxemul_windows *process, win_seh_frame *frame, int continuation)
+{
+    uint64_t chosen[WIN_MAX_VECTORED_HANDLERS];
+    unsigned count = 0u, index, other;
+    for (index = 0; index < process->vectored_handler_count; ++index) {
+        win_vectored_handler *entry = &process->vectored_handlers[index];
+        if (!entry->active || entry->continuation != (uint8_t)continuation) continue;
+        other = count;
+        while (other) {
+            win_vectored_handler *previous = &process->vectored_handlers[chosen[other - 1u]];
+            int before = entry->first != previous->first ? entry->first :
+                         entry->first ? entry->order > previous->order : entry->order < previous->order;
+            if (!before) break;
+            chosen[other] = chosen[other - 1u];
+            --other;
+        }
+        chosen[other] = index;
+        ++count;
+    }
+    frame->vectored_count = count;
+    frame->vectored_cursor = 0u;
+    for (index = 0; index < count; ++index) frame->vectored_snapshot[index] = process->vectored_handlers[chosen[index]].handle;
+}
+
+static uint64_t win_seh_next_vectored(xxemul_windows *process, win_seh_frame *frame)
+{
+    while (frame->vectored_cursor < frame->vectored_count) {
+        uint64_t handle = frame->vectored_snapshot[frame->vectored_cursor++];
+        size_t index;
+        for (index = 0; index < process->vectored_handler_count; ++index)
+            if (process->vectored_handlers[index].active && process->vectored_handlers[index].handle == handle)
+                return process->vectored_handlers[index].callback;
+    }
+    return 0u;
+}
+
+static int win_seh_x86_registration(xxemul_windows *process, uint64_t address, uint64_t *next, uint64_t *handler)
+{
+    uint64_t low, high;
+    if (!address || address == UINT32_MAX || (address & 3u) ||
+        !win_load(process, win_current_teb(process) + 4u, 4u, &high) ||
+        !win_load(process, win_current_teb(process) + 8u, 4u, &low) ||
+        high < low || high - low < 8u || address < low || address > high - 8u ||
+        !win_load(process, address, 4u, next) || !win_load(process, address + 4u, 4u, handler)) return 0;
+    return *next == UINT32_MAX || (*next > address && !(*next & 3u));
+}
+
+static xxemul_status win_seh_lookup64(xxemul_windows *process, uint64_t pc, uint64_t *image_base,
+                                      xxemul_windows_runtime_function64 *function)
+{
+    xxemul_status status;
+    size_t index;
+    status = xxemul_windows_unwind64_lookup_dynamic(win_seh_reader, process, &process->function_tables, pc, image_base, function);
+    if (status != XXEMUL_STATUS_OK || function->address) return status;
+    if (pc >= process->image_base && pc - process->image_base < process->image_size) {
+        *image_base = process->image_base;
+        return xxemul_windows_unwind64_lookup_image(win_seh_reader, process, process->image_base, process->image_size, pc, function);
+    }
+    for (index = 0; index < process->module_count; ++index) {
+        win_module *module = &process->modules[index];
+        if (module->live && pc >= module->base && pc - module->base < module->image_size) {
+            *image_base = module->base;
+            return xxemul_windows_unwind64_lookup_image(win_seh_reader, process, module->base, module->image_size, pc, function);
+        }
+    }
+    *image_base = 0u;
+    memset(function, 0, sizeof(*function));
+    return XXEMUL_STATUS_OK;
+}
+
+static int win_seh_authenticate_lr(void *context, uint64_t signed_lr, uint64_t caller_sp, uint64_t *unsigned_lr)
+{
+    return xxemul_arm_auth_check(((xxemul_windows *)context)->emulator, signed_lr, caller_sp, 1u, unsigned_lr);
+}
+
+static xxemul_status win_seh_lookup_arm(xxemul_windows *process, uint64_t pc, uint64_t *image_base,
+                                         xxemul_windows_runtime_function_arm *function)
+{
+    xxemul_status status;
+    size_t index;
+    int is64 = win_word_size(process->emulator) == 8u;
+    status = xxemul_windows_unwind_arm_lookup_dynamic(win_seh_reader, process, is64, &process->arm_function_tables, pc, image_base, function);
+    if (status != XXEMUL_STATUS_OK || function->address) return status;
+    if (pc >= process->image_base && pc - process->image_base < process->image_size) {
+        *image_base = process->image_base;
+        return xxemul_windows_unwind_arm_lookup_image(win_seh_reader, process, is64, process->image_base, process->image_size, pc, function);
+    }
+    for (index = 0; index < process->module_count; ++index) {
+        win_module *module = &process->modules[index];
+        if (module->live && pc >= module->base && pc - module->base < module->image_size) {
+            *image_base = module->base;
+            return xxemul_windows_unwind_arm_lookup_image(win_seh_reader, process, is64, module->base, module->image_size, pc, function);
+        }
+    }
+    *image_base = 0u;
+    memset(function, 0, sizeof(*function));
+    return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status win_seh_invoke(xxemul_windows *process, win_seh_frame *frame, uint64_t handler,
+                                    unsigned kind, const uint64_t *arguments, unsigned count)
+{
+    xxemul *e = process->emulator;
+    uint8_t width = win_word_size(e);
+    unsigned index;
+    xxemul_status status = xxemul_windows_context_restore(e, frame->saved_context, xxemul_windows_context_size(e));
+    if (status != XXEMUL_STATUS_OK) return status;
+    frame->call_kind = kind;
+    if (e->arch == XXEMUL_ARCH_ARM) {
+        unsigned registers = width == 8u ? 8u : 4u;
+        e->arm.sp = frame->call_sp & ~(uint64_t)(width == 8u ? 15u : 7u);
+        e->arm.gpr[width == 8u ? 30u : 14u] = process->runtime_base + WIN_SEH_RETURN_OFFSET;
+        for (index = 0; index < count; ++index) {
+            if (index < registers) e->arm.gpr[index] = arguments[index] & (width == 8u ? UINT64_MAX : UINT32_MAX);
+            else if (!win_store(process, e->arm.sp + (index - registers) * width, width, arguments[index])) return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        if (width == 4u) {
+            e->mode = handler & 1u ? XXEMUL_MODE_ARM_T32 : XXEMUL_MODE_ARM_A32;
+            e->arm.pstate = (e->arm.pstate & ~UINT32_C(0x20)) | (handler & 1u ? 0x20u : 0u);
+            e->arm.pc = handler & ~UINT64_C(1);
+        } else e->arm.pc = handler;
+    } else {
+        if (!win_store(process, frame->call_sp, width, process->runtime_base + WIN_SEH_RETURN_OFFSET)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (width == 8u) {
+            static const unsigned regs[4] = {XXEMUL_X86_RCX, XXEMUL_X86_RDX, XXEMUL_X86_R8, XXEMUL_X86_R9};
+            for (index = 0; index < count; ++index) {
+                if (index < 4u) e->x86.gpr[regs[index]] = arguments[index];
+                else if (!win_store(process, frame->call_sp + 0x28u + (index - 4u) * 8u, 8u, arguments[index])) return XXEMUL_STATUS_ADDRESS_FAULT;
+            }
+        } else {
+            for (index = 0; index < count; ++index)
+                if (!win_store(process, frame->call_sp + 4u + index * 4u, 4u, arguments[index])) return XXEMUL_STATUS_ADDRESS_FAULT;
+        }
+        e->x86.ip = handler;
+        e->x86.gpr[XXEMUL_X86_RSP] = frame->call_sp;
+        e->x86.flags &= ~UINT64_C(0x100);
+    }
+    if (e->arch == XXEMUL_ARCH_X86 && width == 4u && kind == WIN_SEH_CALL_FRAME) {
+        if (!win_store(process, frame->dispatcher, 4u, frame->registration) ||
+            !win_store(process, frame->dispatcher + 4u, 4u, process->runtime_base + WIN_SEH_NESTED_OFFSET) ||
+            !win_store(process, frame->dispatcher + 8u, 4u, frame->registration) ||
+            !win_store(process, win_current_teb(process), 4u, frame->dispatcher)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    }
+    e->halted = 0u;
+    return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status win_seh_next(xxemul_windows *process, win_seh_frame *frame);
+static xxemul_status win_seh_longjump_context(xxemul_windows *process, uint64_t record_address, uint8_t *context, size_t size);
+
+static xxemul_status win_seh_restore(xxemul_windows *process, win_seh_frame *frame)
+{
+    uint8_t bytes[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+    size_t size = xxemul_windows_context_size(process->emulator);
+    xxemul_status status;
+    if (!win_read(process, frame->context, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    status = xxemul_windows_context_validate(process->emulator, bytes, size);
+    if (status != XXEMUL_STATUS_OK) return status;
+    if (process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u &&
+        !win_store(process, win_current_teb(process), 4u, frame->original_registration)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    status = xxemul_windows_context_restore(process->emulator, bytes, size);
+    if (status == XXEMUL_STATUS_OK) --process->seh_depth;
+    return status;
+}
+
+static xxemul_status win_seh_resume(xxemul_windows *process, win_seh_frame *frame)
+{
+    frame->phase = WIN_SEH_VCH;
+    win_seh_snapshot_vectored(process, frame, 1);
+    return win_seh_next(process, frame);
+}
+
+static int win_seh_arena(xxemul_windows *process, win_seh_frame *frame, uint64_t sp)
+{
+    uint8_t width = win_word_size(process->emulator);
+    if (sp < 0x1000u) return 0;
+    frame->frame_base = (sp - 0x1000u) & ~UINT64_C(15);
+    if (!win_memory_span(process, frame->frame_base, 0x1000u)) return 0;
+    frame->call_sp = frame->frame_base + (width == 8u ? 0x18u : 0x10u);
+    frame->record = frame->frame_base + 0x80u;
+    frame->pointers = frame->frame_base + 0x120u;
+    frame->dispatcher = frame->frame_base + 0x140u;
+    frame->context = frame->frame_base + 0x200u;
+    frame->walk_context = frame->frame_base + 0x700u;
+    return 1;
+}
+
+static xxemul_status win_seh_begin(xxemul_windows *process, const xxemul_x86_state *cpu,
+                                   const xxemul_arm_state *arm, uint32_t code, uint32_t flags,
+                                   uint64_t address, uint64_t linked, unsigned count,
+                                   const uint64_t *parameters, xxemul_status original, int first_chance)
+{
+    win_seh_frame *frame;
+    unsigned index;
+    if (process->seh_depth >= WIN_MAX_SEH_DEPTH) return win_seh_terminate(process, 0xc00000fdu);
+    frame = &process->seh_frames[process->seh_depth];
+    memset(frame, 0, sizeof(*frame));
+    frame->saved = cpu ? *cpu : process->emulator->x86;
+    frame->saved_arm = arm ? *arm : process->emulator->arm;
+    frame->saved_mode = process->emulator->mode;
+    frame->walk = frame->saved;
+    frame->walk_arm = frame->saved_arm;
+    if (!win_seh_arena(process, frame, win_seh_saved_sp(process, frame))) return win_seh_terminate(process, 0xc00000fdu);
+    frame->kind = WIN_SEH_DISPATCH;
+    frame->phase = first_chance ? WIN_SEH_VEH : WIN_SEH_UNHANDLED;
+    frame->original_status = original;
+    frame->code = code;
+    frame->flags = flags;
+    frame->linked_record = linked;
+    frame->exception_address = address;
+    frame->parameter_count = count;
+    for (index = 0; index < count; ++index) frame->information[index] = parameters[index];
+    if (process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u &&
+        !win_load(process, win_current_teb(process), 4u, &frame->original_registration)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    frame->registration = frame->original_registration;
+    if (!win_seh_capture(process, frame) || !win_seh_record(process, frame)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    win_seh_snapshot_vectored(process, frame, 0);
+    ++process->seh_depth;
+    return win_seh_next(process, frame);
+}
+
+static xxemul_status win_seh_secondary(xxemul_windows *process, win_seh_frame *frame, uint32_t code)
+{
+    uint64_t record = frame->record;
+    return win_seh_begin(process, &process->emulator->x86, &process->emulator->arm,
+                         code, 1u, win_seh_ip(process), record, 0u, NULL,
+                         XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, 1);
+}
+
+static win_function_callback *win_seh_find_callback(xxemul_windows *process, uint64_t pc)
+{
+    size_t index;
+    for (index = 0; index < 64u; ++index) {
+        win_function_callback *entry = &process->function_callbacks[index];
+        if (entry->active && pc >= entry->base && pc < entry->end) return entry;
+    }
+    return NULL;
+}
+
+static xxemul_status win_seh_validate_lookup(xxemul_windows *process, win_seh_frame *frame,
+                                             xxemul_windows_runtime_function64 *function,
+                                             xxemul_windows_runtime_function_arm *arm_function)
+{
+    if (process->emulator->arch == XXEMUL_ARCH_ARM) {
+        memset(arm_function, 0, sizeof(*arm_function));
+        if (!frame->lookup_result) return XXEMUL_STATUS_OK;
+        {
+            xxemul_status status = xxemul_windows_unwind_arm_lookup_table(win_seh_reader, process, win_word_size(process->emulator) == 8u,
+                frame->lookup_result, 1u, frame->lookup_base, frame->control_pc, arm_function);
+            return status == XXEMUL_STATUS_OK && !arm_function->address ? XXEMUL_STATUS_INVALID_IMAGE : status;
+        }
+    }
+    memset(function, 0, sizeof(*function));
+    if (!frame->lookup_result) return XXEMUL_STATUS_OK;
+    {
+        xxemul_status status = xxemul_windows_unwind64_lookup_table(win_seh_reader, process, frame->lookup_result, 1u,
+            frame->lookup_base, frame->control_pc, function);
+        return status == XXEMUL_STATUS_OK && !function->address ? XXEMUL_STATUS_INVALID_IMAGE : status;
+    }
+}
+
+static xxemul_status win_seh_walk_next(xxemul_windows *process, win_seh_frame *frame, uint64_t *handler)
+{
+    xxemul *e = process->emulator;
+    xxemul_status status;
+    uint64_t previous_sp, next_sp, low, high, pc;
+    unsigned width = win_word_size(e);
+    *handler = 0u;
+    pc = e->arch == XXEMUL_ARCH_ARM ? frame->walk_arm.pc : frame->walk.ip;
+    if (!pc && frame->walk_started) return XXEMUL_STATUS_OK;
+    if (++frame->searched > WIN_MAX_SEH_SEARCH) return XXEMUL_STATUS_INVALID_IMAGE;
+    if (pc == process->runtime_base + WIN_SEH_RETURN_OFFSET) {
+        size_t index = process->seh_depth - 1u;
+        while (index) {
+            win_seh_frame *outer = &process->seh_frames[--index];
+            uint64_t walk_sp = e->arch == XXEMUL_ARCH_ARM ? frame->walk_arm.sp : frame->walk.gpr[XXEMUL_X86_RSP];
+            if (walk_sp >= outer->call_sp && walk_sp < outer->frame_base + 0x1000u) {
+                frame->walk = outer->walk;
+                frame->walk_arm = outer->walk_arm;
+                frame->walk_started = 0u;
+                frame->scope_resume_index = frame->kind == WIN_SEH_UNWIND ? outer->scope_index : 0u;
+                frame->flags |= frame->kind == WIN_SEH_UNWIND ? 0x40u : 0x10u;
+                return win_seh_walk_next(process, frame, handler);
+            }
+        }
+        return XXEMUL_STATUS_INVALID_IMAGE;
+    }
+    previous_sp = e->arch == XXEMUL_ARCH_ARM ? frame->walk_arm.sp : frame->walk.gpr[XXEMUL_X86_RSP];
+    frame->control_pc_unwound = frame->walk_started != 0u;
+    frame->control_pc = pc - (frame->walk_started ? (e->arch == XXEMUL_ARCH_ARM ? (width == 8u ? 4u : 2u) : 1u) : 0u);
+    if (!frame->lookup_ready) {
+        win_function_callback *entry = win_seh_find_callback(process, frame->control_pc);
+        if (entry) {
+            frame->lookup_callback = entry->callback;
+            frame->lookup_parameter = entry->context;
+            frame->lookup_base = entry->base;
+            frame->walk_pending = 1u;
+            return WIN_SEH_CALLBACK_PENDING;
+        }
+    }
+    if (e->arch == XXEMUL_ARCH_ARM) {
+        xxemul_windows_runtime_function_arm function;
+        xxemul_windows_unwind_arm_result result;
+        memset(&function, 0, sizeof(function));
+        if (frame->lookup_ready) {
+            status = win_seh_validate_lookup(process, frame, NULL, &function);
+            frame->image_base = frame->lookup_base;
+            frame->lookup_ready = 0u;
+        } else status = win_seh_lookup_arm(process, frame->control_pc, &frame->image_base, &function);
+        if (status != XXEMUL_STATUS_OK) return status;
+        frame->function_entry = function.address;
+        frame->next_walk_arm = frame->walk_arm;
+        status = xxemul_windows_unwind_arm_virtual_unwind_ex(win_seh_reader, process, width == 8u, frame->image_base,
+            frame->control_pc, &function, frame->kind == WIN_SEH_UNWIND ? 2u : 1u, &frame->next_walk_arm, &result,
+            win_seh_authenticate_lr);
+        if (status != XXEMUL_STATUS_OK) return status;
+        frame->establisher_frame = result.establisher_frame;
+        frame->handler_data = result.handler_data;
+        *handler = result.handler;
+        next_sp = frame->next_walk_arm.sp;
+        pc = frame->next_walk_arm.pc;
+    } else {
+        xxemul_windows_runtime_function64 function;
+        xxemul_windows_unwind64_result result;
+        memset(&function, 0, sizeof(function));
+        if (frame->lookup_ready) {
+            status = win_seh_validate_lookup(process, frame, &function, NULL);
+            frame->image_base = frame->lookup_base;
+            frame->lookup_ready = 0u;
+        } else status = win_seh_lookup64(process, frame->control_pc, &frame->image_base, &function);
+        if (status != XXEMUL_STATUS_OK) return status;
+        frame->function_entry = function.address;
+        frame->next_walk = frame->walk;
+        status = xxemul_windows_unwind64_virtual_unwind(win_seh_reader, process, frame->image_base,
+            frame->control_pc, &function, frame->kind == WIN_SEH_UNWIND ? 2u : 1u, &frame->next_walk, &result);
+        if (status != XXEMUL_STATUS_OK) return status;
+        frame->establisher_frame = result.establisher_frame;
+        frame->handler_data = result.handler_data;
+        *handler = result.handler;
+        next_sp = frame->next_walk.gpr[XXEMUL_X86_RSP];
+        pc = frame->next_walk.ip;
+    }
+    frame->walk_pending = 0u;
+    if (!win_load(process, win_current_teb(process) + width, (uint8_t)width, &high) ||
+        !win_load(process, win_current_teb(process) + width * 2u, (uint8_t)width, &low)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    if (previous_sp < low || previous_sp > high || frame->establisher_frame < low || frame->establisher_frame > high ||
+        (pc && (next_sp < previous_sp || next_sp > high))) return XXEMUL_STATUS_INVALID_IMAGE;
+    frame->at_target = frame->kind == WIN_SEH_UNWIND && frame->target_frame && frame->establisher_frame == frame->target_frame;
+    if (frame->kind == WIN_SEH_UNWIND && frame->target_frame && frame->establisher_frame > frame->target_frame)
+        return XXEMUL_STATUS_INVALID_IMAGE;
+    if (frame->at_target) frame->flags |= 0x20u;
+    else frame->flags &= ~0x20u;
+    return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status win_seh_frame_context(xxemul_windows *process, win_seh_frame *frame,
+                                            const xxemul_x86_state *cpu, const xxemul_arm_state *arm,
+                                            uint8_t *bytes, size_t size)
+{
+    xxemul shadow = *process->emulator;
+    xxemul_status status = xxemul_windows_context_restore(&shadow, frame->saved_context, size);
+    if (status != XXEMUL_STATUS_OK) return status;
+    memcpy(bytes, frame->saved_context, size);
+    if (shadow.arch == XXEMUL_ARCH_ARM)
+        return xxemul_windows_context_capture_arm(&shadow, arm, bytes, size, xxemul_windows_context_all(&shadow));
+    return xxemul_windows_context_capture(&shadow, cpu, bytes, size, xxemul_windows_context_all(&shadow));
+}
+
+static int win_seh_dispatcher64(xxemul_windows *process, win_seh_frame *frame, uint64_t handler)
+{
+    unsigned width = win_word_size(process->emulator);
+    uint8_t bytes[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+    size_t size = xxemul_windows_context_size(process->emulator);
+    xxemul_status status;
+    status = win_seh_frame_context(process, frame, &frame->walk, &frame->walk_arm, bytes, size);
+    if (status != XXEMUL_STATUS_OK || !win_write(process, frame->walk_context, bytes, size)) return 0;
+    if (process->emulator->arch == XXEMUL_ARCH_ARM) {
+        uint8_t nonvolatile[152] = {0};
+        uint64_t address = frame->frame_base + 0xc00u;
+        unsigned index, integer_count = width == 8u ? 11u : 8u;
+        unsigned pointer_offset = width == 8u ? 0x50u : 0x2cu;
+        for (index = 0; index < integer_count; ++index) {
+            if (width == 8u) win_put64(nonvolatile + index * 8u, frame->walk_arm.gpr[19u + index]);
+            else win_put32(nonvolatile + index * 4u, (uint32_t)frame->walk_arm.gpr[4u + index]);
+        }
+        for (index = 0; index < 8u; ++index) {
+            const uint8_t *value = frame->walk_arm.v[index + 8u];
+            memcpy(nonvolatile + integer_count * width + index * 8u, value, 8u);
+        }
+        if (!win_write(process, address, nonvolatile, integer_count * width + 64u) ||
+            !win_store(process, frame->dispatcher + pointer_offset, (uint8_t)width, address) ||
+            (width == 4u && !win_store(process, frame->dispatcher + 0x30u, 4u, 0u))) return 0;
+    }
+    return win_store(process, frame->dispatcher, (uint8_t)width, frame->control_pc) &&
+        win_store(process, frame->dispatcher + width, (uint8_t)width, frame->image_base) &&
+        win_store(process, frame->dispatcher + width * 2u, (uint8_t)width, frame->function_entry) &&
+        win_store(process, frame->dispatcher + width * 3u, (uint8_t)width, frame->establisher_frame) &&
+        win_store(process, frame->dispatcher + width * 4u, (uint8_t)width, frame->target_ip) &&
+        win_store(process, frame->dispatcher + width * 5u, (uint8_t)width, frame->walk_context) &&
+        win_store(process, frame->dispatcher + width * 6u, (uint8_t)width, handler) &&
+        win_store(process, frame->dispatcher + width * 7u, (uint8_t)width, frame->handler_data) &&
+        win_store(process, frame->dispatcher + width * 8u, (uint8_t)width, 0u) &&
+        win_store(process, frame->dispatcher + width * 9u, 4u, frame->scope_resume_index) &&
+        win_store(process, frame->dispatcher + width * 9u + 4u, 4u, frame->control_pc_unwound);
+}
+
+static xxemul_status win_seh_finish_unwind(xxemul_windows *process, win_seh_frame *frame)
+{
+    xxemul *e = process->emulator;
+    uint8_t bytes[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+    size_t size = xxemul_windows_context_size(e);
+    xxemul_status status;
+    if (win_seh_crt_finish_target(process, frame, &status)) return status;
+    if (e->arch == XXEMUL_ARCH_X86 && win_word_size(e) == 4u) {
+        frame->saved.gpr[XXEMUL_X86_RAX] = (uint32_t)frame->return_value;
+        if (win_seh_frame_context(process, frame, &frame->saved, &frame->saved_arm, bytes, size) != XXEMUL_STATUS_OK)
+            return XXEMUL_STATUS_INVALID_ARGUMENT;
+        memcpy(frame->saved_context, bytes, size);
+        if (!win_store(process, win_current_teb(process), 4u, frame->registration)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        status = xxemul_windows_context_restore(e, frame->saved_context, size);
+    } else {
+        if (!frame->target_frame) return win_seh_terminate(process, frame->code);
+        memcpy(bytes, frame->saved_context, size);
+        if (e->arch == XXEMUL_ARCH_ARM) {
+            frame->walk_arm.pc = frame->target_ip & (win_word_size(e) == 8u ? UINT64_MAX : ~UINT64_C(1));
+            frame->walk_arm.sp = frame->establisher_frame;
+            if (win_word_size(e) == 4u) frame->walk_arm.pstate |= frame->target_ip & 1u ? 0x20u : 0u;
+            frame->walk_arm.gpr[0] = frame->return_value;
+            status = win_seh_frame_context(process, frame, &frame->walk, &frame->walk_arm, bytes, size);
+        } else {
+            frame->walk.ip = frame->target_ip;
+            frame->walk.gpr[XXEMUL_X86_RSP] = frame->establisher_frame;
+            frame->walk.gpr[XXEMUL_X86_RAX] = frame->return_value;
+            status = win_seh_frame_context(process, frame, &frame->walk, &frame->walk_arm, bytes, size);
+        }
+        if (status != XXEMUL_STATUS_OK) return status;
+        if (frame->code == 0x80000026u) {
+            status = win_seh_longjump_context(process, frame->record, bytes, size);
+            if (status != XXEMUL_STATUS_OK) return status;
+        }
+        if (frame->unwind_context && !win_write(process, frame->unwind_context, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (frame->code == 0x80000029u) {
+            xxemul shadow = *e;
+            uint64_t argument = frame->record;
+            if (!frame->parameter_count || !frame->information[0]) return XXEMUL_STATUS_INVALID_ARGUMENT;
+            status = xxemul_windows_context_restore(&shadow, bytes, size);
+            if (status != XXEMUL_STATUS_OK) return status;
+            frame->saved = shadow.x86; frame->saved_arm = shadow.arm;
+            frame->walk = shadow.x86; frame->walk_arm = shadow.arm;
+            frame->kind = WIN_SEH_CONSOLIDATE;
+            if (frame->unwind_context) frame->context = frame->unwind_context;
+            else if (!win_write(process, frame->context, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            memcpy(frame->saved_context, bytes, size);
+            return win_seh_invoke(process, frame, frame->information[0], WIN_SEH_CALL_CONSOLIDATE, &argument, 1u);
+        }
+        status = xxemul_windows_context_restore(e, bytes, size);
+    }
+    if (status == XXEMUL_STATUS_OK) {
+        uint64_t sp = win_seh_sp(process);
+        --process->seh_depth;
+        while (process->seh_depth && sp >= win_seh_saved_sp(process, &process->seh_frames[process->seh_depth - 1u])) --process->seh_depth;
+    }
+    return status;
+}
+
+static xxemul_status win_seh_next(xxemul_windows *process, win_seh_frame *frame)
+{
+    uint64_t handler, arguments[4], next, ignored;
+    xxemul_status status;
+    unsigned width = win_word_size(process->emulator);
+    for (;;) {
+        if (frame->phase == WIN_SEH_VEH || frame->phase == WIN_SEH_VCH) {
+            handler = win_seh_next_vectored(process, frame);
+            if (handler) {
+                arguments[0] = frame->pointers;
+                return win_seh_invoke(process, frame, handler,
+                    frame->phase == WIN_SEH_VEH ? WIN_SEH_CALL_VEH : WIN_SEH_CALL_VCH, arguments, 1u);
+            }
+            if (frame->phase == WIN_SEH_VCH) return win_seh_restore(process, frame);
+            frame->phase = WIN_SEH_FRAMES;
+        }
+        if (frame->phase == WIN_SEH_FRAMES) {
+            if (process->emulator->arch == XXEMUL_ARCH_X86 && width == 4u) {
+                if (frame->kind == WIN_SEH_UNWIND && frame->registration == frame->target_frame)
+                    return win_seh_finish_unwind(process, frame);
+                if (!frame->registration || frame->registration == UINT32_MAX) {
+                    if (frame->kind == WIN_SEH_UNWIND) {
+                        if (frame->target_frame) return win_seh_secondary(process, frame, 0xc0000029u);
+                        return win_seh_finish_unwind(process, frame);
+                    }
+                    frame->phase = WIN_SEH_UNHANDLED;
+                    continue;
+                }
+                if (++frame->searched > WIN_MAX_SEH_SEARCH ||
+                    !win_seh_x86_registration(process, frame->registration, &next, &handler))
+                    return win_seh_secondary(process, frame, 0xc0000028u);
+                frame->next_registration = next;
+                if (handler == process->runtime_base + WIN_SEH_NESTED_OFFSET) {
+                    if (frame->kind == WIN_SEH_DISPATCH) {
+                        frame->flags |= 0x10u;
+                        if (!win_load(process, frame->registration + 8u, 4u, &ignored)) return XXEMUL_STATUS_ADDRESS_FAULT;
+                        if (ignored > frame->nested_frame) frame->nested_frame = ignored;
+                    }
+                    frame->registration = next;
+                    continue;
+                }
+                if (frame->kind == WIN_SEH_UNWIND && frame->target_frame && frame->registration > frame->target_frame)
+                    return win_seh_secondary(process, frame, 0xc0000029u);
+                frame->establisher_frame = frame->registration;
+            } else {
+                if (frame->walk_started && !frame->walk_pending) {
+                    if (frame->at_target) return win_seh_finish_unwind(process, frame);
+                    frame->walk = frame->next_walk;
+                    frame->walk_arm = frame->next_walk_arm;
+                }
+                if (frame->walk_started && !(process->emulator->arch == XXEMUL_ARCH_ARM ? frame->walk_arm.pc : frame->walk.ip)) {
+                    if (frame->kind == WIN_SEH_UNWIND) return win_seh_finish_unwind(process, frame);
+                    frame->phase = WIN_SEH_UNHANDLED;
+                    continue;
+                }
+                status = win_seh_walk_next(process, frame, &handler);
+                if (status == WIN_SEH_CALLBACK_PENDING) {
+                    arguments[0] = frame->control_pc;
+                    arguments[1] = frame->lookup_parameter;
+                    return win_seh_invoke(process, frame, frame->lookup_callback, WIN_SEH_CALL_FUNCTION_TABLE, arguments, 2u);
+                }
+                if (status != XXEMUL_STATUS_OK) {
+                    if (frame->kind == WIN_SEH_DISPATCH &&
+                        (status == XXEMUL_STATUS_ADDRESS_FAULT || status == XXEMUL_STATUS_INVALID_IMAGE)) {
+                        frame->flags |= 8u; /* EXCEPTION_STACK_INVALID: stop the frame search. */
+                        if (!win_seh_record(process, frame)) return XXEMUL_STATUS_ADDRESS_FAULT;
+                        frame->phase = WIN_SEH_UNHANDLED;
+                        continue;
+                    }
+                    return status;
+                }
+                frame->walk_started = 1u;
+                if (!handler) continue;
+                if (!win_seh_dispatcher64(process, frame, handler)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            }
+            if (!win_seh_record(process, frame)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            arguments[0] = frame->record;
+            arguments[1] = frame->establisher_frame;
+            arguments[2] = frame->context;
+            arguments[3] = process->emulator->arch == XXEMUL_ARCH_X86 && width == 4u ? frame->dispatcher + 8u : frame->dispatcher;
+            return win_seh_invoke(process, frame, handler, WIN_SEH_CALL_FRAME, arguments, 4u);
+        }
+        if (frame->phase == WIN_SEH_UNHANDLED) {
+            if (process->unhandled_filter) {
+                arguments[0] = frame->pointers;
+                frame->phase = WIN_SEH_RESUME;
+                return win_seh_invoke(process, frame, process->unhandled_filter, WIN_SEH_CALL_UNHANDLED, arguments, 1u);
+            }
+            return win_seh_terminate(process, frame->code);
+        }
+        return win_seh_terminate(process, frame->code);
+    }
+}
+
+/* The OS C scope handler implements the public SCOPE_TABLE ABI. Native C++
+ * language personalities remain guest functions; exceptions are not invented. */
+static xxemul_status win_seh_longjump_context(xxemul_windows *process, uint64_t record_address,
+                                               uint8_t *context, size_t size)
+{
+    win_seh_frame record;
+    uint8_t jump[256];
+    unsigned index, width = win_word_size(process->emulator);
+    memset(&record, 0, sizeof(record));
+    if (!win_seh_read_record(process, record_address, &record)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    if (record.code != 0x80000026u) return XXEMUL_STATUS_OK;
+    /* Win32 longjmp is restored by its CRT; the Windows table-unwind ABI
+     * applies to x64 and the two Windows ARM architectures. */
+    if (process->emulator->arch == XXEMUL_ARCH_X86 && width == 4u) return XXEMUL_STATUS_OK;
+    if (!record.parameter_count || !record.information[0]) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (process->emulator->arch == XXEMUL_ARCH_X86) {
+        static const unsigned gp_context[10] = {144u, 152u, 160u, 168u, 176u, 216u, 224u, 232u, 240u, 248u};
+        if (!win_read(process, record.information[0], jump, 256u)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        for (index = 0; index < 10u; ++index) win_put64(context + gp_context[index], win_le64(jump + 8u + index * 8u));
+        win_put32(context + 52u, win_le32(jump + 88u));
+        win_put32(context + 280u, win_le32(jump + 88u));
+        context[256u] = jump[92u]; context[257u] = jump[93u];
+        memcpy(context + 512u, jump + 96u, 160u);
+        win_put32(context + 48u, win_le32(context + 48u) | 0x10000bu);
+    } else if (width == 4u) {
+        if (!win_read(process, record.information[0], jump, 112u)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        for (index = 0; index < 8u; ++index) win_put32(context + 20u + index * 4u, win_le32(jump + 4u + index * 4u));
+        win_put32(context + 56u, win_le32(jump + 36u));
+        win_put32(context + 64u, win_le32(jump + 40u) & ~1u);
+        win_put32(context + 68u, win_le32(context + 68u) | (win_le32(jump + 40u) & 1u ? 0x20u : 0u));
+        win_put32(context + 72u, win_le32(jump + 44u));
+        memcpy(context + 144u, jump + 48u, 64u);
+        win_put32(context, win_le32(context) | 0x200007u);
+    } else {
+        if (!win_read(process, record.information[0], jump, 192u)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        for (index = 0; index < 12u; ++index) win_put64(context + 160u + index * 8u, win_le64(jump + 16u + index * 8u));
+        win_put64(context + 256u, win_le64(jump + 112u));
+        win_put64(context + 264u, win_le64(jump + 104u));
+        win_put32(context + 784u, win_le32(jump + 120u));
+        win_put32(context + 788u, win_le32(jump + 124u));
+        for (index = 0; index < 8u; ++index) memcpy(context + 400u + index * 16u, jump + 128u + index * 8u, 8u);
+        win_put32(context, win_le32(context) | 0x400007u);
+    }
+    return xxemul_windows_context_validate(process->emulator, context, size);
+}
+
+static void win_seh_set_context_pc(xxemul_windows *process, uint8_t *bytes, uint64_t pc)
+{
+    if (process->emulator->arch == XXEMUL_ARCH_X86) {
+        if (win_word_size(process->emulator) == 8u) win_put64(bytes + 248u, pc);
+        else win_put32(bytes + 184u, (uint32_t)pc);
+    } else if (win_word_size(process->emulator) == 8u) win_put64(bytes + 264u, pc);
+    else {
+        win_put32(bytes + 64u, (uint32_t)pc & ~1u);
+        win_put32(bytes + 68u, win_le32(bytes + 68u) | (pc & 1u ? 0x20u : 0u));
+    }
+}
+
+static xxemul_status win_seh_scope_result(xxemul_windows *process, win_seh_frame *frame, int32_t result)
+{
+    if (result > 0) {
+        frame->kind = WIN_SEH_UNWIND;
+        frame->phase = WIN_SEH_FRAMES;
+        frame->flags |= 2u;
+        frame->target_frame = frame->establisher_frame;
+        frame->target_ip = frame->scope_target;
+        frame->return_value = frame->code;
+        frame->walk = frame->saved;
+        frame->walk_arm = frame->saved_arm;
+        frame->walk_started = 0u;
+        frame->searched = 0u;
+        frame->scope_mode = 0u;
+        return win_seh_next(process, frame);
+    }
+    if (result < 0) {
+        if (process->emulator->arch == XXEMUL_ARCH_ARM) process->emulator->arm.gpr[0] = 0u;
+        else process->emulator->x86.gpr[XXEMUL_X86_RAX] = 0u;
+        frame->call_kind = WIN_SEH_CALL_FRAME;
+        return win_seh_return(process, NULL);
+    }
+    return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status win_seh_scope_next(xxemul_windows *process, win_seh_frame *frame)
+{
+    uint64_t arguments[2];
+    unsigned width = win_word_size(process->emulator);
+    while (frame->scope_index < frame->scope_count) {
+        uint8_t bytes[16];
+        uint64_t address = frame->scope_table + 4u + frame->scope_index * 16u;
+        uint32_t begin, end, handler, target;
+        if (!win_read(process, address, bytes, sizeof(bytes))) return XXEMUL_STATUS_ADDRESS_FAULT;
+        ++frame->scope_index;
+        begin = win_le32(bytes); end = win_le32(bytes + 4u);
+        handler = win_le32(bytes + 8u); target = win_le32(bytes + 12u);
+        if (end <= begin || frame->image_base > UINT64_MAX - end ||
+            frame->image_base > UINT64_MAX - handler || frame->image_base > UINT64_MAX - target)
+            return XXEMUL_STATUS_INVALID_IMAGE;
+        if (frame->control_pc < frame->image_base + begin || frame->control_pc >= frame->image_base + end) continue;
+        if (!win_store(process, frame->dispatcher + width * 9u, 4u, frame->scope_index)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (frame->kind == WIN_SEH_UNWIND) {
+            if (target || ((frame->flags & 0x20u) && frame->target_ip >= frame->image_base + begin &&
+                           frame->target_ip < frame->image_base + end)) continue;
+            if (!handler) return XXEMUL_STATUS_INVALID_IMAGE;
+            arguments[0] = 1u;
+            arguments[1] = frame->establisher_frame;
+            return win_seh_invoke(process, frame, frame->image_base + handler, WIN_SEH_CALL_SCOPE_FINALLY, arguments, 2u);
+        }
+        if (!target) continue;
+        frame->scope_target = frame->image_base + target;
+        if (handler == 1u) return win_seh_scope_result(process, frame, 1);
+        if (!handler) return XXEMUL_STATUS_INVALID_IMAGE;
+        arguments[0] = frame->pointers;
+        arguments[1] = frame->establisher_frame;
+        return win_seh_invoke(process, frame, frame->image_base + handler, WIN_SEH_CALL_SCOPE_FILTER, arguments, 2u);
+    }
+    frame->scope_mode = 0u;
+    frame->call_kind = WIN_SEH_CALL_FRAME;
+    if (process->emulator->arch == XXEMUL_ARCH_ARM) process->emulator->arm.gpr[0] = 1u;
+    else process->emulator->x86.gpr[XXEMUL_X86_RAX] = 1u;
+    return win_seh_return(process, NULL);
 }
 
 static xxemul_status win_seh_return(xxemul_windows *process, xxemul_step_info *info)
 {
     win_seh_frame *frame;
     uint32_t result;
-    int resume;
+    uint64_t previous_ip = win_seh_ip(process), next;
+    xxemul_status status;
     if (!process->seh_depth) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     frame = &process->seh_frames[process->seh_depth - 1u];
-    result = (uint32_t)process->emulator->x86.gpr[XXEMUL_X86_RAX];
-    resume = frame->vectored ? result == UINT32_MAX : result == 0u;
-    if (resume) {
-        if (!win_store(process, process->runtime_base, 4u, frame->original_registration)) return XXEMUL_STATUS_ADDRESS_FAULT;
-        if (!win_seh_context(process, frame, 1)) return XXEMUL_STATUS_ADDRESS_FAULT;
-        --process->seh_depth;
-    } else {
-        if (!frame->vectored && (result != 1u || !win_load(process, frame->registration, 4u, &frame->registration))) return frame->original_status;
-        if (!win_seh_next(process, frame)) {
-            win_store(process, process->runtime_base, 4u, frame->original_registration);
-            process->emulator->x86 = frame->saved;
-            --process->seh_depth;
-            return frame->original_status;
+    result = (uint32_t)(process->emulator->arch == XXEMUL_ARCH_ARM ? process->emulator->arm.gpr[0] : process->emulator->x86.gpr[XXEMUL_X86_RAX]);
+    if (win_seh_crt_return(process, frame, result, &status)) {
+        win_seh_step_info(process, info, previous_ip);
+        return status;
+    }
+    if (process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u && frame->call_kind == WIN_SEH_CALL_FRAME)
+        if (!win_store(process, win_current_teb(process), 4u, frame->registration)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    if (frame->call_kind == WIN_SEH_CALL_CONSOLIDATE) {
+        uint8_t bytes[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+        size_t size = xxemul_windows_context_size(process->emulator);
+        uint64_t pc = process->emulator->arch == XXEMUL_ARCH_ARM ? process->emulator->arm.gpr[0] : process->emulator->x86.gpr[XXEMUL_X86_RAX];
+        if (!win_read(process, frame->context, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        win_seh_set_context_pc(process, bytes, pc);
+        status = xxemul_windows_context_validate(process->emulator, bytes, size);
+        if (status == XXEMUL_STATUS_OK && !win_write(process, frame->context, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (status == XXEMUL_STATUS_OK) {
+            status = xxemul_windows_context_restore(process->emulator, bytes, size);
+            if (status == XXEMUL_STATUS_OK) { --process->seh_depth; win_seh_abandon(process); }
         }
+    } else if (frame->call_kind == WIN_SEH_CALL_FUNCTION_TABLE) {
+        frame->lookup_result = process->emulator->arch == XXEMUL_ARCH_ARM ? process->emulator->arm.gpr[0] : process->emulator->x86.gpr[XXEMUL_X86_RAX];
+        frame->lookup_ready = 1u;
+        if (frame->kind == WIN_SEH_LOOKUP_API) {
+            xxemul_windows_runtime_function64 function;
+            xxemul_windows_runtime_function_arm arm_function;
+            status = win_seh_validate_lookup(process, frame, &function, &arm_function);
+            if (status == XXEMUL_STATUS_OK) {
+                uint64_t address = process->emulator->arch == XXEMUL_ARCH_ARM ? arm_function.address : function.address;
+                if (!win_store(process, frame->lookup_output, win_word_size(process->emulator), address ? frame->lookup_base : 0u))
+                    return XXEMUL_STATUS_ADDRESS_FAULT;
+                status = xxemul_windows_context_restore(process->emulator, frame->saved_context, xxemul_windows_context_size(process->emulator));
+                if (status == XXEMUL_STATUS_OK) {
+                    if (process->emulator->arch == XXEMUL_ARCH_ARM) process->emulator->arm.gpr[0] = address;
+                    else process->emulator->x86.gpr[XXEMUL_X86_RAX] = address;
+                    --process->seh_depth;
+                }
+            }
+        } else status = win_seh_next(process, frame);
+    } else if (frame->call_kind == WIN_SEH_CALL_SCOPE_FILTER) {
+        if ((int32_t)result) status = win_seh_scope_result(process, frame, (int32_t)result);
+        else status = win_seh_scope_next(process, frame);
+    } else if (frame->call_kind == WIN_SEH_CALL_SCOPE_FINALLY) status = win_seh_scope_next(process, frame);
+    else if (frame->kind == WIN_SEH_FILTER_API) {
+        status = xxemul_windows_context_restore(process->emulator, frame->saved_context, xxemul_windows_context_size(process->emulator));
+        if (status == XXEMUL_STATUS_OK) {
+            if (process->emulator->arch == XXEMUL_ARCH_ARM) process->emulator->arm.gpr[0] = result;
+            else process->emulator->x86.gpr[XXEMUL_X86_RAX] = result;
+            --process->seh_depth;
+        }
+    } else if (frame->call_kind == WIN_SEH_CALL_VCH) {
+        if (result == UINT32_MAX) frame->vectored_cursor = frame->vectored_count;
+        status = win_seh_next(process, frame);
+    } else if (frame->call_kind == WIN_SEH_CALL_VEH || frame->call_kind == WIN_SEH_CALL_UNHANDLED) {
+        if (result == UINT32_MAX) {
+            if (frame->flags & 1u) status = win_seh_secondary(process, frame, 0xc0000025u);
+            else status = win_seh_resume(process, frame);
+        } else if (frame->call_kind == WIN_SEH_CALL_UNHANDLED) status = win_seh_terminate(process, frame->code);
+        else status = win_seh_next(process, frame);
+    } else if (frame->call_kind == WIN_SEH_CALL_FRAME && frame->kind == WIN_SEH_UNWIND) {
+        if (result == 3u && process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u) {
+            if (!win_load(process, frame->dispatcher + 8u, 4u, &next) ||
+                !win_seh_x86_registration(process, next, &frame->next_registration, &previous_ip))
+                status = win_seh_secondary(process, frame, 0xc0000028u);
+            else {
+                frame->flags |= 0x40u;
+                frame->registration = frame->next_registration;
+                if (!win_store(process, win_current_teb(process), 4u, frame->registration)) return XXEMUL_STATUS_ADDRESS_FAULT;
+                status = win_seh_next(process, frame);
+            }
+        } else if (result == 3u) {
+            uint8_t bytes[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+            xxemul shadow = *process->emulator;
+            size_t size = xxemul_windows_context_size(&shadow);
+            unsigned width = win_word_size(&shadow);
+            uint64_t context, scope;
+            if (!win_load(process, frame->dispatcher + width * 5u, (uint8_t)width, &context) ||
+                !win_load(process, frame->dispatcher + width * 9u, 4u, &scope) ||
+                !win_read(process, context, bytes, size)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            status = xxemul_windows_context_restore(&shadow, bytes, size);
+            if (status == XXEMUL_STATUS_OK) {
+                frame->walk = shadow.x86; frame->walk_arm = shadow.arm;
+                frame->walk_started = 0u;
+                frame->scope_resume_index = scope;
+                frame->flags |= 0x40u;
+                status = win_seh_next(process, frame);
+            }
+        } else if (result != 1u) status = win_seh_secondary(process, frame, 0xc0000026u);
+        else {
+            if (process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u) {
+                frame->registration = frame->next_registration;
+                if (!win_store(process, win_current_teb(process), 4u, frame->registration)) return XXEMUL_STATUS_ADDRESS_FAULT;
+            }
+            frame->flags &= ~0x40u;
+            status = win_seh_next(process, frame);
+        }
+    } else if (frame->call_kind == WIN_SEH_CALL_FRAME) {
+        if (result == 0u) {
+            if (frame->flags & 1u) status = win_seh_secondary(process, frame, 0xc0000025u);
+            else status = win_seh_resume(process, frame);
+        } else if (result == 1u || result == 2u) {
+            if (process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u) {
+                if (result == 2u) {
+                    if (!win_load(process, frame->dispatcher + 8u, 4u, &next)) return XXEMUL_STATUS_ADDRESS_FAULT;
+                    if (next > frame->nested_frame) frame->nested_frame = next;
+                    frame->flags |= 0x10u;
+                }
+                if (frame->registration == frame->nested_frame) frame->flags &= ~0x10u;
+                frame->registration = frame->next_registration;
+            }
+            status = win_seh_next(process, frame);
+        } else status = win_seh_secondary(process, frame, 0xc0000026u);
+    } else status = XXEMUL_STATUS_INVALID_IMAGE;
+    win_seh_step_info(process, info, previous_ip);
+    return status;
+}
+
+int xxemul_windows_try_exception(xxemul_windows *process, const xxemul_x86_state *before,
+                                  xxemul_status status, xxemul_step_info *info)
+{
+    uint64_t parameters[2];
+    uint32_t code;
+    xxemul_x86_state state;
+    xxemul_status dispatch;
+    if (!process || !before || process->emulator->arch != XXEMUL_ARCH_X86) return 0;
+    code = process->emulator->windows_exception_code;
+    if (!code && status == XXEMUL_STATUS_ADDRESS_FAULT) code = 0xc0000005u;
+    if (!code && status == XXEMUL_STATUS_BREAKPOINT) code = 0x80000003u;
+    if (!code && status == XXEMUL_WINDOWS_SINGLE_STEP_FAULT) code = 0x80000004u;
+    if (!code) return 0;
+    state = *before;
+    if (status == XXEMUL_STATUS_ADDRESS_FAULT && process->emulator->x86_rep_partial) {
+        state = process->emulator->x86;
+        state.ip = before->ip;
     }
-    if (info) {
-        memset(info, 0, sizeof(*info));
-        info->address = process->runtime_base + WIN_SEH_RETURN_OFFSET;
-        info->next_address = process->emulator->x86.ip;
+    if (code == 0x80000003u || code == 0x80000004u || code == 0xc0000095u) state.ip = process->emulator->x86.ip;
+    parameters[0] = process->emulator->fault_access;
+    parameters[1] = process->emulator->fault_address_valid ? process->emulator->fault_address : 0u;
+    dispatch = win_seh_begin(process, &state, NULL, code, 0u, code == 0x80000004u || code == 0xc0000095u ? state.ip : before->ip, 0u,
+                             code == 0xc0000005u ? 2u : 0u, parameters, status, 1);
+    if (dispatch != XXEMUL_STATUS_OK && dispatch != XXEMUL_STATUS_HALTED) {
+        if (process->seh_depth) --process->seh_depth;
+        return 0;
     }
-    return XXEMUL_STATUS_OK;
+    win_seh_step_info(process, info, before->ip);
+    return 1;
+}
+
+int xxemul_windows_try_arm_exception(xxemul_windows *process, const xxemul_arm_state *before,
+                                      xxemul_status status, xxemul_step_info *info)
+{
+    uint64_t parameters[2];
+    uint32_t code;
+    xxemul_arm_state state;
+    xxemul_status dispatch;
+    if (!process || !before || process->emulator->arch != XXEMUL_ARCH_ARM) return 0;
+    code = process->emulator->windows_exception_code;
+    if (!code && status == XXEMUL_STATUS_ADDRESS_FAULT) code = 0xc0000005u;
+    if (!code && status == XXEMUL_STATUS_BREAKPOINT) code = 0x80000003u;
+    if (!code) return 0;
+    state = *before;
+    if (code == 0x80000003u || code == 0x80000004u) state.pc = process->emulator->arm.pc;
+    parameters[0] = process->emulator->fault_access;
+    parameters[1] = process->emulator->fault_address_valid ? process->emulator->fault_address : 0u;
+    dispatch = win_seh_begin(process, NULL, &state, code, 0u, before->pc, 0u,
+                             code == 0xc0000005u ? 2u : 0u, parameters, status, 1);
+    if (dispatch != XXEMUL_STATUS_OK && dispatch != XXEMUL_STATUS_HALTED) {
+        if (process->seh_depth) --process->seh_depth;
+        return 0;
+    }
+    win_seh_step_info(process, info, before->pc);
+    return 1;
+}
+
+static void win_seh_abandon(xxemul_windows *process)
+{
+    uint64_t sp = win_seh_sp(process), head;
+    while (process->seh_depth) {
+        win_seh_frame *frame = &process->seh_frames[process->seh_depth - 1u];
+        if (sp < win_seh_saved_sp(process, frame)) break;
+        if (process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u &&
+            win_load(process, win_current_teb(process), 4u, &head) && head == frame->dispatcher)
+            (void)win_store(process, win_current_teb(process), 4u, frame->original_registration);
+        --process->seh_depth;
+    }
+}
+
+static void win_seh_api_caller(xxemul_windows *process, const win_api *api, uint64_t return_address,
+                                xxemul_x86_state *cpu, xxemul_arm_state *arm)
+{
+    xxemul *e = process->emulator;
+    unsigned width = win_word_size(e);
+    *cpu = e->x86;
+    *arm = e->arm;
+    if (e->arch == XXEMUL_ARCH_ARM) {
+        arm->pc = return_address & (width == 8u ? UINT64_MAX : ~UINT64_C(1));
+        if (width == 4u) arm->pstate = (arm->pstate & ~UINT32_C(0x20)) | (return_address & 1u ? 0x20u : 0u);
+    } else {
+        cpu->ip = return_address;
+        cpu->gpr[XXEMUL_X86_RSP] += width == 8u ? 8u : 4u + (api->caller_cleans ? 0u : (uint64_t)api->argument_count * 4u);
+    }
+}
+
+static xxemul_status win_seh_unwind_begin(xxemul_windows *process, const xxemul_x86_state *cpu,
+                                          const xxemul_arm_state *arm, const uint64_t *arguments,
+                                          int extended)
+{
+    win_seh_frame *frame;
+    uint64_t head;
+    if (process->seh_depth >= WIN_MAX_SEH_DEPTH) return win_seh_terminate(process, 0xc00000fdu);
+    frame = &process->seh_frames[process->seh_depth];
+    memset(frame, 0, sizeof(*frame));
+    frame->saved = *cpu;
+    frame->saved_arm = *arm;
+    frame->saved_mode = process->emulator->mode;
+    frame->walk = *cpu;
+    frame->walk_arm = *arm;
+    if (!win_seh_arena(process, frame, win_seh_saved_sp(process, frame))) return XXEMUL_STATUS_ADDRESS_FAULT;
+    frame->kind = WIN_SEH_UNWIND;
+    frame->phase = WIN_SEH_FRAMES;
+    frame->target_frame = arguments[0];
+    frame->target_ip = arguments[1];
+    frame->return_value = arguments[3];
+    frame->unwind_context = extended ? arguments[4] : 0u;
+    frame->code = 0xc0000027u;
+    frame->exception_address = process->emulator->arch == XXEMUL_ARCH_ARM ? arm->pc : cpu->ip;
+    if (arguments[2] && !win_seh_read_record(process, arguments[2], frame)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    frame->flags |= 2u | (frame->target_frame ? 0u : 4u);
+    if (process->emulator->arch == XXEMUL_ARCH_X86 && win_word_size(process->emulator) == 4u) {
+        if (!win_load(process, win_current_teb(process), 4u, &head)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        frame->original_registration = frame->registration = head;
+    }
+    if (!win_seh_capture(process, frame) || !win_seh_record(process, frame)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    if (arguments[2] && !win_store(process, arguments[2] + 4u, 4u, frame->flags)) return XXEMUL_STATUS_ADDRESS_FAULT;
+    ++process->seh_depth;
+    return win_seh_next(process, frame);
+}
+
+#include "xxemul_windows_seh_crt.inc"
+
+static int win_exception_api(xxemul_windows *process, const win_api *api, const uint64_t *arguments,
+                               uint64_t return_address, xxemul_step_info *info, xxemul_status *status)
+{
+    xxemul *e = process->emulator;
+    const char *name = api->name;
+    xxemul_x86_state caller;
+    xxemul_arm_state arm;
+    uint64_t ip = win_seh_ip(process), value = 0u;
+    unsigned width = win_word_size(e);
+    size_t size = xxemul_windows_context_size(e);
+    uint8_t bytes[XXEMUL_WINDOWS_CONTEXT64_SIZE];
+    win_seh_api_caller(process, api, return_address, &caller, &arm);
+    if (win_seh_crt_api(process, name, arguments, status)) {
+        win_seh_step_info(process, info, ip);
+        return 1;
+    }
+    if (win_equal(name, "_abnormal_termination") || win_equal(name, "__abnormal_termination")) {
+        value = process->seh_depth && process->seh_frames[process->seh_depth - 1u].crt.active &&
+            process->seh_frames[process->seh_depth - 1u].call_kind == WIN_SEH_CALL_CRT_FINALLY;
+        goto exception_api_result;
+    }
+    if (win_equal(name, "RaiseException") || win_equal(name, "RtlRaiseStatus") ||
+        win_equal(name, "RtlRaiseException") || win_equal(name, "NtRaiseException") || win_equal(name, "ZwRaiseException")) {
+        win_seh_frame record;
+        unsigned index;
+        int nt = win_equal(name, "NtRaiseException") || win_equal(name, "ZwRaiseException");
+        memset(&record, 0, sizeof(record));
+        record.code = (uint32_t)arguments[0];
+        record.exception_address = return_address;
+        if (win_equal(name, "RaiseException")) {
+            record.flags = (uint32_t)arguments[1] & 1u;
+            if (arguments[3]) {
+                if (arguments[2] > 15u) {
+                    record.code = 0xc000000du;
+                    record.flags = 1u;
+                } else {
+                    record.parameter_count = (uint32_t)arguments[2];
+                    for (index = 0; index < record.parameter_count; ++index)
+                        if (!win_load(process, arguments[3] + index * width, (uint8_t)width, &record.information[index])) {
+                            *status = XXEMUL_STATUS_ADDRESS_FAULT;
+                            return 1;
+                        }
+                }
+            }
+        } else if (win_equal(name, "RtlRaiseStatus")) record.flags = 1u;
+        else {
+            if (!win_seh_read_record(process, arguments[0], &record)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            if (nt) {
+                xxemul shadow = *e;
+                if (!win_read(process, arguments[1], bytes, size)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+                *status = xxemul_windows_context_restore(&shadow, bytes, size);
+                if (*status != XXEMUL_STATUS_OK) return 1;
+                caller = shadow.x86;
+                arm = shadow.arm;
+            } else {
+                record.exception_address = return_address;
+                if (!win_store(process, arguments[0] + (width == 8u ? 16u : 12u), (uint8_t)width, return_address)) {
+                    *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1;
+                }
+            }
+        }
+        *status = win_seh_begin(process, &caller, &arm, record.code, record.flags, record.exception_address,
+                                 record.linked_record, record.parameter_count, record.information,
+                                 XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, !nt || arguments[2]);
+        win_seh_step_info(process, info, ip);
+        return 1;
+    }
+    if (win_equal(name, "NtContinue") || win_equal(name, "ZwContinue") || win_equal(name, "RtlRestoreContext")) {
+        int restore = win_equal(name, "RtlRestoreContext");
+        if (!win_read(process, arguments[0], bytes, size)) {
+            if (restore) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            value = 0xc0000005u; e->windows_exception_code = 0u; goto exception_api_result;
+        }
+        if (restore && arguments[1]) {
+            win_seh_frame record;
+            memset(&record, 0, sizeof(record));
+            if (!win_seh_read_record(process, arguments[1], &record)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            if (record.code == 0x80000029u) {
+                win_seh_frame *frame;
+                xxemul shadow = *e;
+                uint64_t callback_argument = arguments[1];
+                if (!record.parameter_count || !record.information[0]) { *status = XXEMUL_STATUS_INVALID_ARGUMENT; return 1; }
+                *status = xxemul_windows_context_restore(&shadow, bytes, size);
+                if (*status != XXEMUL_STATUS_OK) return 1;
+                if (process->seh_depth >= WIN_MAX_SEH_DEPTH) { *status = win_seh_terminate(process, 0xc00000fdu); return 1; }
+                frame = &process->seh_frames[process->seh_depth];
+                memset(frame, 0, sizeof(*frame));
+                frame->saved = shadow.x86; frame->saved_arm = shadow.arm;
+                frame->walk = shadow.x86; frame->walk_arm = shadow.arm;
+                frame->kind = WIN_SEH_CONSOLIDATE;
+                if (!win_seh_arena(process, frame, win_seh_sp(process))) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+                frame->context = arguments[0];
+                memcpy(frame->saved_context, bytes, size);
+                ++process->seh_depth;
+                *status = win_seh_invoke(process, frame, record.information[0], WIN_SEH_CALL_CONSOLIDATE, &callback_argument, 1u);
+                win_seh_step_info(process, info, ip);
+                return 1;
+            }
+            *status = win_seh_longjump_context(process, arguments[1], bytes, size);
+            if (*status != XXEMUL_STATUS_OK) return 1;
+            if (!win_write(process, arguments[0], bytes, size)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+        }
+        {
+            xxemul shadow = *e;
+            uint8_t normalized[XXEMUL_WINDOWS_CONTEXT64_SIZE] = {0};
+            shadow.x86 = caller; shadow.arm = arm;
+            if (!restore) { shadow.x86.gpr[XXEMUL_X86_RAX] = 0u; shadow.arm.gpr[0] = 0u; }
+            *status = xxemul_windows_context_restore(&shadow, bytes, size);
+            if (*status != XXEMUL_STATUS_OK) {
+                if (restore) return 1;
+                value = *status == XXEMUL_STATUS_ADDRESS_FAULT ? 0xc0000005u :
+                    (*status == XXEMUL_STATUS_UNSUPPORTED_IMAGE || *status == XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION) ? 0xc00000bbu : 0xc000000du;
+                e->windows_exception_code = 0u;
+                goto exception_api_result;
+            }
+            *status = e->arch == XXEMUL_ARCH_ARM ?
+                xxemul_windows_context_capture_arm(&shadow, &shadow.arm, normalized, size, xxemul_windows_context_all(&shadow)) :
+                xxemul_windows_context_capture(&shadow, &shadow.x86, normalized, size, xxemul_windows_context_all(&shadow));
+            if (*status == XXEMUL_STATUS_OK) *status = xxemul_windows_context_restore(e, normalized, size);
+            if (*status == XXEMUL_STATUS_OK) { win_seh_abandon(process); e->halted = 0u; }
+        }
+        win_seh_step_info(process, info, ip);
+        return 1;
+    }
+    if (win_equal(name, "RtlCaptureContext")) {
+        memset(bytes, 0, sizeof(bytes));
+        *status = e->arch == XXEMUL_ARCH_ARM ?
+            xxemul_windows_context_capture_arm(e, &arm, bytes, size, xxemul_windows_context_all(e)) :
+            xxemul_windows_context_capture(e, &caller, bytes, size, xxemul_windows_context_all(e));
+        if (*status == XXEMUL_STATUS_OK && !win_write(process, arguments[0], bytes, size)) *status = XXEMUL_STATUS_ADDRESS_FAULT;
+        if (*status == XXEMUL_STATUS_OK) {
+            e->x86 = caller;
+            e->arm = arm;
+            if (e->arch == XXEMUL_ARCH_ARM && width == 4u) e->mode = arm.pstate & 0x20u ? XXEMUL_MODE_ARM_T32 : XXEMUL_MODE_ARM_A32;
+        }
+        win_seh_step_info(process, info, ip);
+        return 1;
+    }
+    if (win_equal(name, "RtlUnwind") || win_equal(name, "RtlUnwindEx")) {
+        *status = win_seh_unwind_begin(process, &caller, &arm, arguments, win_equal(name, "RtlUnwindEx"));
+        win_seh_step_info(process, info, ip);
+        return 1;
+    }
+    if (win_equal(name, "__C_specific_handler")) {
+        win_seh_frame *frame;
+        uint64_t count;
+        if (!process->seh_depth || (e->arch == XXEMUL_ARCH_X86 && width == 4u)) {
+            *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; return 1;
+        }
+        frame = &process->seh_frames[process->seh_depth - 1u];
+        if (frame->call_kind != WIN_SEH_CALL_FRAME || arguments[0] != frame->record || arguments[1] != frame->establisher_frame ||
+            arguments[2] != frame->context || arguments[3] != frame->dispatcher || !frame->handler_data) {
+            *status = XXEMUL_STATUS_INVALID_ARGUMENT; return 1;
+        }
+        frame->scope_table = frame->handler_data;
+        if (!win_load(process, frame->scope_table, 4u, &count)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+        if (count > 4096u || !win_memory_span(process, frame->scope_table, 4u + count * 16u)) {
+            *status = XXEMUL_STATUS_INVALID_IMAGE; return 1;
+        }
+        frame->scope_count = count;
+        frame->scope_index = frame->scope_resume_index;
+        frame->scope_resume_index = 0u;
+        frame->scope_mode = 1u;
+        *status = win_seh_scope_next(process, frame);
+        win_seh_step_info(process, info, ip);
+        return 1;
+    }
+    if (win_equal(name, "UnhandledExceptionFilter")) {
+        win_seh_frame *frame;
+        uint64_t record, context;
+        if (!win_load(process, arguments[0], (uint8_t)width, &record) ||
+            !win_load(process, arguments[0] + width, (uint8_t)width, &context)) {
+            *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1;
+        }
+        if (!process->unhandled_filter) { value = 1u; goto exception_api_result; }
+        if (process->seh_depth >= WIN_MAX_SEH_DEPTH) { *status = win_seh_terminate(process, 0xc00000fdu); return 1; }
+        frame = &process->seh_frames[process->seh_depth];
+        memset(frame, 0, sizeof(*frame));
+        frame->saved = caller; frame->saved_arm = arm;
+        if (!win_seh_arena(process, frame, win_seh_saved_sp(process, frame))) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+        frame->kind = WIN_SEH_FILTER_API;
+        if (e->arch == XXEMUL_ARCH_ARM)
+            *status = xxemul_windows_context_capture_arm(e, &arm, frame->saved_context, size, xxemul_windows_context_all(e));
+        else *status = xxemul_windows_context_capture(e, &caller, frame->saved_context, size, xxemul_windows_context_all(e));
+        if (*status != XXEMUL_STATUS_OK) return 1;
+        frame->record = record; frame->context = context; frame->pointers = arguments[0];
+        ++process->seh_depth;
+        *status = win_seh_invoke(process, frame, process->unhandled_filter, WIN_SEH_CALL_UNHANDLED, arguments, 1u);
+        win_seh_step_info(process, info, ip);
+        return 1;
+    }
+    if (win_equal(name, "RtlInstallFunctionTableCallback")) {
+        size_t index, free_slot = 64u;
+        value = 0u;
+        if ((e->arch == XXEMUL_ARCH_X86 && width == 4u) || (arguments[0] & 3u) != 3u ||
+            !arguments[2] || !arguments[3] || arguments[2] > UINT32_MAX || arguments[1] > UINT64_MAX - arguments[2])
+            goto exception_api_result;
+        for (index = 0; index < 64u; ++index) {
+            win_function_callback *entry = &process->function_callbacks[index];
+            if (!entry->active) { if (free_slot == 64u) free_slot = index; continue; }
+            if (entry->identifier == arguments[0] || (entry->base < arguments[1] + arguments[2] && arguments[1] < entry->end))
+                goto exception_api_result;
+        }
+        if (free_slot < 64u) {
+            win_function_callback *entry = &process->function_callbacks[free_slot];
+            entry->identifier = arguments[0]; entry->base = arguments[1]; entry->end = arguments[1] + arguments[2];
+            entry->callback = arguments[3]; entry->context = arguments[4]; entry->active = 1u;
+            value = 1u;
+        }
+        goto exception_api_result;
+    }
+    if (win_equal(name, "RtlAddFunctionTable")) {
+        if (e->arch == XXEMUL_ARCH_ARM)
+            value = xxemul_windows_unwind_arm_add_table(win_seh_reader, process, width == 8u, &process->arm_function_tables,
+                arguments[0], (uint32_t)arguments[1], arguments[2]) == XXEMUL_STATUS_OK;
+        else if (width == 8u) value = xxemul_windows_unwind64_add_table(win_seh_reader, process, &process->function_tables,
+            arguments[0], (uint32_t)arguments[1], arguments[2]) == XXEMUL_STATUS_OK;
+        else { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; return 1; }
+    } else if (win_equal(name, "RtlDeleteFunctionTable")) {
+        size_t index;
+        for (index = 0; index < 64u; ++index) {
+            win_function_callback *entry = &process->function_callbacks[index];
+            if (entry->active && entry->identifier == arguments[0]) {
+                entry->active = 0u; value = 1u; goto exception_api_result;
+            }
+        }
+        if (e->arch == XXEMUL_ARCH_ARM) value = xxemul_windows_unwind_arm_delete_table(&process->arm_function_tables, arguments[0]);
+        else if (width == 8u) value = xxemul_windows_unwind64_delete_table(&process->function_tables, arguments[0]);
+        else { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; return 1; }
+    } else if (win_equal(name, "RtlLookupFunctionEntry")) {
+        uint64_t base;
+        win_function_callback *entry = win_seh_find_callback(process, arguments[0]);
+        if (entry) {
+            win_seh_frame *frame;
+            uint64_t callback_arguments[2] = {arguments[0], entry->context};
+            if (process->seh_depth >= WIN_MAX_SEH_DEPTH) { *status = win_seh_terminate(process, 0xc00000fdu); return 1; }
+            frame = &process->seh_frames[process->seh_depth];
+            memset(frame, 0, sizeof(*frame));
+            frame->saved = caller; frame->saved_arm = arm; frame->walk = caller; frame->walk_arm = arm;
+            frame->kind = WIN_SEH_LOOKUP_API;
+            frame->control_pc = arguments[0]; frame->lookup_output = arguments[1]; frame->lookup_base = entry->base;
+            if (!win_seh_arena(process, frame, win_seh_saved_sp(process, frame))) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            if (!win_seh_capture(process, frame)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            ++process->seh_depth;
+            *status = win_seh_invoke(process, frame, entry->callback, WIN_SEH_CALL_FUNCTION_TABLE, callback_arguments, 2u);
+            win_seh_step_info(process, info, ip);
+            return 1;
+        }
+        if (e->arch == XXEMUL_ARCH_ARM) {
+            xxemul_windows_runtime_function_arm function;
+            memset(&function, 0, sizeof(function));
+            *status = win_seh_lookup_arm(process, arguments[0], &base, &function);
+            value = function.address;
+        } else if (width == 8u) {
+            xxemul_windows_runtime_function64 function;
+            memset(&function, 0, sizeof(function));
+            *status = win_seh_lookup64(process, arguments[0], &base, &function);
+            value = function.address;
+        } else { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; return 1; }
+        if (*status != XXEMUL_STATUS_OK) return 1;
+        if (!win_store(process, arguments[1], (uint8_t)width, base)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+    } else if (win_equal(name, "RtlVirtualUnwind")) {
+        xxemul_windows_runtime_function64 function;
+        xxemul_windows_unwind64_result result;
+        xxemul shadow = *e;
+        uint8_t raw[12], pointers[256];
+        unsigned index;
+        if (e->arch == XXEMUL_ARCH_ARM) {
+            xxemul_windows_runtime_function_arm arm_function;
+            xxemul_windows_unwind_arm_result arm_result;
+            unsigned pointer_count = width == 8u ? 20u : 17u;
+            memset(&arm_function, 0, sizeof(arm_function));
+            if (arguments[3]) {
+                if (!win_read(process, arguments[3], raw, 8u)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+                *status = xxemul_windows_unwind_arm_lookup_table(win_seh_reader, process, width == 8u,
+                    arguments[3], 1u, arguments[1], arguments[2], &arm_function);
+                if (*status != XXEMUL_STATUS_OK) return 1;
+                if (!arm_function.address) { *status = XXEMUL_STATUS_INVALID_ARGUMENT; return 1; }
+            }
+            if (!win_read(process, arguments[4], bytes, size)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            *status = xxemul_windows_context_restore(&shadow, bytes, size);
+            if (*status != XXEMUL_STATUS_OK) return 1;
+            *status = xxemul_windows_unwind_arm_virtual_unwind_ex(win_seh_reader, process, width == 8u, arguments[1], arguments[2],
+                &arm_function, (unsigned)arguments[0], &shadow.arm, &arm_result, win_seh_authenticate_lr);
+            if (*status != XXEMUL_STATUS_OK) return 1;
+            *status = xxemul_windows_context_capture_arm(&shadow, &shadow.arm, bytes, size, win_le32(bytes));
+            if (*status != XXEMUL_STATUS_OK) return 1;
+            if (!win_memory_span(process, arguments[4], size) || !win_memory_span(process, arguments[5], width) ||
+                !win_memory_span(process, arguments[6], width) || (arguments[7] && !win_memory_span(process, arguments[7], pointer_count * width))) {
+                *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1;
+            }
+            if (!win_write(process, arguments[4], bytes, size) || !win_store(process, arguments[5], (uint8_t)width, arm_result.handler_data) ||
+                !win_store(process, arguments[6], (uint8_t)width, arm_result.establisher_frame)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            if (arguments[7]) {
+                memset(pointers, 0, sizeof(pointers));
+                for (index = 0; index < pointer_count; ++index) {
+                    uint64_t address;
+                    unsigned integer_count = width == 8u ? 12u : 9u;
+                    if (index < integer_count) address = arm_result.integer_save[width == 8u ? index + 19u : (index == 8u ? 14u : index + 4u)];
+                    else address = arm_result.vfp_save[index - integer_count + 8u];
+                    if (width == 8u) win_put64(pointers + index * width, address);
+                    else win_put32(pointers + index * width, (uint32_t)address);
+                }
+                if (!win_write(process, arguments[7], pointers, pointer_count * width)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            }
+            value = arm_result.handler;
+            goto exception_api_result;
+        }
+        if (width != 8u) { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; return 1; }
+        memset(&function, 0, sizeof(function));
+        if (arguments[3]) {
+            if (!win_read(process, arguments[3], raw, sizeof(raw))) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+            function.address = arguments[3];
+            function.begin_address = win_le32(raw);
+            function.end_address = win_le32(raw + 4u);
+            function.unwind_data = win_le32(raw + 8u);
+        }
+        if (!win_read(process, arguments[4], bytes, size)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+        *status = xxemul_windows_context_restore(&shadow, bytes, size);
+        if (*status != XXEMUL_STATUS_OK) return 1;
+        *status = xxemul_windows_unwind64_virtual_unwind(win_seh_reader, process, arguments[1], arguments[2],
+            &function, (unsigned)arguments[0], &shadow.x86, &result);
+        if (*status != XXEMUL_STATUS_OK) return 1;
+        *status = xxemul_windows_context_capture(&shadow, &shadow.x86, bytes, size, win_le32(bytes + 48u));
+        if (*status != XXEMUL_STATUS_OK) return 1;
+        if (!win_memory_span(process, arguments[4], size) || !win_memory_span(process, arguments[5], 8u) ||
+            !win_memory_span(process, arguments[6], 8u) || (arguments[7] && !win_memory_span(process, arguments[7], sizeof(pointers)))) {
+            *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1;
+        }
+        if (!win_write(process, arguments[4], bytes, size) || !win_store(process, arguments[5], 8u, result.handler_data) ||
+            !win_store(process, arguments[6], 8u, result.establisher_frame)) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+        if (arguments[7]) {
+            memset(pointers, 0, sizeof(pointers));
+            for (index = 0; index < 16u; ++index) {
+                win_put64(pointers + index * 8u, result.xmm_save[index]);
+                win_put64(pointers + 128u + index * 8u, result.integer_save[index]);
+            }
+            if (!win_write(process, arguments[7], pointers, sizeof(pointers))) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+        }
+        value = result.handler;
+    } else return 0;
+exception_api_result:
+    if (e->arch == XXEMUL_ARCH_ARM) {
+        e->arm = arm; e->arm.gpr[0] = value;
+        if (width == 4u) e->mode = arm.pstate & 0x20u ? XXEMUL_MODE_ARM_T32 : XXEMUL_MODE_ARM_A32;
+    }
+    else { e->x86 = caller; e->x86.gpr[XXEMUL_X86_RAX] = width == 8u ? value : (uint32_t)value; }
+    *status = XXEMUL_STATUS_OK;
+    win_seh_step_info(process, info, ip);
+    return 1;
 }
 
 static void win_thread_save(xxemul_windows *process, win_thread_context *thread)
@@ -9424,16 +13095,32 @@ static void win_thread_save(xxemul_windows *process, win_thread_context *thread)
     xxemul *e = process->emulator;
     uint8_t width = win_word_size(e);
     thread->cpu = e->x86;
+    thread->arm_cpu = e->arm; thread->cpu_mode = e->mode;
+    thread->arm_thread_pointer = e->arm_thread_pointer;
+    thread->arm_thread_pointer_valid = e->arm_thread_pointer_valid;
+    memcpy(thread->arm_break_value, e->arm_break_value, sizeof(thread->arm_break_value));
+    memcpy(thread->arm_watch_value, e->arm_watch_value, sizeof(thread->arm_watch_value));
+    memcpy(thread->arm_break_control, e->arm_break_control, sizeof(thread->arm_break_control));
+    memcpy(thread->arm_watch_control, e->arm_watch_control, sizeof(thread->arm_watch_control));
+    memcpy(thread->x87_raw, e->x87_raw, sizeof(thread->x87_raw)); thread->x87_tags = e->x87_tags;
     memcpy(thread->x87_stack, e->x87_stack, sizeof(thread->x87_stack));
     memcpy(thread->x87_int_val, e->x87_int_val, sizeof(thread->x87_int_val));
     memcpy(thread->x87_is_int, e->x87_is_int, sizeof(thread->x87_is_int));
     thread->x87_depth = e->x87_depth; thread->x87_top = e->x87_top;
     thread->x87_control = e->x87_control; thread->x87_status = e->x87_status;
-    memcpy(thread->tls_values, process->tls_values, sizeof(thread->tls_values));
+    memcpy(thread->x86_debug, e->x86_debug, sizeof(thread->x86_debug));
+    thread->x86_mxcsr = e->x86_mxcsr;
+    if (process->structures_ready && win_tls_read_slots(process, thread, thread->tls_values))
+        memcpy(process->tls_values, thread->tls_values, sizeof(process->tls_values));
+    else memcpy(thread->tls_values, process->tls_values, sizeof(thread->tls_values));
+    {
+        uint64_t error;
+        if (win_load(process, win_current_teb(process) + (width == 8u ? 0x68u : 0x34u), 4u, &error)) process->last_error = (uint32_t)error;
+    }
     thread->last_error = process->last_error;
-    (void)win_load(process, process->runtime_base, width, &thread->seh_head);
-    (void)win_load(process, process->runtime_base + width, width, &thread->stack_base);
-    (void)win_load(process, process->runtime_base + width * 2u, width, &thread->stack_limit);
+    (void)win_load(process, win_current_teb(process), width, &thread->seh_head);
+    (void)win_load(process, win_current_teb(process) + width, width, &thread->stack_base);
+    (void)win_load(process, win_current_teb(process) + width * 2u, width, &thread->stack_limit);
     memcpy(thread->seh_frames, process->seh_frames, sizeof(thread->seh_frames)); thread->seh_depth = process->seh_depth;
     memcpy(thread->qsort_frames, process->qsort_frames, sizeof(thread->qsort_frames)); thread->qsort_depth = process->qsort_depth;
     memcpy(thread->initterm_frames, process->initterm_frames, sizeof(thread->initterm_frames)); thread->initterm_depth = process->initterm_depth;
@@ -9444,20 +13131,30 @@ static void win_thread_restore(xxemul_windows *process, const win_thread_context
     xxemul *e = process->emulator;
     uint8_t width = win_word_size(e);
     e->x86 = thread->cpu;
+    e->arm = thread->arm_cpu; e->mode = thread->cpu_mode;
+    e->arm_thread_pointer = thread->arm_thread_pointer;
+    e->arm_thread_pointer_valid = thread->arm_thread_pointer_valid;
+    memcpy(e->arm_break_value, thread->arm_break_value, sizeof(thread->arm_break_value));
+    memcpy(e->arm_watch_value, thread->arm_watch_value, sizeof(thread->arm_watch_value));
+    memcpy(e->arm_break_control, thread->arm_break_control, sizeof(thread->arm_break_control));
+    memcpy(e->arm_watch_control, thread->arm_watch_control, sizeof(thread->arm_watch_control));
+    memcpy(e->x87_raw, thread->x87_raw, sizeof(e->x87_raw)); e->x87_tags = thread->x87_tags;
     memcpy(e->x87_stack, thread->x87_stack, sizeof(thread->x87_stack));
     memcpy(e->x87_int_val, thread->x87_int_val, sizeof(thread->x87_int_val));
     memcpy(e->x87_is_int, thread->x87_is_int, sizeof(thread->x87_is_int));
     e->x87_depth = thread->x87_depth; e->x87_top = thread->x87_top;
     e->x87_control = thread->x87_control; e->x87_status = thread->x87_status;
+    memcpy(e->x86_debug, thread->x86_debug, sizeof(e->x86_debug));
+    e->x86_mxcsr = thread->x86_mxcsr;
     memcpy(process->tls_values, thread->tls_values, sizeof(thread->tls_values));
     process->last_error = thread->last_error;
-    (void)win_store(process, process->runtime_base + (width == 8u ? 0x68u : 0x34u), 4u, thread->last_error);
-    (void)win_store(process, process->runtime_base, width, thread->seh_head);
-    (void)win_store(process, process->runtime_base + width, width, thread->stack_base);
-    (void)win_store(process, process->runtime_base + width * 2u, width, thread->stack_limit);
-    (void)win_store(process, process->runtime_base + (width == 8u ? 0x58u : 0x2cu), width, thread->tls_array);
-    (void)win_store(process, process->runtime_base + (width == 8u ? 0x40u : 0x20u), width, process->process_id);
-    (void)win_store(process, process->runtime_base + (width == 8u ? 0x48u : 0x24u), width, thread->id);
+    (void)win_store(process, win_current_teb(process) + (width == 8u ? 0x68u : 0x34u), 4u, thread->last_error);
+    (void)win_store(process, win_current_teb(process), width, thread->seh_head);
+    (void)win_store(process, win_current_teb(process) + width, width, thread->stack_base);
+    (void)win_store(process, win_current_teb(process) + width * 2u, width, thread->stack_limit);
+    (void)win_store(process, win_current_teb(process) + (width == 8u ? 0x58u : 0x2cu), width, thread->tls_array);
+    (void)win_store(process, win_current_teb(process) + (width == 8u ? 0x40u : 0x20u), width, process->process_id);
+    (void)win_store(process, win_current_teb(process) + (width == 8u ? 0x48u : 0x24u), width, thread->id);
     memcpy(process->seh_frames, thread->seh_frames, sizeof(thread->seh_frames)); process->seh_depth = thread->seh_depth;
     memcpy(process->qsort_frames, thread->qsort_frames, sizeof(thread->qsort_frames)); process->qsort_depth = thread->qsort_depth;
     memcpy(process->initterm_frames, thread->initterm_frames, sizeof(thread->initterm_frames)); process->initterm_depth = thread->initterm_depth;
@@ -9466,6 +13163,7 @@ static void win_thread_restore(xxemul_windows *process, const win_thread_context
 static void win_thread_release_guest(xxemul_windows *process, win_thread_context *thread)
 {
     win_allocation *allocation;
+    win_actctx_abandon_thread(process,thread->id);
     allocation = win_find_allocation(process, thread->stack_allocation);
     if (allocation) allocation->active = 0u;
     win_tls_thread_release(process, thread);
@@ -9480,8 +13178,16 @@ static xxemul_status win_thread_create(xxemul_windows *process, const uint64_t *
     win_thread_context *thread;
     win_handle *handle;
     *result = 0u;
-    if (process->emulator->arch != XXEMUL_ARCH_X86 || process->dll_exiting) {
-        process->last_error = 120u; return XXEMUL_STATUS_OK;
+    if (process->dll_exiting || process->fls_process_exiting) { process->last_error = 120u; return XXEMUL_STATUS_OK; }
+    if (process->emulator->arch == XXEMUL_ARCH_ARM) {
+        size_t index;
+        if (process->main_tls.callbacks) { process->last_error = 120u; return XXEMUL_STATUS_OK; }
+        for (index = 0; index < process->module_count; ++index) {
+            const win_module *module = &process->modules[index];
+            if (module->real && module->live && !module->thread_callbacks_disabled && (module->entry_rva || module->tls.callbacks)) {
+                process->last_error = 120u; return XXEMUL_STATUS_OK;
+            }
+        }
     }
     if ((arg[4] & ~UINT64_C(0x10004)) || !arg[2] || !win_load(process, arg[2], 1u, &ignored) ||
         (arg[5] && !win_memory_span(process, arg[5], 4u))) { process->last_error = 87u; return XXEMUL_STATUS_OK; }
@@ -9497,6 +13203,11 @@ static xxemul_status win_thread_create(xxemul_windows *process, const uint64_t *
     stack = win_heap_alloc(process, stack_size);
     if (!stack) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
     thread = &process->threads[slot]; memset(thread, 0, sizeof(*thread));
+    thread->teb_base = process->runtime_base + WIN_THREAD_TEB_OFFSET + slot * WIN_THREAD_TEB_STRIDE;
+    {
+        uint8_t zeros[WIN_THREAD_TEB_STRIDE] = {0};
+        if (!win_write(process, thread->teb_base, zeros, sizeof(zeros))) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
+    }
     thread->stack_allocation = stack;
     if (!win_tls_thread_create(process, thread)) {
         win_thread_release_guest(process, thread);
@@ -9509,6 +13220,8 @@ static xxemul_status win_thread_create(xxemul_windows *process, const uint64_t *
         process->last_error = 8u; return XXEMUL_STATUS_OK;
     }
     thread->x87_control = 0x37fu;
+    thread->x87_tags = UINT16_C(0xffff);
+    thread->x86_mxcsr = 0x1f80u;
     thread->cpu.flags = 0x202u;
     memcpy(thread->cpu.segment, process->emulator->x86.segment, sizeof(thread->cpu.segment));
     sp = (thread->stack_base & ~UINT64_C(15)) - (width == 8u ? 40u : 8u);
@@ -9516,9 +13229,22 @@ static xxemul_status win_thread_create(xxemul_windows *process, const uint64_t *
     thread->cpu.gpr[XXEMUL_X86_RSP] = sp;
     thread->start_address = arg[2];
     thread->cpu.ip = process->runtime_base + WIN_THREAD_START_OFFSET;
+    thread->cpu_mode = process->emulator->mode;
     if (width == 8u) thread->cpu.gpr[XXEMUL_X86_RCX] = arg[3];
-    if (!win_store(process, sp, width, process->runtime_base + WIN_THREAD_RETURN_OFFSET) ||
-        (width == 4u && !win_store(process, sp + 4u, width, arg[3]))) {
+    if (process->emulator->arch == XXEMUL_ARCH_ARM) {
+        thread->arm_cpu.sp = thread->stack_base & ~(uint64_t)(width == 8u ? 15u : 7u);
+        thread->arm_cpu.pc = process->runtime_base + WIN_THREAD_START_OFFSET;
+        thread->arm_cpu.gpr[0] = arg[3];
+        thread->arm_cpu.gpr[width == 8u ? 30u : 14u] = process->runtime_base + WIN_THREAD_RETURN_OFFSET;
+        thread->arm_cpu.pstate = width == 8u ? 0u : 0x10u | (arg[2] & 1u ? 0x20u : 0u);
+        thread->cpu_mode = width == 8u ? XXEMUL_MODE_ARM_A64 : arg[2] & 1u ? XXEMUL_MODE_ARM_T32 : XXEMUL_MODE_ARM_A32;
+        if (width == 8u) thread->arm_cpu.gpr[18] = thread->teb_base;
+        thread->arm_thread_pointer = width == 8u ? 0u : thread->teb_base;
+        thread->arm_thread_pointer_valid = 1u;
+    }
+    if (process->emulator->arch == XXEMUL_ARCH_X86 &&
+        (!win_store(process, sp, width, process->runtime_base + WIN_THREAD_RETURN_OFFSET) ||
+        (width == 4u && !win_store(process, sp + 4u, width, arg[3])))) {
         win_thread_release_guest(process, thread); process->last_error = 998u; return XXEMUL_STATUS_OK;
     }
     thread->active = 1u; thread->handle_bound = 1u; thread->handle_slot = (uint16_t)handle_slot;
@@ -9531,6 +13257,23 @@ static xxemul_status win_thread_create(xxemul_windows *process, const uint64_t *
     handle->root_slot = (uint16_t)handle_slot; handle->thread_slot = (uint16_t)slot;
     handle->thread_start = arg[2]; handle->thread_parameter = arg[3];
     handle->object_id=thread->id;
+    if (!win_store(process, thread->teb_base, width, thread->seh_head) ||
+        !win_store(process, thread->teb_base + width, width, thread->stack_base) ||
+        !win_store(process, thread->teb_base + width * 2u, width, thread->stack_limit) ||
+        !win_store(process, thread->teb_base + (width == 8u ? 0x30u : 0x18u), width, thread->teb_base) ||
+        !win_store(process, thread->teb_base + (width == 8u ? 0x60u : 0x30u), width, process->runtime_base + 0x2000u) ||
+        !win_store(process, thread->teb_base + (width == 8u ? 0x58u : 0x2cu), width, thread->tls_array) ||
+        !win_store(process, thread->teb_base + (width == 8u ? 0x40u : 0x20u), width, process->process_id) ||
+        !win_store(process, thread->teb_base + (width == 8u ? 0x48u : 0x24u), width, thread->id)) {
+        thread->active = 0u; handle->in_use = 0u;
+        win_thread_release_guest(process, thread);
+        process->last_error = 8u; *result = 0u; return XXEMUL_STATUS_OK;
+    }
+    if (win_thread_initialize_structures(process, thread) != XXEMUL_STATUS_OK) {
+        thread->active = 0u; handle->in_use = 0u;
+        win_thread_release_guest(process, thread);
+        process->last_error = 8u; *result = 0u; return XXEMUL_STATUS_OK;
+    }
     if (arg[5]) (void)win_store(process, arg[5], 4u, thread->id);
     *result = 0x100u + handle_slot;
     return XXEMUL_STATUS_OK;
@@ -9561,9 +13304,8 @@ static xxemul_status win_thread_yield(xxemul_windows *process, xxemul_step_info 
     if(win_dll_thread_active(process))return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     size_t i, turn;
     win_thread_context *current = &process->threads[process->thread_current];
-    /* SEH records/CONTEXT bytes use a shared runtime arena. Do not switch
-     * a live exception handler until that arena is made thread-local. */
-    if (process->seh_depth && current->active) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    /* Exception records and CONTEXT blocks are on this thread's guest stack;
+     * win_thread_save/restore carries the asynchronous dispatch state. */
     if (current->active && !process->child_waiting) win_thread_save(process, current);
     process->child_waiting=0u;
     {
@@ -9579,17 +13321,27 @@ static xxemul_status win_thread_yield(xxemul_windows *process, xxemul_step_info 
             uint64_t value = 0u;
             if (!thread->active) continue;
             active = 1;
+            if (thread->blocked == 3u) {
+                win_critical_section *entry = win_critical_at(process, thread->wait_handles[0]);
+                if (!entry) return XXEMUL_STATUS_INVALID_ARGUMENT;
+                if (!entry->recursion) {
+                    entry->owner_id = thread->id;
+                    entry->recursion = 1u;
+                    if (win_critical_write(process, entry) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
+                    thread->blocked = 0u;
+                }
+            }
             if (thread->blocked == 2u && win_thread_wait_ready(process, thread, &value)) {
-                thread->cpu.gpr[XXEMUL_X86_RAX] = value; thread->blocked = 0u;
+                thread->cpu.gpr[XXEMUL_X86_RAX] = value; thread->arm_cpu.gpr[0] = value; thread->blocked = 0u;
                 if (value == UINT32_MAX) thread->last_error = 6u;
             } else if (thread->blocked && thread->deadline <= process->scheduler_tick) {
-                if (thread->blocked == 2u) thread->cpu.gpr[XXEMUL_X86_RAX] = 0x102u;
+                if (thread->blocked == 2u) { thread->cpu.gpr[XXEMUL_X86_RAX] = 0x102u; thread->arm_cpu.gpr[0] = 0x102u; }
                 thread->blocked = 0u;
             }
             if (thread->blocked && !thread->suspended && thread->deadline < earliest) earliest = thread->deadline;
         }
         if (!active) {
-            process->process_terminated=1u;
+            win_runtime_abandon_process(process);process->process_terminated=1u;
             process->emulator->halted = 1; process->emulator->exit_code = (uint8_t)process->exit_code;
             return XXEMUL_STATUS_HALTED;
         }
@@ -9599,7 +13351,7 @@ static xxemul_status win_thread_yield(xxemul_windows *process, xxemul_step_info 
             if (thread->active && !thread->blocked && !thread->suspended) {
                 process->thread_current = (unsigned)next;
                 win_thread_restore(process, thread);
-                if (info) info->next_address = thread->cpu.ip;
+                if (info) info->next_address = win_seh_ip(process);
                 return XXEMUL_STATUS_OK;
             }
         }
@@ -9615,67 +13367,38 @@ static xxemul_status win_thread_yield(xxemul_windows *process, xxemul_step_info 
     }
 }
 
-static win_dialog_frame *win_dialog_current(xxemul_windows *process)
-{
-    win_dialog_frame *result=NULL;size_t i;uint32_t owner=process->threads[process->thread_current].id;
-    for(i=0u;i<WIN_GUI_DIALOGS;++i){win_dialog_frame *frame=&process->dialogs[i];
-        if(frame->active&&frame->owner_id==owner&&(!result||frame->sequence>result->sequence))result=frame;
-    }
-    return result;
-}
-static xxemul_status win_dialog_invoke(xxemul_windows *process,win_dialog_frame *frame,xxemul_step_info *info)
-{
-    xxemul *emulator=process->emulator;uint8_t width=win_word_size(emulator);
-    uint64_t sp=(frame->caller.gpr[XXEMUL_X86_RSP]&~UINT64_C(15))-(width==8u?40u:32u);
-    uint64_t message=frame->phase==1u?0x30u:0x110u;
-    uint64_t wparam=frame->phase==1u?win_gui_at(process,frame->handle)->font:win_gui_initial_focus(process,frame->handle);
-    uint64_t lparam=frame->phase==1u?0u:frame->parameter;
-    if(!win_store(process,sp,width,process->runtime_base+WIN_DIALOG_RETURN_OFFSET))return XXEMUL_STATUS_ADDRESS_FAULT;
-    emulator->x86=frame->caller;
-    if(width==8u){
-        emulator->x86.gpr[XXEMUL_X86_RCX]=frame->handle;emulator->x86.gpr[XXEMUL_X86_RDX]=message;
-        emulator->x86.gpr[XXEMUL_X86_R8]=wparam;emulator->x86.gpr[XXEMUL_X86_R9]=lparam;
-    }else if(!win_store(process,sp+4u,4u,frame->handle)||!win_store(process,sp+8u,4u,message)||
-             !win_store(process,sp+12u,4u,wparam)||!win_store(process,sp+16u,4u,lparam))return XXEMUL_STATUS_ADDRESS_FAULT;
-    emulator->x86.gpr[XXEMUL_X86_RSP]=sp;emulator->x86.ip=frame->procedure;
-    if(info)info->next_address=frame->procedure;
-    return XXEMUL_STATUS_OK;
-}
-static xxemul_status win_dialog_finish(xxemul_windows *process,win_dialog_frame *frame,xxemul_step_info *info)
-{
-    xxemul_x86_state caller=frame->caller;uint64_t result=frame->result;
-    (void)win_close_handle(process,frame->event);win_gui_discard(process,frame->handle);memset(frame,0,sizeof(*frame));
-    process->emulator->x86=caller;process->emulator->x86.gpr[XXEMUL_X86_RAX]=win_word_size(process->emulator)==8u?result:(uint32_t)result;
-    if(info)info->next_address=caller.ip;
-    return XXEMUL_STATUS_OK;
-}
-static xxemul_status win_dialog_return(xxemul_windows *process,int waited,xxemul_step_info *info)
-{
-    win_dialog_frame *frame=win_dialog_current(process);win_thread_context *thread;
-    size_t i;int others=0;
-    if(!frame)return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-    if(frame->ended)return win_dialog_finish(process,frame,info);
-    if(!waited&&frame->phase==1u){frame->phase=2u;return win_dialog_invoke(process,frame,info);}
-    frame->phase=3u;process->emulator->x86=frame->caller;
-    process->emulator->x86.ip=process->runtime_base+WIN_DIALOG_WAIT_OFFSET;
-    thread=&process->threads[process->thread_current];thread->blocked=2u;thread->deadline=UINT64_MAX;
-    thread->wait_count=1u;thread->wait_handles[0]=frame->event;thread->wait_all=0u;
-    for(i=0u;i<WIN_MAX_THREADS;++i)if(i!=process->thread_current&&process->threads[i].active&&!process->threads[i].suspended)others=1;
-    if(!others)return XXEMUL_STATUS_INPUT_REQUIRED;
-    return win_thread_yield(process,info);
-}
-
 static void win_thread_end(xxemul_windows *process, size_t slot, uint32_t code)
 {
     win_thread_context *thread = &process->threads[slot];
     if (!thread->active) return;
+    win_fls_abandon_thread(process, slot);
+    win_cbt_abandon_thread(process,thread->id);
+    {
+        size_t n;
+        win_window_wait *w=&process->window_waits[slot];
+        if(w->event)(void)win_close_handle(process,w->event);
+        memset(w,0,sizeof(*w));
+        for(n=0;n<WIN_WINDOW_FRAMES;n++)if(process->window_frames[n].active&&process->window_frames[n].owner_id==thread->id){
+            win_allocation *a=win_find_allocation(process,process->window_frames[n].data);if(a)a->active=0;
+            memset(&process->window_frames[n],0,sizeof(process->window_frames[n]));
+        }
+        for(n=0;n<WIN_GUI_OBJECTS;n++)if(process->gui_objects[n].active&&process->gui_objects[n].kind==WIN_GUI_WINDOW&&process->gui_objects[n].owner_id==thread->id)
+            win_window_release(process,UINT64_C(0x10000)+n);
+        for(n=0;n<WIN_GUI_OBJECTS;n++)if(process->gui_objects[n].active&&process->gui_objects[n].kind==WIN_GUI_DIALOG&&process->gui_objects[n].owner_id==thread->id)
+            win_gui_discard(process,UINT64_C(0x10000)+n);
+        for(n=0;n<WIN_GUI_OBJECTS;n++){win_gui_object *dc=&process->gui_objects[n];if(dc->active&&dc->kind==WIN_GUI_DC&&dc->owner_id==thread->id){
+            win_gui_object *bitmap=dc->style?win_gui_at(process,dc->resource):NULL;if(bitmap&&bitmap->kind==WIN_GUI_BITMAP&&!bitmap->id)bitmap->parent=0;memset(dc,0,sizeof(*dc));}}
+
+    }
     {
         size_t index;
         for (index=0u;index<WIN_GUI_DIALOGS;++index) {
             win_dialog_frame *dialog=&process->dialogs[index];
             if (!dialog->active || dialog->owner_id!=thread->id) continue;
             (void)win_close_handle(process,dialog->event);
-            win_gui_discard(process,dialog->handle);
+            win_gui_discard_owned(process,dialog->handle,dialog->root_generation);
+            {win_allocation *a=win_find_allocation(process,dialog->data);if(a)a->active=0;a=win_find_allocation(process,dialog->filter_data);if(a)a->active=0;}
+            free(dialog->plan);
             memset(dialog,0,sizeof(*dialog));
         }
     }
@@ -9685,6 +13408,7 @@ static void win_thread_end(xxemul_windows *process, size_t slot, uint32_t code)
         if (--handle->references == 0u) memset(handle, 0, sizeof(*handle));
     }
     win_thread_release_guest(process, thread);
+    thread->com_references = 0u; thread->com_apartment = 0u;
     thread->active = 0u;thread->exit_code=code;process->exit_code = code;
 
 }
@@ -9692,6 +13416,7 @@ static void win_thread_end(xxemul_windows *process, size_t slot, uint32_t code)
 static xxemul_status win_thread_finish_raw(xxemul_windows *process, uint32_t code, xxemul_step_info *info)
 {
     if (!process->threads[process->thread_current].active) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (win_fls_current(process)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     win_thread_end(process, process->thread_current, code);
     return win_thread_yield(process, info);
 }
@@ -9700,6 +13425,11 @@ static xxemul_status win_thread_finish(xxemul_windows *process, uint32_t code, x
 {
     win_thread_context *thread = &process->threads[process->thread_current];
     if (!thread->active || win_dll_thread_active(process)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (win_fls_current(process)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (process->emulator->arch == XXEMUL_ARCH_ARM) return win_thread_finish_raw(process, code, info);
+    if (!thread->fls_cleanup_done && win_fls_has_values(process))
+        return win_fls_start_exit(process, WIN_FLS_THREAD_EXIT, code, info);
+    thread->fls_cleanup_done = 1u;
     if (win_dll_last_thread(process)) {
         if (win_dll_exit_needed(process)) return win_dll_exit(process, code, info);
         return win_thread_finish_raw(process, code, info);
@@ -9711,6 +13441,7 @@ static xxemul_status win_thread_finish(xxemul_windows *process, uint32_t code, x
 int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxemul_status *status)
 {
     uint64_t ip, return_address, value = 0;
+    uint64_t dll_sequence_before;
     size_t index;
     uint64_t arguments[16] = {0};
     uint8_t word_size, i;
@@ -9720,8 +13451,22 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
     int wait_single = 0, wait_multiple = 0;
 
     if (process == NULL || status == NULL) return 0;
+    *status = win_loader_lock_sync(process);
+    if (*status != XXEMUL_STATUS_OK) return 1;
+    if (!process->process_initialized && !process->startup_pending && !process->dll_depth &&
+        (process->tls_started || (process->emulator->arch == XXEMUL_ARCH_ARM && !process->main_tls.callbacks))) {
+        process->process_initialized = 1u;
+        if (win_process_sync_exception_flags(process) != XXEMUL_STATUS_OK) { *status = XXEMUL_STATUS_ADDRESS_FAULT; return 1; }
+    }
     if (process->emulator->arch == XXEMUL_ARCH_ARM) return win_arm_try_step(process, info, status);
     ip = process->emulator->x86.ip;
+    if (ip == process->runtime_base + WIN_FLS_RETURN_OFFSET) {
+        *status = win_fls_continue(process, 1, info);
+        return 1;
+    }
+    if(ip==process->runtime_base+WIN_CBT_RETURN_OFFSET){*status=win_cbt_return(process,info);return 1;}
+    if(ip==process->runtime_base+WIN_WINDOW_RETURN_OFFSET){*status=win_window_return(process,info);return 1;}
+    if(ip==process->runtime_base+WIN_WINDOW_WAIT_OFFSET){*status=win_window_wait_resume(process,info);return 1;}
     if (process->startup_pending) {
         process->startup_pending = 0u;
         process->tls_started = 1;
@@ -9751,7 +13496,7 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
         win_seh_frame *frame = &process->seh_frames[process->seh_depth - 1u];
         uint64_t head;
         if (process->emulator->x86.gpr[XXEMUL_X86_RSP] < frame->saved.gpr[XXEMUL_X86_RSP] ||
-            !win_load(process, process->runtime_base, 4u, &head) || head == frame->dispatcher) break;
+            !win_load(process, win_current_teb(process), 4u, &head) || head == frame->dispatcher) break;
         /* Some native handlers unwind their registration and resume with a
          * direct RET instead of returning an EXCEPTION_DISPOSITION. */
         --process->seh_depth;
@@ -9779,7 +13524,7 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
             return 1;
         }
         if(win_dll_exit_needed(process)){*status=win_dll_exit(process,(uint32_t)process->emulator->x86.gpr[XXEMUL_X86_RAX],info);return 1;}
-        process->process_terminated=1u;
+        win_runtime_abandon_process(process);process->process_terminated=1u;
         process->exit_code = (uint32_t)process->emulator->x86.gpr[XXEMUL_X86_RAX];
         process->emulator->exit_code = (uint8_t)process->exit_code;
         process->emulator->halted = 1;
@@ -9802,6 +13547,10 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
     index = win_api_index(process, ip);
     if (index == SIZE_MAX) return 0;
     api = &process->apis[index];
+    if (api->unsupported) {
+        *status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        return 1;
+    }
     word_size = (uint8_t)(win_word_size(process->emulator));
     if (!win_load(process, process->emulator->x86.gpr[XXEMUL_X86_RSP], word_size, &return_address)) {
         *status = XXEMUL_STATUS_ADDRESS_FAULT;
@@ -9826,6 +13575,7 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
             }
         }
     }
+    if (win_exception_api(process, api, arguments, return_address, info, status)) return 1;
     if (strcmp(api->name, "_initterm") == 0 || strcmp(api->name, "_initterm_e") == 0) {
         win_initterm_frame *frame;
         if (process->initterm_depth >= WIN_MAX_INITTERM_DEPTH || arguments[1] < arguments[0] || arguments[1] - arguments[0] > (uint64_t)word_size * 4096u ||
@@ -9889,12 +13639,13 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
     }
     {
         uint64_t teb_error;
-        if (win_load(process, process->runtime_base + (word_size == 8u ? 0x68u : 0x34u), 4u, &teb_error))
+        if (win_load(process, win_current_teb(process) + (word_size == 8u ? 0x68u : 0x34u), 4u, &teb_error))
             process->last_error = (uint32_t)teb_error;
     }
     if((win_equal(api->name,"ExitProcess")||win_equal(api->name,"exit")||win_equal(api->name,"_exit"))&&win_dll_exit_needed(process)){*status=win_dll_exit(process,(uint32_t)arguments[0],info);return 1;}
+    dll_sequence_before = process->dll_sequence;
     call_status = win_call(process, api, arguments, &value);
-    (void)win_store(process, process->runtime_base + (word_size == 8u ? 0x68u : 0x34u), 4u, process->last_error);
+    (void)win_store(process, win_current_teb(process) + (word_size == 8u ? 0x68u : 0x34u), 4u, process->last_error);
     if (call_status != XXEMUL_STATUS_OK && call_status != XXEMUL_STATUS_HALTED) {
         *status = call_status;
         return 1;
@@ -9909,20 +13660,59 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
         process->emulator->x86.ip = return_address;
         process->emulator->x86.gpr[XXEMUL_X86_RSP] += word_size == 8u ? 8u : 4u + (api->caller_cleans ? 0u : (uint64_t)api->argument_count * 4u);
         process->emulator->x86.gpr[XXEMUL_X86_RAX] = word_size == 8u ? value : (uint32_t)value;
+        if(win_cbt_api_pending(process)){*status=win_cbt_api_continue(process,info);return 1;}
+        if (process->fls_pending) {
+            win_fls_frame *frame = win_fls_current(process);
+            if (!frame || process->fls_pending != (unsigned)(frame - process->fls_frames) + 1u) {
+                *status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                return 1;
+            }
+            process->fls_pending = 0u;
+            frame->caller = process->emulator->x86;
+            *status = win_fls_continue(process, 0, info);
+            return 1;
+        }
+        if(process->window_pending){
+            win_window_frame *f=&process->window_frames[process->window_pending-1u];process->window_pending=0;
+            f->caller=process->emulator->x86;*status=win_window_invoke(process,f,info);return 1;
+        }
+        if(process->window_wait_pending){
+            win_window_wait *w=&process->window_waits[process->thread_current];process->window_wait_pending=0;
+            w->caller=process->emulator->x86;w->active=1;process->emulator->x86.ip=process->runtime_base+WIN_WINDOW_WAIT_OFFSET;
+            *status=win_window_wait_resume(process,info);return 1;
+        }
         if(process->dll_pending){size_t dll_slot=process->dll_pending-1u;int unloading=process->dll_pending_unload;
             process->dll_pending=0u;process->dll_pending_unload=0u;
             *status=win_dll_begin(process,dll_slot,unloading,0,info);return 1;}
-        {size_t dll_slot;if(win_dll_uninitialized(process,&dll_slot)){
-            *status=win_dll_begin(process,dll_slot,0,0,info);return 1;}}
-        if (process->dialog_pending && (win_equal(api->name,"DialogBoxParamA") || win_equal(api->name,"DialogBoxParamW"))) {
-            win_dialog_frame *frame=&process->dialogs[process->dialog_pending-1u];
-            process->dialog_pending=0u;frame->caller=process->emulator->x86;
-            frame->phase=win_gui_at(process,frame->handle)->font?1u:2u;
-            *status=win_dialog_invoke(process,frame,info);return 1;
+        if (!process->dll_depth) {
+            size_t dll_slot;
+            if (win_dll_uninitialized(process, &dll_slot)) {
+                *status = win_dll_begin(process, dll_slot, 0, 0, info);
+                return 1;
+            }
+        } else {
+            /* An ordinary API in DllMain/TLS must not start an older queued
+             * dependent. A forwarder may nevertheless load a fresh DLL in
+             * this call without setting dll_pending. Its reserved slot
+             * precedes its recursively loaded dependencies; initialize that
+             * new root and its closure before returning to guest code. */
+            size_t dll_slot;
+            for (dll_slot = 0u; dll_slot < process->module_count; ++dll_slot) {
+                win_module *module = &process->modules[dll_slot];
+                if (module->real && module->live && !module->initialized && !module->initializing &&
+                    module->init_order > dll_sequence_before) {
+                    *status = win_dll_begin(process, dll_slot, 0, 0, info);
+                    return 1;
+                }
+            }
+        }
+        if(process->dialog_pending){
+            win_dialog_frame *frame=&process->dialogs[process->dialog_pending-1u];process->dialog_pending=0u;
+            frame->caller=process->emulator->x86;*status=win_dialog_create_next(process,frame,info);return 1;
         }
         {
             win_thread_context *thread = &process->threads[process->thread_current];
-            int yield = win_equal(api->name,"EndDialog") && value;
+            int yield = thread->blocked == 3u || (win_equal(api->name,"EndDialog") && value);
             if ((wait_single || wait_multiple) && value == 0x102u && wait_timeout) {
                 size_t index;
                 thread->blocked = 2u;
@@ -9953,4 +13743,251 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
     }
     *status = call_status;
     return 1;
+}
+
+/* Synchronous CLR/native transitions use the existing Windows process. They
+ * never load host DLL code or invent native return values. */
+static xxemul_status win_native_stop(xxemul_windows *process, xxemul_windows_native_result *result,
+                                    xxemul_status status, const char *diagnostic)
+{
+    result->status = status;
+    if (process) {
+        result->stopped_state = process->emulator->x86;
+        result->stopped_thread_id = process->threads[process->thread_current].id;
+        result->last_error = process->last_error;
+    }
+    if (diagnostic) (void)win_copy(result->diagnostic, sizeof(result->diagnostic), diagnostic);
+    return status;
+}
+
+static xxemul_status win_native_run(xxemul_windows *process, unsigned owner, uint64_t limit,
+                                   xxemul_windows_native_result *result)
+{
+    uint64_t sentinel = process->runtime_base + WIN_NATIVE_RETURN_OFFSET;
+    for (;;) {
+        xxemul_status status;
+        if (process->thread_current == owner && process->emulator->x86.ip == sentinel && !process->dll_depth)
+            return XXEMUL_STATUS_OK;
+        if (result->instructions == limit) return XXEMUL_STATUS_LIMIT_REACHED;
+        status = xxemul_step(process->emulator, NULL);
+        ++result->instructions;
+        if (status != XXEMUL_STATUS_OK) return status;
+    }
+}
+
+static xxemul_status win_native_initialize(xxemul_windows *process, unsigned owner, uint64_t limit,
+                                          xxemul_windows_native_result *result, int *incomplete)
+{
+    size_t slot;
+    while (win_dll_uninitialized(process, &slot)) {
+        xxemul_status status;
+        result->phase = XXEMUL_WINDOWS_NATIVE_INITIALIZE;
+        process->emulator->x86.ip = process->runtime_base + WIN_NATIVE_RETURN_OFFSET;
+        status = win_dll_begin(process, slot, 0, 0, NULL);
+        if (status == XXEMUL_STATUS_OK) status = win_native_run(process, owner, limit, result);
+        if (status != XXEMUL_STATUS_OK) { *incomplete = 1; return status; }
+    }
+    return XXEMUL_STATUS_OK;
+}
+
+static uint64_t win_native_export(xxemul_windows *process, win_module *module, const char *name)
+{
+    size_t i;
+    if (module->real) return win_dll_export(process, module, name, 0u, name[0] == '#');
+    if (win_explicit_module(module->name)) {
+        uint64_t ordinal = 0u;
+        const char *at;
+        if (name[0] != '#') {
+            const win_export_spec *spec = win_explicit_export(module->name, 0u, name);
+            if (spec) return win_resolve_spec(process, spec);
+            if (win_strict_exports_module(module->name)) return 0u;
+            for (i = 0u; i < module->api_count; ++i) {
+                const win_api *api = &process->apis[module->api_indices[i]];
+                if (!strcmp(api->name, name)) return api->address;
+            }
+            return 0u;
+        }
+        if (!name[1]) return 0u;
+        for (at = name + 1; *at; ++at) {
+            if (*at < '0' || *at > '9' || ordinal > (UINT16_MAX - (unsigned)(*at - '0')) / 10u) return 0u;
+            ordinal = ordinal * 10u + (unsigned)(*at - '0');
+        }
+        return win_resolve_ordinal(process, module->name, (uint16_t)ordinal);
+    }
+    /* P/Invoke must not manufacture the generic unknown-import fallback. */
+    if (name[0] == '#') {
+        uint64_t ordinal = 0u;
+        const char *at = name + 1;
+        if (!*at) return 0u;
+        for (; *at; ++at) {
+            if (*at < '0' || *at > '9' || ordinal > (UINT16_MAX - (unsigned)(*at - '0')) / 10u) return 0u;
+            ordinal = ordinal * 10u + (unsigned)(*at - '0');
+        }
+        if (!ordinal || ordinal > module->api_count) return 0u;
+        return process->apis[module->api_indices[ordinal - 1u]].address;
+    }
+    for (i = 0u; i < module->api_count; ++i) {
+        const win_api *api = &process->apis[module->api_indices[i]];
+        if (!strcmp(api->name, name)) return api->address;
+    }
+    return 0u;
+}
+
+xxemul_status xxemul_windows_invoke_native(xxemul_windows *process, const xxemul_windows_native_call *call,
+                                          xxemul_windows_native_result *result)
+{
+    xxemul *emulator;
+    win_thread_context caller;
+    win_module *module;
+    xxemul_status status;
+    uint64_t sp, top, expected_sp, entry, teb_error;
+    uint32_t generation;
+    unsigned owner, width;
+    size_t i, stack_bytes = 0u, cursor;
+    int in_step, incomplete = 0;
+    if (!result) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    memset(result, 0, sizeof(*result));
+    if (!process || !call || !call->module || !*call->module || !call->entry || !*call->entry ||
+        strlen(call->module) >= 2048u || strlen(call->entry) >= 96u || !call->instruction_limit ||
+        call->argument_count > 16u || (call->argument_count && (!call->arguments || !call->argument_widths)) ||
+        (call->return_width != 0u && call->return_width != 4u && call->return_width != 8u))
+        return win_native_stop(process, result, XXEMUL_STATUS_INVALID_ARGUMENT, "invalid native call descriptor");
+    emulator = process->emulator;
+    if (emulator->arch != XXEMUL_ARCH_X86 || (emulator->mode != XXEMUL_MODE_X86_32 && emulator->mode != XXEMUL_MODE_X86_64))
+        return win_native_stop(process, result, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "native scalar ABI requires x86 or x64");
+    width = win_word_size(emulator);
+    if ((width == 8u && call->convention != XXEMUL_WINDOWS_NATIVE_WIN64) ||
+        (width == 4u && call->convention != XXEMUL_WINDOWS_NATIVE_STDCALL && call->convention != XXEMUL_WINDOWS_NATIVE_CDECL))
+        return win_native_stop(process, result, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "unsupported native calling convention");
+    for (i = 0u; i < call->argument_count; ++i) {
+        if (call->argument_widths[i] != 4u && call->argument_widths[i] != 8u)
+            return win_native_stop(process, result, XXEMUL_STATUS_INVALID_ARGUMENT, "invalid native scalar width");
+        stack_bytes += width == 8u ? 8u : call->argument_widths[i];
+    }
+    if (process->native_call_active)
+        return win_native_stop(process, result, XXEMUL_STATUS_INVALID_ARGUMENT, "native bridge or loader reentry");
+    if (process->native_call_failure)
+        return win_native_stop(process, result, process->native_call_failure, "previous native invocation did not complete");
+    if (process->dll_depth || process->dll_pending || process->startup_pending)
+        return win_native_stop(process, result, XXEMUL_STATUS_INVALID_ARGUMENT, "native bridge or loader reentry");
+    if (emulator->halted || process->process_terminated || !process->threads[process->thread_current].active)
+        return win_native_stop(process, result, XXEMUL_STATUS_HALTED, "native process or caller thread has terminated");
+    owner = process->thread_current;
+    top = emulator->x86.gpr[XXEMUL_X86_RSP];
+    if ((width == 4u && (top & 3u)) || top < stack_bytes + 0x40u)
+        return win_native_stop(process, result, XXEMUL_STATUS_ADDRESS_FAULT, "invalid native caller stack");
+    sp = width == 8u ? ((top - 0x28u - (call->argument_count > 4u ? (call->argument_count - 4u) * 8u : 0u)) & ~UINT64_C(0xf)) - 8u : top - 4u - stack_bytes;
+    if (!win_memory_span(process, sp, top - sp))
+        return win_native_stop(process, result, XXEMUL_STATUS_ADDRESS_FAULT, "native call frame is outside guest memory");
+    in_step = emulator->in_step;
+    /* Guest memory hooks can call back even during the state capture below.
+     * Publish the guard before the first guest read, not just before running. */
+    process->native_call_active = 1u;
+    if (win_load(process, win_current_teb(process) + (width == 8u ? 0x68u : 0x34u), 4u, &teb_error))
+        process->last_error = (uint32_t)teb_error;
+    caller = process->threads[owner];
+    win_thread_save(process, &caller);
+    result->phase = XXEMUL_WINDOWS_NATIVE_LOAD;
+    module = win_find_module(process, call->module, 0);
+    if (!module) {
+        if (win_loadable_module(process, call->module)) module = win_find_module(process, call->module, 1);
+        else module = win_dll_at(process, win_dll_load(process, call->module, 0u));
+    }
+    (void)win_store(process, win_current_teb(process) + (width == 8u ? 0x68u : 0x34u), 4u, process->last_error);
+    if (!module) { status = XXEMUL_STATUS_IO_ERROR; (void)win_copy(result->diagnostic, sizeof(result->diagnostic), "guest native DLL could not be loaded"); goto done; }
+    if (module->data_only) { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        (void)win_copy(result->diagnostic, sizeof(result->diagnostic), "guest native DLL was loaded without initialization"); goto done; }
+    result->module_base = module->base;
+    generation = module->generation;
+    result->phase = XXEMUL_WINDOWS_NATIVE_INITIALIZE;
+    status = win_native_initialize(process, owner, call->instruction_limit, result, &incomplete);
+    if (status != XXEMUL_STATUS_OK) goto done;
+    if (!module->live || module->generation != generation || (module->real && !module->initialized)) {
+        status = XXEMUL_STATUS_INVALID_IMAGE; incomplete = 1;
+        (void)win_copy(result->diagnostic, sizeof(result->diagnostic), "guest DLL initialization was rejected"); goto done;
+    }
+    result->phase = XXEMUL_WINDOWS_NATIVE_RESOLVE;
+    entry = win_native_export(process, module, call->entry);
+    if (!entry) { process->last_error = 127u; (void)win_store(process, win_current_teb(process) + (width == 8u ? 0x68u : 0x34u), 4u, 127u); status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        (void)win_copy(result->diagnostic, sizeof(result->diagnostic), "guest DLL export was not found"); goto done; }
+    /* A forwarded export can load another real dependency. Its initializer
+     * must finish before the resolved code executes. */
+    status = win_native_initialize(process, owner, call->instruction_limit, result, &incomplete);
+    if (status != XXEMUL_STATUS_OK) goto done;
+    entry = win_native_export(process, module, call->entry);
+    if (!entry || !win_memory_span(process, entry, 1u)) { process->last_error = 127u; (void)win_store(process, win_current_teb(process) + (width == 8u ? 0x68u : 0x34u), 4u, 127u); status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; goto done; }
+    result->entry_address = entry;
+    result->phase = XXEMUL_WINDOWS_NATIVE_CALL;
+    emulator->x86 = caller.cpu;
+    if (!win_store(process, sp, (uint8_t)width, process->runtime_base + WIN_NATIVE_RETURN_OFFSET)) {
+        status = XXEMUL_STATUS_ADDRESS_FAULT; goto done;
+    }
+    cursor = 4u;
+    for (i = 0u; i < call->argument_count; ++i) {
+        uint64_t value = call->argument_widths[i] == 4u ? (uint32_t)call->arguments[i] : call->arguments[i];
+        if (width == 8u && i < 4u) {
+            static const unsigned registers[4] = {XXEMUL_X86_RCX, XXEMUL_X86_RDX, XXEMUL_X86_R8, XXEMUL_X86_R9};
+            emulator->x86.gpr[registers[i]] = value;
+        } else {
+            uint64_t address = width == 8u ? sp + 0x28u + (i - 4u) * 8u : sp + cursor;
+            if (!win_store(process, address, (uint8_t)(width == 8u ? 8u : call->argument_widths[i]), value)) {
+                status = XXEMUL_STATUS_ADDRESS_FAULT; goto done;
+            }
+        }
+        cursor += call->argument_widths[i];
+    }
+    emulator->x86.gpr[XXEMUL_X86_RSP] = sp;
+    emulator->x86.ip = entry;
+    status = win_native_run(process, owner, call->instruction_limit, result);
+    if (status != XXEMUL_STATUS_OK) { incomplete = 1; goto done; }
+    expected_sp = width == 8u ? sp + 8u : call->convention == XXEMUL_WINDOWS_NATIVE_CDECL ? sp + 4u : top;
+    if (emulator->x86.gpr[XXEMUL_X86_RSP] != expected_sp) {
+        status = XXEMUL_STATUS_INVALID_IMAGE; incomplete = 1;
+        (void)win_copy(result->diagnostic, sizeof(result->diagnostic), "guest native return violated its stack ABI"); goto done;
+    }
+    if (call->return_width == 4u) result->value = (uint32_t)emulator->x86.gpr[XXEMUL_X86_RAX];
+    else if (call->return_width == 8u) result->value = width == 8u ? emulator->x86.gpr[XXEMUL_X86_RAX] :
+        (uint32_t)emulator->x86.gpr[XXEMUL_X86_RAX] | (uint64_t)(uint32_t)emulator->x86.gpr[XXEMUL_X86_RDX] << 32u;
+    result->phase = XXEMUL_WINDOWS_NATIVE_COMPLETE;
+done:
+    (void)win_native_stop(process, result, status, NULL);
+    /* Leave every guest memory/TLS/LastError effect intact. If a native worker
+     * was scheduled at failure, save it before restoring the suspended caller. */
+    if (process->thread_current != owner) {
+        win_thread_save(process, &process->threads[process->thread_current]);
+        process->thread_current = owner;
+        win_thread_restore(process, &process->threads[owner]);
+    }
+    if (win_load(process, win_current_teb(process) + (width == 8u ? 0x68u : 0x34u), 4u, &teb_error))
+        process->last_error = (uint32_t)teb_error;
+    else process->last_error = result->last_error;
+    result->last_error = process->last_error;
+    (void)win_store(process, win_current_teb(process) + (width == 8u ? 0x68u : 0x34u), 4u, process->last_error);
+    emulator->x86 = caller.cpu;
+    memcpy(emulator->x87_raw, caller.x87_raw, sizeof(emulator->x87_raw)); emulator->x87_tags = caller.x87_tags;
+    memcpy(emulator->x87_stack, caller.x87_stack, sizeof(caller.x87_stack));
+    memcpy(emulator->x87_int_val, caller.x87_int_val, sizeof(caller.x87_int_val));
+    memcpy(emulator->x87_is_int, caller.x87_is_int, sizeof(caller.x87_is_int));
+    emulator->x87_depth = caller.x87_depth; emulator->x87_top = caller.x87_top;
+    emulator->x87_control = caller.x87_control; emulator->x87_status = caller.x87_status;
+    memcpy(emulator->x86_debug, caller.x86_debug, sizeof(emulator->x86_debug));
+    emulator->x86_mxcsr = caller.x86_mxcsr;
+    emulator->in_step = in_step;
+    process->native_call_active = 0u;
+    if (incomplete) process->native_call_failure = status;
+    return status;
+}
+
+xxemul_status xxemul_windows_post_input(xxemul_windows *process,uint64_t window,uint32_t message,uint64_t wparam,uint64_t lparam)
+{
+    win_gui_object *object;uint8_t width,widths[4];uint64_t arguments[4];xxemul_windows_native_call call;xxemul_windows_native_result result;
+    if(!process||process->emulator->in_step||process->native_call_active)return XXEMUL_STATUS_INVALID_ARGUMENT;
+    object=win_hwnd_at(process,window);
+    if(!object||object->destroying||object->owner_id!=process->threads[process->thread_current].id)return XXEMUL_STATUS_INVALID_ARGUMENT;
+    width=win_word_size(process->emulator);widths[0]=width;widths[1]=4u;widths[2]=width;widths[3]=width;
+    arguments[0]=window;arguments[1]=message;arguments[2]=wparam;arguments[3]=lparam;memset(&call,0,sizeof(call));
+    call.module="user32.dll";call.entry="PostMessageA";call.arguments=arguments;call.argument_widths=widths;call.argument_count=4u;
+    call.convention=width==8u?XXEMUL_WINDOWS_NATIVE_WIN64:XXEMUL_WINDOWS_NATIVE_STDCALL;call.return_width=4u;call.instruction_limit=1024u;
+    if(xxemul_windows_invoke_native(process,&call,&result)!=XXEMUL_STATUS_OK)return result.status;
+    return result.value?XXEMUL_STATUS_OK:XXEMUL_STATUS_INVALID_ARGUMENT;
 }
