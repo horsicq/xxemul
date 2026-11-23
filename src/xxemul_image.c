@@ -71,11 +71,13 @@ xxemul *xxemul_create_image_at(xxemul_image_format format, const void *image, si
         status = &local_status;
     }
     *status = XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (format < XXEMUL_IMAGE_COM || format > XXEMUL_IMAGE_MACHO64 || image == NULL || image_size == 0u || image_size > (size_t)LONG_MAX) {
+    if (format < XXEMUL_IMAGE_COM || format > XXEMUL_IMAGE_AMIGA_HUNK || image == NULL || image_size == 0u || image_size > (size_t)LONG_MAX) {
+        if (format == XXEMUL_IMAGE_AMIGA_HUNK && image != NULL && image_size == 0u)
+            *status = XXEMUL_STATUS_INVALID_IMAGE;
         return NULL;
     }
     if (image_base != 0 && format != XXEMUL_IMAGE_PE32 && format != XXEMUL_IMAGE_PE64 &&
-        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ && format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64) {
+        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ && format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64 && format != XXEMUL_IMAGE_AMIGA_HUNK) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }
@@ -88,6 +90,7 @@ xxemul *xxemul_create_image_at(xxemul_image_format format, const void *image, si
         return NULL;
     }
     switch (format) {
+        case XXEMUL_IMAGE_AMIGA_HUNK: emulator = xxemul_load_amigahunk(image, image_size, image_base, status); break;
         case XXEMUL_IMAGE_PE32:
         case XXEMUL_IMAGE_PE64: emulator = xxemul_load_pe(format, (const uint8_t *)image, image_size, io, image_base, status); break;
         case XXEMUL_IMAGE_ELF32:
@@ -115,11 +118,11 @@ xxemul *xxemul_create_image_file_at(xxemul_image_format format, const char *path
         status = &local_status;
     }
     *status = XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (path == NULL || format < XXEMUL_IMAGE_COM || format > XXEMUL_IMAGE_MACHO64) {
+    if (path == NULL || format < XXEMUL_IMAGE_COM || format > XXEMUL_IMAGE_AMIGA_HUNK) {
         return NULL;
     }
     if (image_base != 0 && format != XXEMUL_IMAGE_PE32 && format != XXEMUL_IMAGE_PE64 &&
-        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ && format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64) {
+        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ && format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64 && format != XXEMUL_IMAGE_AMIGA_HUNK) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }
@@ -131,7 +134,7 @@ xxemul *xxemul_create_image_file_at(xxemul_image_format format, const char *path
     size = xx_io_total_size(io);
     if (size <= 0 || size > XXEMUL_IMAGE_MAX_FILE_SIZE) {
         xx_io_close(io);
-        *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+        *status = format == XXEMUL_IMAGE_AMIGA_HUNK ? XXEMUL_STATUS_INVALID_IMAGE : XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }
     image = (uint8_t *)xx_mem_alloc((size_t)size);

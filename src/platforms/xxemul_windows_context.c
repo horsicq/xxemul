@@ -200,7 +200,13 @@ xxemul_status xxemul_x87_prepare_numeric(xxemul *e)
     unsigned i;
     int empty = 0;
     uint8_t encoded[10];
-    fp_load(e, &fp); fp.depth = 0;
+    fp_load(e, &fp);
+    /* Every physical tag empty means there is no raw register state to bridge.
+     * Keep the numeric cache untouched so a faulting arithmetic instruction
+     * (e.g. FDIV m32fp that raises #PF on its operand read) leaves the register
+     * file, and therefore a restart, exactly as it found it. */
+    if (fp.tags == UINT16_C(0xffff) && e->x87_depth != 0u) return XXEMUL_STATUS_OK;
+    fp.depth = 0;
     memset(fp.stack, 0, sizeof(fp.stack)); memset(fp.integer, 0, sizeof(fp.integer));
     memset(fp.is_integer, 0, sizeof(fp.is_integer));
     for (i = 0; i < 8u; ++i) {

@@ -6,6 +6,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Shared host path confinement: canonical root; reject symlinks/reparse points
+ * and parent traversal, resolve existing components case-insensitively. */
+int xxemul_host_root_path(char *root, size_t capacity, const char *workdir);
+uint16_t xxemul_host_resolve(const char *root, const char *guest, char *host, size_t capacity, int creating);
+
 /* Call after creating a DOS image and before stepping it. argv excludes argv[0].
  * The DOS drive is rooted at workdir; the executable must also be staged there.
  * A failed start preserves the current session. Destroying the emulator stops it. */

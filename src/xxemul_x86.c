@@ -2406,6 +2406,13 @@ static xxemul_status xxemul_mmx_execute(xxemul *e, const cdisasm_x86_instruction
     if (insn->name_id == CDISASM_X86_NAME_EMMS) {
         if (insn->operand_count != 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         e->x87_top = 0u; e->x87_tags = UINT16_C(0xffff); e->x87_status &= UINT16_C(0xc7ff);
+        /* The physical register file is now empty; drop any stale numeric
+         * cache so a later x87 instruction bridges from the empty file
+         * instead of resurrecting pre-EMMS values. */
+        memset(e->x87_stack, 0, sizeof(e->x87_stack));
+        memset(e->x87_int_val, 0, sizeof(e->x87_int_val));
+        memset(e->x87_is_int, 0, sizeof(e->x87_is_int));
+        e->x87_depth = 0u;
         return XXEMUL_STATUS_OK;
     }
     if (insn->operand_count != 2u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;

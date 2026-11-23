@@ -69,6 +69,7 @@ if(NOT TARGET cdisasm::cdisasm)
         set(USE_ARCH_X86 ON CACHE BOOL "" FORCE)
         set(USE_ARCH_ARM ON CACHE BOOL "" FORCE)
         set(USE_ARCH_MIPS ON CACHE BOOL "" FORCE)
+        set(USE_ARCH_M68K ON CACHE BOOL "" FORCE)
         set(USE_DISASM_FORMAT ON CACHE BOOL "" FORCE)
         set(USE_EXTRA_OPCODES ${XXEMUL_CDISASM_EXTRA_OPCODES} CACHE BOOL "" FORCE)
         set(_xxemul_build_testing "${BUILD_TESTING}")
@@ -119,6 +120,7 @@ add_library(xxemul
     src/xxemul_status.c
     src/xxemul_x86.c
     src/xxemul_arm.c
+    src/xxemul_m68k.c
     src/xxemul_mips.c
     src/xxemul_mips64.c
     src/xxemul_arm_simd.h
@@ -130,6 +132,9 @@ add_library(xxemul
     src/formats/xxemul_elf.c
     src/formats/xxemul_macho.c
     src/formats/xxemul_macho_fixups.h
+    src/formats/xxemul_amigahunk.c
+    src/platforms/xxemul_amigaos.c
+    src/platforms/xxemul_amigaos.h
     src/formats/xxemul_com.c
     src/formats/xxemul_msdos_exe.c
     src/platforms/xxemul_dos_loader.c
@@ -469,6 +474,18 @@ if(XXEMUL_BUILD_TESTS AND BUILD_TESTING AND _xxemul_has_tests)
     target_link_libraries(xxemul_dos_load_base_tests PRIVATE xxemul::xxemul)
     add_test(NAME xxemul_dos_load_base_tests COMMAND xxemul_dos_load_base_tests)
     set_tests_properties(xxemul_dos_load_base_tests PROPERTIES TIMEOUT 30)
+    add_executable(xxemul_amiga_hunk_tests tests/test_amiga_hunk.c)
+    target_link_libraries(xxemul_amiga_hunk_tests PRIVATE xxemul::xxemul)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/amiga-hunk-tests")
+    add_test(NAME xxemul_amiga_hunk_tests COMMAND xxemul_amiga_hunk_tests)
+    set_tests_properties(xxemul_amiga_hunk_tests PROPERTIES TIMEOUT 60
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/amiga-hunk-tests")
+
+    add_executable(xxemul_m68k_tests tests/test_m68k.c)
+    target_include_directories(xxemul_m68k_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(xxemul_m68k_tests PRIVATE xxemul::xxemul cdisasm::cdisasm xxfclib::xxfclib)
+    add_test(NAME xxemul_m68k_tests COMMAND xxemul_m68k_tests)
+
     add_executable(xxemul_mips_tests tests/test_mips.c)
     target_link_libraries(xxemul_mips_tests PRIVATE xxemul::xxemul)
     add_test(NAME xxemul_mips_tests COMMAND xxemul_mips_tests)

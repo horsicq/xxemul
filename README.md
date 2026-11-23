@@ -1,9 +1,9 @@
 # xxemul
 
-`xxemul` is a pure C11 instruction emulator for x86, ARM, MIPS32/MIPS64 and Dalvik. It accepts a
+`xxemul` is a pure C11 instruction emulator for x86, ARM, MC68000, MIPS32/MIPS64 and Dalvik. It accepts a
 caller-supplied flat region, or explicitly loads COM, MZ, PE32, PE64, ELF32,
-ELF64, Mach-O 32, and Mach-O 64 images. The loaders use format parsers from
-the sibling `xxfclib`.
+ELF64, Mach-O 32/64, and Amiga Hunk images. Most loaders use format parsers
+from the sibling `xxfclib`; the Hunk loader has its own bounded parser.
 
 APK and standalone DEX loading are available through `xxemul/xxemul_dex.h`.
 The bounded Dalvik interpreter is in `xxemul/xxemul_dex_runtime.h`, using
@@ -180,6 +180,55 @@ Static owned ARM32, ARM64 and MIPS32 LE/BE ELF fixtures packed with UPX
 4.2.4 NRV2E/LZMA have been unpacked through both script adapters and executed
 afresh in the debugger. The fixture programs use modeled write/exit calls;
 this does not establish arbitrary libc, dynamic-linker or native-host support.
+
+## MC68000 and Amiga Hunk
+
+Flat-region MC68000 execution uses `XXEMUL_ARCH_M68K` and
+`XXEMUL_MODE_M68K_68000`. `xxemul_get_m68k_state` / `xxemul_set_m68k_state`
+expose D0-D7, A0-A7, PC, SR, USP and SSP. The interpreter supports the plain
+68000 integer instruction set, big-endian memory, even-address checks,
+exception frames, supervisor/user stack switching and memory hooks. Decoding
+and formatting use cdisasm. It does not model cycle timing, the prefetch queue,
+external interrupts, peripherals or later 680x0 instructions. Debugger ILLEGAL
+traps use the existing breakpoint API; current/stack address queries return
+PC/active A7.
+
+Load `XXEMUL_IMAGE_AMIGA_HUNK` with `xxemul_create_image[_file][_at]`, then call
+`xxemul_start_process` with that format, program path, working directory and
+argv (including argv[0]). The default first segment starts at `0x00200000`,
+with entry at `0x00200008`; a nonzero base selects the segment's size word.
+Each segment contains its byte size, a BPTR link, and zero-filled CODE/DATA/BSS
+storage. RELOC32, RELOC32SHORT (including the executable DREL32 alias), and
+RELRELOC32 (documented longword and compact word fields) are supported. Resident libraries and overlays are
+rejected. The zero-based flat map includes low memory, a 1 MiB heap and an
+8 KiB stack, stays below 16 MiB for small default images, and is capped at
+256 MiB. Explicit bases must be longword-aligned and at least `0x20000`.
+
+The CLI model supplies AbsExecBase, a Process/CLI structure, command BSTR,
+A0/D0 argument string/length (joined arguments plus newline and trailing NUL),
+and an RTS exit trampoline. Modeled Exec/DOS negative vectors provide library
+opening, allocation, signals, memory copying, formatting, file and console I/O,
+seek/delete, DateStamp and process exit. File paths reuse DOS confinement and
+case-insensitive component lookup under the working directory. Console output
+uses `xxemul_set_output_callback` stream 1; console input returns EOF. RTS/DOS
+Exit preserve a full 32-bit exit code through `xxemul_process_exit_code`.
+`xxemul_symbol_name` identifies library vectors and their callable stubs.
+
+RawDoFmt supports `%d`, `%ld`, `%u`, `%x`, `%lx`, `%s`, `%c`, `%b`, width/flags
+and precision, with word-sized default numbers in both RawDoFmt and DOS
+VPrintf/VFPrintf. PutChProc supports the common `move.b d0,(a3)+; rts` callback,
+NULL/string, `(void *)1`/serial-output and `(void *)2`/count conventions.
+String/count callbacks include the final NUL; serial output uses stream 1.
+Other callbacks stop with a diagnostic. SetFunction supports replacing and
+restoring vectors while retaining callable original stubs. Delay is a virtual
+no-op; Wait consumes pending signals or halts with a diagnostic when none can
+arrive. Workbench startup, asynchronous tasks/devices and unlisted LVOs are
+unsupported; `xxemul_process_error` identifies unsupported library/LVO calls.
+This is a minimal CLI environment, with bounded strings and formatted output.
+
+Fixtures are embedded in `tests/amiga_hunk_fixtures.inc`; regenerate them with
+`python3 tests/make_amiga_hunk_fixtures.py` and GNU m68k-linux-gnu binutils.
+The build and tests do not need a cross assembler.
 
 ## Windows process model
 

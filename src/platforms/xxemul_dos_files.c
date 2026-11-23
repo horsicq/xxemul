@@ -312,10 +312,10 @@ static int dos_path_kind(const char *path)
 
 /* Resolve DOS paths component by component; no symlink or reparse point may
  * redirect an xxfclib open outside the configured workspace. */
-static uint16_t dos_resolve(const dos_session *session, const char *guest, char *host, size_t capacity, int creating)
+uint16_t xxemul_host_resolve(const char *root, const char *guest, char *host, size_t capacity, int creating)
 {
     const char *cursor = guest;
-    size_t used = strlen(session->root);
+    size_t used = strlen(root);
     int components = 0;
 
     /* Mode 2 resolves an existing directory for bounded FindFirst searches. */
@@ -323,7 +323,7 @@ static uint16_t dos_resolve(const dos_session *session, const char *guest, char 
     if (used == 0u || used + 1u >= capacity) {
         return 3u;
     }
-    memcpy(host, session->root, used + 1u);
+    memcpy(host, root, used + 1u);
     if (isalpha((unsigned char)cursor[0]) && cursor[1] == ':') {
         cursor += 2;
     }
@@ -391,6 +391,11 @@ static uint16_t dos_resolve(const dos_session *session, const char *guest, char 
         ++components;
     }
     return components != 0 || directory ? 0u : 3u;
+}
+
+static uint16_t dos_resolve(const dos_session *session, const char *guest, char *host, size_t capacity, int creating)
+{
+    return xxemul_host_resolve(session->root, guest, host, capacity, creating);
 }
 
 static void dos_sft_update(xxemul *emulator, const dos_session *session, uint16_t handle);
@@ -1138,7 +1143,7 @@ static uint16_t dos_seek(xxemul *emulator, dos_session *session)
     return 0u;
 }
 
-static int dos_root_path(char *root, size_t capacity, const char *workdir)
+int xxemul_host_root_path(char *root, size_t capacity, const char *workdir)
 {
 #if defined(_WIN32)
     DWORD attributes;
@@ -1248,7 +1253,7 @@ xxemul_status xxemul_dos_files_start(xxemul *emulator, const char *workdir, cons
     if (session == NULL) {
         return XXEMUL_STATUS_OUT_OF_MEMORY;
     }
-    if (!dos_root_path(session->root, sizeof(session->root), workdir)) {
+    if (!xxemul_host_root_path(session->root, sizeof(session->root), workdir)) {
         free(session);
         return XXEMUL_STATUS_IO_ERROR;
     }

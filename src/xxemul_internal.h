@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef struct xxemul_amigaos xxemul_amigaos;
 typedef struct xxemul_windows xxemul_windows;
 typedef struct xxemul_linux_process xxemul_linux_process;
 typedef struct xxemul_darwin xxemul_darwin;
@@ -64,6 +65,8 @@ struct xxemul {
     uint64_t region_address;
     size_t region_size;
     uint8_t *region_data;
+    xxemul_amigaos *amigaos;
+    uint32_t amiga_hunk_base, amiga_hunk_end;
     xxemul_windows *windows;
     xxemul_linux_process *linux_process;
     xxemul_darwin *darwin;
@@ -127,6 +130,16 @@ struct xxemul {
     uint8_t arm_thread_pointer_valid;
     xxemul_arm_state arm;
     xxemul_mips_state mips;
+    xxemul_m68k_state m68k;
+    /* Last exception vector/opcode, including unhandled exceptions. Zero
+     * vector means no exception in the most recent step. */
+    uint32_t m68k_exception_vector;
+    uint16_t m68k_exception_opcode;
+    /* TRAP and line-A/F interception, before vector/stack processing. OK
+     * completes the instruction; any other result requests normal exception
+     * processing. The hook may redirect PC; unchanged PC advances by two. */
+    xxemul_status (*m68k_trap_hook)(xxemul *, uint32_t, uint16_t, void *);
+    void *m68k_trap_context;
     uint32_t mips_branch_target;
     int mips_delay_pending;
     uint32_t mips_reservation;
@@ -192,6 +205,7 @@ struct xxemul {
 xxemul *xxemul_create_empty(xxemul_arch arch, xxemul_mode mode, uint64_t region_address, size_t region_size, xxemul_status *status);
 
 xxemul *xxemul_image_allocate(xxemul_arch arch, xxemul_mode mode, uint64_t base, uint64_t image_span, uint64_t entry, int unix_stack, xxemul_status *status);
+xxemul *xxemul_load_amigahunk(const uint8_t *image, size_t size, uint64_t base, xxemul_status *status);
 xxemul *xxemul_load_pe(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, uint64_t image_base, xxemul_status *status);
 xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t image_size, xx_io_device *io, uint64_t image_base, xxemul_status *status);
 void xxemul_elf_primary_destroy(xxemul *emulator);
@@ -233,6 +247,10 @@ size_t xxemul_x86_format_current(xxemul *emulator, char *buffer, size_t buffer_s
 
 xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info);
 size_t xxemul_arm_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
+
+xxemul_m68k_state *xxemul_m68k_regs(xxemul *emulator);
+xxemul_status xxemul_m68k_step(xxemul *emulator, xxemul_step_info *info);
+size_t xxemul_m68k_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
 
 xxemul_status xxemul_mips_step(xxemul *emulator, xxemul_step_info *info);
 size_t xxemul_mips_format_current(xxemul *emulator, char *buffer, size_t buffer_size);

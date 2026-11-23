@@ -1,6 +1,7 @@
 #include "xxemul_internal.h"
 #include "platforms/xxemul_windows.h"
 #include "platforms/xxemul_linux.h"
+#include "platforms/xxemul_amigaos.h"
 #include "platforms/xxemul_darwin.h"
 #include "platforms/xxemul_dos_files.h"
 
@@ -28,6 +29,7 @@ static int xxemul_mode_matches_arch(xxemul_arch arch, xxemul_mode mode)
     if (arch == XXEMUL_ARCH_ARM) {
         return mode == XXEMUL_MODE_ARM_A32 || mode == XXEMUL_MODE_ARM_T32 || mode == XXEMUL_MODE_ARM_A64;
     }
+    if (arch == XXEMUL_ARCH_M68K) return mode == XXEMUL_MODE_M68K_68000;
     if (arch == XXEMUL_ARCH_MIPS) return mode == XXEMUL_MODE_MIPS32 || mode == XXEMUL_MODE_MIPS32_BE ||
         mode == XXEMUL_MODE_MIPS64 || mode == XXEMUL_MODE_MIPS64_BE;
     return 0;
@@ -63,7 +65,8 @@ static int xxemul_config_addressable(const xxemul_config *config)
     last_address = config->region_address + (uint64_t)(config->region_size - 1);
     if ((config->mode == XXEMUL_MODE_X86_16 && last_address > UINT16_MAX) ||
         ((config->mode == XXEMUL_MODE_X86_32 || config->mode == XXEMUL_MODE_ARM_A32 || config->mode == XXEMUL_MODE_ARM_T32 ||
-          config->mode == XXEMUL_MODE_MIPS32 || config->mode == XXEMUL_MODE_MIPS32_BE) && last_address > UINT32_MAX)) {
+          config->mode == XXEMUL_MODE_MIPS32 || config->mode == XXEMUL_MODE_MIPS32_BE ||
+          config->mode == XXEMUL_MODE_M68K_68000) && last_address > UINT32_MAX)) {
         return 0;
     }
     return config->entry_address >= config->region_address && config->entry_address <= last_address;
@@ -133,7 +136,7 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
     if ((config->mode == XXEMUL_MODE_ARM_A32 || config->mode == XXEMUL_MODE_ARM_A64 || config->arch == XXEMUL_ARCH_MIPS) && (config->entry_address & UINT64_C(3)) != 0) {
         return NULL;
     }
-    if (config->mode == XXEMUL_MODE_ARM_T32 && (config->entry_address & UINT64_C(1)) != 0) {
+    if ((config->mode == XXEMUL_MODE_ARM_T32 || config->arch == XXEMUL_ARCH_M68K) && (config->entry_address & UINT64_C(1)) != 0) {
         return NULL;
     }
     emulator = xxemul_create_empty(config->arch, config->mode, config->region_address, config->region_size, status);
@@ -143,7 +146,7 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
     xx_mem_copy(emulator->region_data, config->code, config->code_size);
 
     stack_alignment = config->arch == XXEMUL_ARCH_ARM || config->mode == XXEMUL_MODE_MIPS64 || config->mode == XXEMUL_MODE_MIPS64_BE ? 16u : (config->arch == XXEMUL_ARCH_MIPS ? 8u :
-        (config->mode == XXEMUL_MODE_X86_16 ? 2u : (config->mode == XXEMUL_MODE_X86_32 ? 4u : 8u)));
+        ((config->mode == XXEMUL_MODE_X86_16 || config->arch == XXEMUL_ARCH_M68K) ? 2u : (config->mode == XXEMUL_MODE_X86_32 ? 4u : 8u)));
     stack_top = config->region_address + (uint64_t)config->region_size;
     stack_top &= ~((uint64_t)stack_alignment - UINT64_C(1));
 
@@ -151,6 +154,10 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
         emulator->x86.ip = config->entry_address;
         emulator->x86.flags = UINT64_C(2);
         emulator->x86.gpr[XXEMUL_X86_RSP] = stack_top;
+    } else if (config->arch == XXEMUL_ARCH_M68K) {
+        emulator->m68k.pc = (uint32_t)config->entry_address;
+        emulator->m68k.a[7] = emulator->m68k.usp = (uint32_t)stack_top;
+        emulator->m68k.ssp = (uint32_t)stack_top;
     } else if (config->arch == XXEMUL_ARCH_MIPS) {
         if (config->mode == XXEMUL_MODE_MIPS64 || config->mode == XXEMUL_MODE_MIPS64_BE) {
             emulator->mips64.pc = config->entry_address;
@@ -175,6 +182,7 @@ void xxemul_destroy(xxemul *emulator)
     if (emulator == NULL) {
         return;
     }
+    xxemul_amigaos_destroy(emulator->amigaos);
     xxemul_windows_destroy(emulator->windows);
     xxemul_elf_primary_destroy(emulator);
     xxemul_linux_destroy(emulator->linux_process);
@@ -244,11 +252,13 @@ xxemul_status xxemul_start_process(xxemul *emulator, xxemul_image_format format,
     xxemul_status status = XXEMUL_STATUS_INVALID_ARGUMENT;
 
     if (emulator == NULL || program_path == NULL || working_directory == NULL || argc < 0 || (argc > 0 && argv == NULL) || emulator->windows != NULL ||
-        emulator->linux_process != NULL) {
+        emulator->linux_process != NULL || emulator->amigaos != NULL) {
         return status;
     }
     if((emulator->windows_native_dll_count||emulator->windows_default_actctx)&&format!=XXEMUL_IMAGE_PE32&&format!=XXEMUL_IMAGE_PE64)return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
     emulator->windows_native_policy_locked=1u;
+    if (format == XXEMUL_IMAGE_AMIGA_HUNK)
+        return xxemul_amigaos_start(emulator, program_path, working_directory, argc, argv);
     if (format == XXEMUL_IMAGE_MACHO32 || format == XXEMUL_IMAGE_MACHO64) {
         if (emulator->darwin == NULL) return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return xxemul_darwin_start(emulator->darwin, program_path, working_directory, argc, argv);
@@ -301,6 +311,7 @@ int xxemul_process_exit_code(const xxemul *emulator)
     if (emulator->windows != NULL) return (int)xxemul_windows_exit_code(emulator->windows);
     if (emulator->linux_process != NULL) return xxemul_linux_exit_code(emulator->linux_process);
     if (emulator->darwin != NULL) return xxemul_darwin_exit_code(emulator->darwin);
+    if (emulator->amigaos != NULL) return xxemul_amigaos_exit_code(emulator->amigaos);
     if (emulator->dos_mode) return (int)emulator->exit_code;
     return -1;
 }
@@ -308,6 +319,7 @@ int xxemul_process_exit_code(const xxemul *emulator)
 const char *xxemul_process_error(const xxemul *emulator)
 {
     const char *elf_error = xxemul_elf_primary_error(emulator);
+    if (emulator != NULL && emulator->amigaos != NULL) return xxemul_amigaos_error(emulator->amigaos);
     if (elf_error != NULL) return elf_error;
     if (emulator == NULL || emulator->darwin == NULL) return NULL;
     return xxemul_darwin_last_error(emulator->darwin);
@@ -688,6 +700,10 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
         }
         return status;
     }
+    if (emulator->arch == XXEMUL_ARCH_M68K) {
+        status = xxemul_m68k_step(emulator, info);
+        return xxemul_amigaos_after_step(emulator->amigaos, status);
+    }
     if (emulator->arch == XXEMUL_ARCH_MIPS)
         return emulator->mode == XXEMUL_MODE_MIPS64 || emulator->mode == XXEMUL_MODE_MIPS64_BE
             ? xxemul_mips64_step(emulator, info) : xxemul_mips_step(emulator, info);
@@ -743,6 +759,7 @@ size_t xxemul_format_current(xxemul *emulator, char *buffer, size_t buffer_size)
     if (emulator->arch == XXEMUL_ARCH_X86) {
         return xxemul_x86_format_current(emulator, buffer, buffer_size);
     }
+    if (emulator->arch == XXEMUL_ARCH_M68K) return xxemul_m68k_format_current(emulator, buffer, buffer_size);
     if (emulator->arch == XXEMUL_ARCH_MIPS)
         return emulator->mode == XXEMUL_MODE_MIPS64 || emulator->mode == XXEMUL_MODE_MIPS64_BE
             ? xxemul_mips64_format_current(emulator, buffer, buffer_size) : xxemul_mips_format_current(emulator, buffer, buffer_size);
@@ -809,6 +826,10 @@ xxemul_status xxemul_get_current_address(const xxemul *emulator, uint64_t *addre
         *address = emulator->mode == XXEMUL_MODE_MIPS64 || emulator->mode == XXEMUL_MODE_MIPS64_BE ? emulator->mips64.pc : emulator->mips.pc;
         return XXEMUL_STATUS_OK;
     }
+    if (emulator->arch == XXEMUL_ARCH_M68K) {
+        *address = emulator->m68k.pc;
+        return XXEMUL_STATUS_OK;
+    }
     return xxemul_x86_linear_address(emulator, XXEMUL_X86_CS, emulator->x86.ip, address);
 }
 
@@ -824,6 +845,10 @@ xxemul_status xxemul_get_stack_address(const xxemul *emulator, uint64_t *address
     }
     if (emulator->arch == XXEMUL_ARCH_MIPS) {
         *address = emulator->mode == XXEMUL_MODE_MIPS64 || emulator->mode == XXEMUL_MODE_MIPS64_BE ? emulator->mips64.gpr[29] : emulator->mips.gpr[29];
+        return XXEMUL_STATUS_OK;
+    }
+    if (emulator->arch == XXEMUL_ARCH_M68K) {
+        *address = emulator->m68k.a[7];
         return XXEMUL_STATUS_OK;
     }
     mask = emulator->mode == XXEMUL_MODE_X86_16 ? UINT16_MAX
@@ -876,6 +901,7 @@ int xxemul_is_halted(const xxemul *emulator)
 const char *xxemul_symbol_name(const xxemul *emulator, uint64_t address)
 {
     if (emulator == NULL) return NULL;
+    if (emulator->amigaos != NULL) return xxemul_amigaos_symbol(emulator->amigaos, address);
     if (emulator->darwin != NULL) return xxemul_darwin_symbol(emulator->darwin, address);
     if (emulator->windows != NULL) return xxemul_windows_thunk_name(emulator, address);
     return NULL;

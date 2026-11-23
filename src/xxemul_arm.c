@@ -19,7 +19,8 @@
  * architectural state here makes debugger state roundtrips preserve IT. */
 static uint8_t xxemul_arm_itstate(const xxemul *emulator)
 {
-    return (uint8_t)(((emulator->arm.pstate >> 8u) & 0xfcu) | ((emulator->arm.pstate >> 25u) & 3u));
+    uint8_t state = (uint8_t)(((emulator->arm.pstate >> 8u) & 0xfcu) | ((emulator->arm.pstate >> 25u) & 3u));
+    return (state >> 4u) == 15u ? 0u : state;
 }
 
 static void xxemul_arm_set_itstate(xxemul *emulator, uint8_t state)
@@ -561,6 +562,22 @@ static xxemul_status xxemul_arm_decode_current(xxemul *emulator, cdisasm_arm_ins
     if (emulator->mode == XXEMUL_MODE_ARM_T32 && (xxemul_arm_itstate(emulator) & 15u))
         flags.bitmap[CDISASM_ARM_DECODE_FLAGS_OPTION_BITMAP] |= CDISASM_ARM_DECODE_OPTION_IN_IT_BLOCK;
     decoded_size = cdisasm_arm_decode(CDISASM_ARM_CPU_ANY, xxemul_arm_cdisasm_mode(emulator), code, available, emulator->arm.pc, &flags, instruction);
+    if (decoded_size == 0u && emulator->mode == XXEMUL_MODE_ARM_A32) {
+        uint32_t word = (uint32_t)code[0] | ((uint32_t)code[1] << 8u) |
+            ((uint32_t)code[2] << 16u) | ((uint32_t)code[3] << 24u);
+        if ((word & UINT32_C(0x0f7f0ff0)) == UINT32_C(0x010f00d0)) {
+            /* Legacy ESIL accepts LDRD [PC,Rm]; decode via R0, then restore PC. */
+            code[2] &= 0xf0u;
+            decoded_size = cdisasm_arm_decode(CDISASM_ARM_CPU_ANY, CDISASM_ARM_MODE_A32, code, available, emulator->arm.pc, &flags, instruction);
+            if (decoded_size == 4u && instruction->name_id == CDISASM_ARM_NAME_LDRD &&
+                instruction->operand_count == 3u && instruction->operand[2].type == CDISASM_OPERAND_MEMORY) {
+                instruction->raw_instruction = word;
+                instruction->operand[2].base_reg = CDISASM_ARM_REG_R15;
+            } else {
+                decoded_size = 0u;
+            }
+        }
+    }
     emulator->x86_fetching = 0u;
     if (emulator->windows && emulator->in_step && decoded_size &&
         !xxemul_windows_memory_access(emulator->windows,emulator->arm.pc,decoded_size,8u,1)) return XXEMUL_STATUS_ADDRESS_FAULT;
@@ -1733,9 +1750,14 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
                 status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
                 break;
             }
-            /* PC is an architectural operand: A32 reads current_pc + 8,
-             * including MOV LR,PC used before an indirect BX call. */
+            /* Preserve pipeline PC for other A32 operands, including MOV LR,PC. */
             status = xxemul_arm_read_data_operand(emulator, &instruction, 1u, current_pc, &value, &shift_carry_valid, &shift_carry);
+            if (status == XXEMUL_STATUS_OK && emulator->mode == XXEMUL_MODE_ARM_A32 &&
+                instruction.name_id == CDISASM_ARM_NAME_MOV && instruction.operand_count == 2u &&
+                instruction.operand[0].type == CDISASM_OPERAND_REGISTER && instruction.operand[0].reg == CDISASM_ARM_REG_R0 &&
+                instruction.operand[1].type == CDISASM_OPERAND_REGISTER && instruction.operand[1].reg == CDISASM_ARM_REG_R15) {
+                value = next_pc;
+            }
             if (status == XXEMUL_STATUS_OK) {
                 status = xxemul_arm_write_register(emulator, instruction.operand[0].reg, value);
             }

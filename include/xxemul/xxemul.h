@@ -26,6 +26,7 @@ typedef uint32_t xxemul_arch;
 #define XXEMUL_ARCH_X86 UINT32_C(1)
 #define XXEMUL_ARCH_ARM UINT32_C(2)
 #define XXEMUL_ARCH_MIPS UINT32_C(3)
+#define XXEMUL_ARCH_M68K UINT32_C(4)
 
 typedef uint32_t xxemul_mode;
 #define XXEMUL_MODE_X86_16 UINT32_C(16)
@@ -40,6 +41,7 @@ typedef uint32_t xxemul_mode;
 #define XXEMUL_MODE_MIPS64 UINT32_C(0x203)
 #define XXEMUL_MODE_MIPS64_LE XXEMUL_MODE_MIPS64
 #define XXEMUL_MODE_MIPS64_BE UINT32_C(0x204)
+#define XXEMUL_MODE_M68K_68000 UINT32_C(0x301)
 
 typedef uint32_t xxemul_status;
 #define XXEMUL_STATUS_OK UINT32_C(0)
@@ -54,8 +56,8 @@ typedef uint32_t xxemul_status;
 #define XXEMUL_STATUS_INVALID_IMAGE UINT32_C(9)
 #define XXEMUL_STATUS_INPUT_REQUIRED UINT32_C(10)
 #define XXEMUL_STATUS_UNSUPPORTED_IMAGE UINT32_C(11)
-/** A guest INT3 executed while debug traps are enabled. IP is already past
- * the trapping instruction, as on hardware. */
+/** A guest debug trap (including M68K ILLEGAL) executed while debug traps
+ * are enabled. The instruction pointer is already past the instruction. */
 #define XXEMUL_STATUS_BREAKPOINT UINT32_C(12)
 
 #define XXEMUL_DISPLAY_WIDTH 640u
@@ -74,6 +76,7 @@ typedef uint32_t xxemul_image_format;
 #define XXEMUL_IMAGE_ELF64 UINT32_C(6)
 #define XXEMUL_IMAGE_MACHO32 UINT32_C(7)
 #define XXEMUL_IMAGE_MACHO64 UINT32_C(8)
+#define XXEMUL_IMAGE_AMIGA_HUNK UINT32_C(9)
 
 enum {
     XXEMUL_X86_ES = 0,
@@ -146,12 +149,36 @@ typedef struct xxemul_mips64_state {
     uint64_t lo;
 } xxemul_mips64_state;
 
+#define XXEMUL_M68K_SR_C UINT16_C(0x0001)
+#define XXEMUL_M68K_SR_V UINT16_C(0x0002)
+#define XXEMUL_M68K_SR_Z UINT16_C(0x0004)
+#define XXEMUL_M68K_SR_N UINT16_C(0x0008)
+#define XXEMUL_M68K_SR_X UINT16_C(0x0010)
+#define XXEMUL_M68K_SR_IPL_MASK UINT16_C(0x0700)
+#define XXEMUL_M68K_SR_S UINT16_C(0x2000)
+#define XXEMUL_M68K_SR_T UINT16_C(0x8000)
+
+/* Plain MC68000: big-endian data and instructions, even PC and word/long
+ * accesses. A7 is the active stack; usp/ssp mirror it when their bank is
+ * active and retain the inactive bank otherwise. Reserved SR bits read zero. */
+typedef struct xxemul_m68k_state {
+    uint32_t d[8];
+    uint32_t a[8];
+    uint32_t usp;
+    uint32_t ssp;
+    uint32_t pc;
+    uint16_t sr;
+    uint16_t reserved;
+} xxemul_m68k_state;
+
 /**
  * Configuration for the initial flat-region backend.
  *
  * The emulator owns a zero-filled region_size-byte copy, places code_size
  * bytes at its beginning, starts at entry_address, and initializes the stack
  * pointer to the aligned end of the same region.
+ * M68K requires a region fitting in 32 bits and an even entry address; A7
+ * starts at the even-aligned region end (modulo 2^32), in user mode (SR=0).
  */
 typedef struct xxemul_config {
     xxemul_arch arch;
@@ -177,7 +204,7 @@ XXEMUL_API xxemul *xxemul_create(const xxemul_config *config, xxemul_status *sta
 /** Loads an explicitly selected executable format into owned memory. */
 XXEMUL_API xxemul *xxemul_create_image(xxemul_image_format format, const void *image, size_t image_size, xxemul_status *status);
 XXEMUL_API xxemul *xxemul_create_image_file(xxemul_image_format format, const char *path, xxemul_status *status);
-/** Load a PE or DOS image at an explicit address. image_base == 0 preserves
+/** Load a supported image at an explicit address. image_base == 0 preserves
  * the existing loader behavior (PE preferred base; DOS PSP segment 0x814
  * and first program/module byte at physical address 0x8240).
  * A nonzero PE32/PE64 base applies relocations before execution and requires
@@ -191,7 +218,11 @@ XXEMUL_API xxemul *xxemul_create_image_file(xxemul_image_format format, const ch
  * its stack fits below video memory. PSP = (image_base >> 4) - 0x10, set
  * before DOS kernel initialization. MZ body, allocation and stack bounds
  * must fit conventional RAM. DOS region_address remains zero because its
- * memory region represents physical memory, including the PSP and kernel. */
+ * memory region represents physical memory, including the PSP and kernel.
+ * Amiga Hunk bases name the first segment's size word (entry is base + 8).
+ * Zero selects 0x00200000; explicit bases must be longword-aligned and >=
+ * 0x20000. The zero-based flat map, including runtime arenas, is capped at
+ * 256 MiB. LoadSeg links are BPTRs to the following segment's link word. */
 XXEMUL_API xxemul *xxemul_create_image_at(xxemul_image_format format, const void *image, size_t image_size, uint64_t image_base, xxemul_status *status);
 XXEMUL_API xxemul *xxemul_create_image_file_at(xxemul_image_format format, const char *path, uint64_t image_base, xxemul_status *status);
 /** Explicit DOS format; COM has no signature and is never auto-detected.
@@ -200,8 +231,10 @@ XXEMUL_API xxemul *xxemul_create_image_file_at(xxemul_image_format format, const
 XXEMUL_API xxemul *xxemul_create_dos(xxemul_dos_format format, const void *image, size_t image_size, xxemul_status *status);
 /** Reads a COM or MZ file through xxfclib's file device. */
 XXEMUL_API xxemul *xxemul_create_dos_file(xxemul_dos_format format, const char *path, xxemul_status *status);
-/** Initialize guest OS services for a loaded PE, ELF, DOS, or ARM64/arm64e Mach-O image.
+/** Initialize guest OS services for a loaded PE, ELF, DOS, Amiga Hunk, or ARM64/arm64e Mach-O image.
  * argv includes argv[0]; host file access is confined to working_directory.
+ * Amiga Hunk starts a CLI process with an 8 KiB stack, newline-terminated
+ * arguments at A0/D0, modeled Exec/DOS libraries and full-width exit codes.
  * ELF selects Linux services or native FreeBSD i386 static services from
  * OSABI 9. FreeBSD uses stack syscall arguments and CF/positive errno;
  * unsupported FreeBSD architectures, dynamic images and legacy branding fail.
@@ -260,6 +293,15 @@ XXEMUL_API xxemul_status xxemul_get_mips64_state(const xxemul *emulator, xxemul_
  * at the same PC preserve it. Any state write invalidates LL/SC reservations. */
 XXEMUL_API xxemul_status xxemul_set_mips64_state(xxemul *emulator, const xxemul_mips64_state *state);
 
+XXEMUL_API xxemul_status xxemul_get_m68k_state(const xxemul *emulator, xxemul_m68k_state *state);
+/* Rejects odd PC. A7 is authoritative for the bank selected by the supplied
+ * SR.S; the other bank is copied unchanged. Clears the stopped/halted state.
+ * Exceptions use the vector table at zero when mapped and nonzero; otherwise
+ * illegal instructions return UNSUPPORTED_INSTRUCTION, address errors return
+ * ADDRESS_FAULT, and other exceptions return HALTED. With debug traps enabled,
+ * ILLEGAL returns BREAKPOINT with PC advanced by two bytes. */
+XXEMUL_API xxemul_status xxemul_set_m68k_state(xxemul *emulator, const xxemul_m68k_state *state);
+
 XXEMUL_API xxemul_status xxemul_step(xxemul *emulator, xxemul_step_info *info);
 XXEMUL_API xxemul_status xxemul_run(xxemul *emulator, uint64_t instruction_limit, uint64_t *instructions_executed);
 
@@ -285,7 +327,8 @@ typedef void (*xxemul_memory_hook)(void *context, uint64_t address, size_t size,
 XXEMUL_API xxemul_status xxemul_set_output_callback(xxemul *emulator, xxemul_output_callback callback, void *context);
 XXEMUL_API xxemul_status xxemul_set_memory_hook(xxemul *emulator, xxemul_memory_hook hook, void *context);
 /** When enabled, a guest INT3 (and INT 3 outside DOS) returns
- * XXEMUL_STATUS_BREAKPOINT instead of halting the emulator. */
+ * XXEMUL_STATUS_BREAKPOINT instead of halting the emulator. On M68K this
+ * intercepts ILLEGAL (0x4AFC), advances PC by two, and leaves TRAP #15 alone. */
 XXEMUL_API xxemul_status xxemul_set_debug_traps(xxemul *emulator, int enabled);
 /** Automatic Windows native-fault dispatch is enabled by default. Disabling it
  * exposes raw fault statuses at the native step boundary for host-side API
@@ -310,7 +353,8 @@ XXEMUL_API xxemul_status xxemul_get_current_address(const xxemul *emulator, uint
  * the code mode, and wraps DOS segment-base plus offset to 32 bits. With DOS
  * paging disabled the A20 gate is applied; with paging enabled the address
  * is linear, without page-table translation. No segment access/limit check
- * is performed. ARM A32/T32 uses the low 32 bits of SP. */
+ * is performed. ARM A32/T32 uses the low 32 bits of SP. M68K returns A7,
+ * the active USP or SSP selected by SR.S. */
 XXEMUL_API xxemul_status xxemul_get_stack_address(const xxemul *emulator, uint64_t *address);
 /** Current effective x86 segment base, without reading guest memory.
  * Includes DOS descriptor/real-mode bases and Windows/Linux FS/GS TLS bases.
