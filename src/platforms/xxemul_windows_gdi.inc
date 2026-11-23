@@ -527,8 +527,10 @@ static int win_gdi_call(xxemul_windows *p,const char *name,const uint64_t *arg,u
         if(pixels){
             /* Canonical private rows are bottom-up like a positive-height DIB. */
             size_t row=(size_t)cx*4u;
+            const int top_down=cy<0;
             for(int32_t y=0;y<o->height;y++){
-                const uint8_t *src=pixels+(size_t)(cy<0?o->height-y-1:y)*source_stride;
+                const int32_t source_y=top_down?o->height-1-y:y;
+                const uint8_t *src=pixels+(size_t)source_y*source_stride;
                 uint8_t *dst=p->emulator->region_data+(size_t)(data-p->emulator->region_address)+(size_t)y*row;
                 if((colors>>16)==32u)memcpy(dst,src,row);
                 else for(int32_t x=0;x<cx;x++)win_put32(dst+(size_t)x*4u,palette[(src[(uint32_t)x/8u]>>(7u-((uint32_t)x&7u)))&1u]);
