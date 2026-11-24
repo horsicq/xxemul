@@ -296,6 +296,7 @@ typedef struct win_initterm_frame {
     uint64_t end;
     uint64_t call_sp;
     uint64_t return_address;
+    uint32_t is_e; /* _initterm_e: a nonzero callback result stops the walk and is returned */
 } win_initterm_frame;
 
 enum {
@@ -1322,6 +1323,7 @@ static const char *const win_crt_names[] = {"_controlfp", "_except_handler3", "_
                                         "_get_osfhandle",
                                         "_gmtime64",
                                         "_initterm",
+                                        "_initterm_e",
                                         "_kbhit",
                                         "_localtime64",
                                         "_lock",
@@ -1629,7 +1631,7 @@ static uint8_t win_argument_count(const char *name)
         win_equal(name, "GetConsoleScreenBufferInfo") || win_equal(name, "SetConsoleCursorInfo") || win_equal(name, "SetConsoleCursorPosition") ||
         win_equal(name, "SetConsoleTextAttribute") || win_equal(name, "GetHandleInformation") || win_equal(name, "SetProcessAffinityMask") ||
         win_equal(name, "SetThreadPriority") || win_equal(name, "GetThreadContext") || win_equal(name, "SetThreadContext") || win_equal(name, "IsDBCSLeadByteEx") ||
-        win_equal(name, "_initterm") || win_equal(name, "setlocale") || win_equal(name, "calloc") || win_equal(name, "realloc") || win_equal(name, "strchr") ||
+        win_equal(name, "_initterm") || win_equal(name, "_initterm_e") || win_equal(name, "setlocale") || win_equal(name, "calloc") || win_equal(name, "realloc") || win_equal(name, "strchr") ||
         win_equal(name, "strrchr") || win_equal(name, "strstr") || win_equal(name, "strcspn") || win_equal(name, "strcmp") || win_equal(name, "_stricmp") ||
         win_equal(name, "strcpy") || win_equal(name, "_stati64") || win_equal(name, "_stat64") || win_equal(name, "_fstati64") || win_equal(name, "_fstat64") ||
         win_equal(name, "_chmod") || win_equal(name, "LocalAlloc") || win_equal(name, "GlobalAlloc") || win_equal(name, "SetConsoleCtrlHandler") ||
@@ -4718,6 +4720,13 @@ static win_handle *win_handle_at(xxemul_windows *process, uint64_t handle)
     return entry;
 }
 
+/* The guest's own program file and synthetic system-module file handles may
+ * be opened for reading only; no handle-based setter may touch the host file. */
+static int win_file_host_protected(const xxemul_windows *process, const win_handle *entry)
+{
+    return entry->module_file_data != NULL || win_equal(entry->file_path, process->program_path);
+}
+
 static int win_is_current_process_handle(xxemul_windows *process, uint64_t handle, uint8_t word_size)
 {
     win_handle *entry;
@@ -4821,7 +4830,7 @@ static xxemul_status win_set_file_times(xxemul_windows *process, win_handle *ent
         process->last_error = 6u;
         return XXEMUL_STATUS_OK;
     }
-    if ((entry->file_access & (0x40000000u | 0x100u)) == 0u) {
+    if ((entry->file_access & (0x40000000u | 0x100u)) == 0u || win_file_host_protected(process, entry)) {
         process->last_error = 5u;
         return XXEMUL_STATUS_OK;
     }
@@ -6168,7 +6177,17 @@ typedef struct win_format_buffer {
     uint8_t *bytes;
     size_t length, capacity, limit;
     int wide;
+    int truncate; /* wsprintf family: keep limit-1 units, drop the rest */
 } win_format_buffer;
+
+/* Units of count that still fit; only a truncating buffer clips. */
+static size_t win_format_fit(const win_format_buffer *out, size_t count)
+{
+    size_t room;
+    if (!out->truncate) return count;
+    room = out->length < out->limit ? out->limit - 1u - out->length : 0u;
+    return count < room ? count : room;
+}
 
 static xxemul_status win_format_reserve(win_format_buffer *out, size_t count)
 {
@@ -6192,7 +6211,9 @@ static xxemul_status win_format_reserve(win_format_buffer *out, size_t count)
 
 static xxemul_status win_format_append(win_format_buffer *out, uint16_t character)
 {
-    xxemul_status status = win_format_reserve(out, 1u);
+    xxemul_status status;
+    if (win_format_fit(out, 1u) == 0u) return XXEMUL_STATUS_OK;
+    status = win_format_reserve(out, 1u);
     if (status != XXEMUL_STATUS_OK) return status;
     if (out->wide) win_put16(out->bytes + out->length * 2u, character);
     else out->bytes[out->length] = (uint8_t)character;
@@ -6202,7 +6223,9 @@ static xxemul_status win_format_append(win_format_buffer *out, uint16_t characte
 
 static xxemul_status win_format_repeat(win_format_buffer *out, uint16_t character, size_t count)
 {
-    xxemul_status status = win_format_reserve(out, count);
+    xxemul_status status;
+    count = win_format_fit(out, count);
+    status = win_format_reserve(out, count);
     if (status != XXEMUL_STATUS_OK) return status;
     while (count--) {
         if (out->wide) win_put16(out->bytes + out->length * 2u, character);
@@ -6266,16 +6289,20 @@ static xxemul_status win_format_string(xxemul_windows *process, win_format_buffe
             status = win_format_append(&text, win_format_character((uint16_t)ch, source_wide, out->wide));
             if (status != XXEMUL_STATUS_OK) goto done;
         }
-        if (precision < 0 && index == limit) { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; goto done; }
+        /* A string that alone fills a truncating buffer is simply clipped. */
+        if (precision < 0 && index == limit && !out->truncate) { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; goto done; }
     }
     if (!left && width > text.length) {
         status = win_format_repeat(out, ' ', width - text.length);
         if (status != XXEMUL_STATUS_OK) goto done;
     }
-    status = win_format_reserve(out, text.length);
-    if (status != XXEMUL_STATUS_OK) goto done;
-    if (text.length) memcpy(out->bytes + out->length * (out->wide ? 2u : 1u), text.bytes, text.length * (out->wide ? 2u : 1u));
-    out->length += text.length;
+    {
+        size_t copied = win_format_fit(out, text.length);
+        status = win_format_reserve(out, copied);
+        if (status != XXEMUL_STATUS_OK) goto done;
+        if (copied) memcpy(out->bytes + out->length * (out->wide ? 2u : 1u), text.bytes, copied * (out->wide ? 2u : 1u));
+        out->length += copied;
+    }
     if (left && width > text.length) status = win_format_repeat(out, ' ', width - text.length);
 done:
     free(text.bytes);
@@ -6411,12 +6438,14 @@ static xxemul_status win_format_guest(xxemul_windows *process, uint64_t format, 
             else written = snprintf(spec, sizeof(spec), "%%%s%u%s%c", flags, width, floating ? "" : "ll", type);
             if (written < 0 || (size_t)written >= sizeof(spec)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             count = floating ? snprintf(NULL, 0u, spec, real) : is_signed ? snprintf(NULL, 0u, spec, (long long)(int64_t)value) : snprintf(NULL, 0u, spec, (unsigned long long)value);
-            if (count < 0 || (size_t)count > out->limit - out->length) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            if (count < 0 || (!out->truncate && (size_t)count > out->limit - out->length) ||
+                (out->truncate && (size_t)count > out->limit * 2u + 64u)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             piece = (char *)malloc((size_t)count + 1u);
             if (piece == NULL) return XXEMUL_STATUS_OUT_OF_MEMORY;
             if (floating) snprintf(piece, (size_t)count + 1u, spec, real);
             else if (is_signed) snprintf(piece, (size_t)count + 1u, spec, (long long)(int64_t)value);
             else snprintf(piece, (size_t)count + 1u, spec, (unsigned long long)value);
+            count = (int)win_format_fit(out, (size_t)count);
             status = win_format_reserve(out, (size_t)count);
             if (status == XXEMUL_STATUS_OK) for (index = 0u; index < (size_t)count; ++index) {
                 if (out->wide) win_put16(out->bytes + out->length * 2u, (uint16_t)(uint8_t)piece[index]);
@@ -6435,11 +6464,12 @@ static xxemul_status win_format_guest(xxemul_windows *process, uint64_t format, 
 }
 
 static xxemul_status win_format_result(xxemul_windows *process, uint64_t destination, uint64_t format, int wide,
-                                      win_format_args *args, size_t limit, uint64_t *result)
+                                      win_format_args *args, size_t limit, int truncate, uint64_t *result)
 {
-    win_format_buffer out = {NULL, 0u, 0u, limit, wide};
+    win_format_buffer out = {NULL, 0u, 0u, limit, wide, truncate};
     xxemul_status status = win_format_guest(process, format, wide, args, &out);
     size_t count = out.length;
+    out.truncate = 0; /* the terminator always fits: truncation keeps limit-1 units */
     if (status == XXEMUL_STATUS_OK) status = win_format_append(&out, 0u);
     if (status == XXEMUL_STATUS_OK && !win_write(process, destination, out.bytes, out.length * (wide ? 2u : 1u))) status = XXEMUL_STATUS_ADDRESS_FAULT;
     if (status == XXEMUL_STATUS_OK) *result = count;
@@ -6951,7 +6981,7 @@ static xxemul_status win_legacy_write(xxemul_windows *process, const uint64_t *a
     ssize_t written;
     *result = UINT32_MAX;
     if (!handle || handle->kind != WIN_HANDLE_FILE || !handle->io) { process->last_error = 6u; return XXEMUL_STATUS_OK; }
-    if (!(handle->file_access & 0x40000000u)) { process->last_error = 5u; return XXEMUL_STATUS_OK; }
+    if (!(handle->file_access & 0x40000000u) || win_file_host_protected(process, handle)) { process->last_error = 5u; return XXEMUL_STATUS_OK; }
     if (count > WIN_MAX_IO) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
     if (count == 0u) {
         int64_t position = xx_io_tell(handle->io);
@@ -8084,8 +8114,12 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         int wide = win_suffix(name, "W");
         int valist = strcmp(name, "vsprintf") == 0 || win_prefix(name, "wvsprintf");
         win_format_args arguments = {valist ? arg[2] : 0u, 2u, !valist};
-        size_t limit = win_prefix(name, "w") ? 1024u / (wide ? 2u : 1u) : WIN_MAX_IO;
-        return win_format_result(process, arg[0], arg[1], wide, &arguments, limit, result);
+        /* wsprintfA/W and wvsprintfA/W write at most 1024 characters (bytes
+         * or WCHARs) including the terminator: longer output is truncated to
+         * 1023 + NUL and 1023 is returned. */
+        int user = win_prefix(name, "w");
+        size_t limit = user ? 1024u : WIN_MAX_IO;
+        return win_format_result(process, arg[0], arg[1], wide, &arguments, limit, user, result);
     }
     if (strcmp(name, "printf") == 0 || strcmp(name, "fprintf") == 0) {
         int explicit_stream = strcmp(name, "fprintf") == 0;
@@ -8485,7 +8519,8 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         win_handle *entry = win_handle_at(process, handle);
         uint32_t error = length < 0 ? 22u :
             entry == NULL || entry->kind != WIN_HANDLE_FILE ? 9u :
-            !(entry->file_access & (UINT32_C(0x40000000) | UINT32_C(0x10000000))) ? (secure ? 9u : 13u) : 0u;
+            !(entry->file_access & (UINT32_C(0x40000000) | UINT32_C(0x10000000))) ? (secure ? 9u : 13u) :
+            win_file_host_protected(process, entry) ? 13u : 0u;
         if (error == 0u && xx_io_resize(entry->io, length) != 0)
             error = errno == ENOSPC ? 28u : errno == EACCES || errno == EPERM ? 13u : 5u;
         *result = error ? (secure ? error : UINT32_MAX) : 0u;
@@ -9694,7 +9729,7 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         int64_t position;
         size_t index;
         if (!file || file->kind != WIN_HANDLE_FILE || !file->io) { process->last_error = 6u; return XXEMUL_STATUS_OK; }
-        if (!(file->file_access & 0x40000000u)) { process->last_error = 5u; return XXEMUL_STATUS_OK; }
+        if (!(file->file_access & 0x40000000u) || win_file_host_protected(process, file)) { process->last_error = 5u; return XXEMUL_STATUS_OK; }
         for (index = 0u; index < WIN_MAX_HANDLES; ++index) {
             win_handle *mapping = &process->handles[index];
             if (mapping->in_use && mapping->kind == WIN_HANDLE_MAPPING && mapping->file_path[0] && win_equal(mapping->file_path, file->file_path)) {
@@ -10181,27 +10216,37 @@ static xxemul_status win_call(xxemul_windows *process, const win_api *api, const
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "PeekNamedPipe") == 0) {
-        uint32_t avail = 0;
-        io = win_handle_io(process, arg[0]);
+        uint32_t avail = 0u, copied = 0u;
+        win_handle *peeked = win_handle_at(process, arg[0]);
+        *result = 0u;
+        /* Standard handles (0x10..0x12) behave as empty byte pipes; anything
+         * else must be a live file/pipe handle. */
+        if ((peeked == NULL || peeked->kind != WIN_HANDLE_FILE) && !(arg[0] >= 0x10u && arg[0] <= 0x12u)) {
+            process->last_error = 6u;
+            return XXEMUL_STATUS_OK;
+        }
+        io = peeked != NULL ? peeked->io : NULL;
         if (io != NULL) {
             int64_t total = xx_io_size(io);
             int64_t cur = xx_io_tell(io);
-            if (total > cur) avail = (uint32_t)(total - cur);
+            if (cur >= 0 && total > cur) avail = (uint64_t)(total - cur) > UINT32_MAX ? UINT32_MAX : (uint32_t)(total - cur);
         }
         if (arg[1] != 0 && avail > 0 && (uint32_t)arg[2] > 0) {
             uint32_t to_read = (uint32_t)arg[2] < avail ? (uint32_t)arg[2] : avail;
             uint8_t *tmp = (uint8_t *)malloc(to_read);
-            if (tmp != NULL) {
-                int64_t pos = xx_io_tell(io);
-                xx_io_read(io, tmp, to_read);
-                xx_io_seek64(io, pos, SEEK_SET);
-                win_write(process, arg[1], tmp, to_read);
-                free(tmp);
-            }
+            int64_t pos = xx_io_tell(io);
+            ssize_t got;
+            if (tmp == NULL) { process->last_error = 8u; return XXEMUL_STATUS_OK; }
+            got = xx_io_read(io, tmp, to_read);
+            if (xx_io_seek64(io, pos, SEEK_SET) != 0 || got < 0) { free(tmp); process->last_error = 6u; return XXEMUL_STATUS_OK; }
+            if (got > 0 && !win_write(process, arg[1], tmp, (size_t)got)) { free(tmp); process->last_error = 998u; return XXEMUL_STATUS_OK; }
+            copied = (uint32_t)got;
+            free(tmp);
         }
-        if (arg[3] != 0) win_store(process, arg[3], 4u, 0u);
-        if (arg[4] != 0) win_store(process, arg[4], 4u, avail);
-        if (arg[5] != 0) win_store(process, arg[5], 4u, avail);
+        /* Byte-mode pipes: lpBytesLeftThisMessage is always zero. */
+        if ((arg[3] != 0 && !win_store(process, arg[3], 4u, copied)) ||
+            (arg[4] != 0 && !win_store(process, arg[4], 4u, avail)) ||
+            (arg[5] != 0 && !win_store(process, arg[5], 4u, 0u))) { process->last_error = 998u; return XXEMUL_STATUS_OK; }
         *result = 1u;
         return XXEMUL_STATUS_OK;
     }
@@ -11400,16 +11445,20 @@ static xxemul_status win_initterm_continue(xxemul_windows *process, uint64_t cur
     win_initterm_frame *frame;
     uint8_t word_size = (uint8_t)(win_word_size(process->emulator));
     uint64_t next_ip;
+    uint32_t callback_result = 0u;
     if (process->initterm_depth == 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     frame = &process->initterm_frames[process->initterm_depth - 1u];
+    /* Returning from an _initterm_e callback: its int result is in EAX. */
+    if (frame->is_e && current_ip == process->runtime_base + WIN_INITTERM_RETURN_OFFSET)
+        callback_result = (uint32_t)process->emulator->x86.gpr[XXEMUL_X86_RAX];
     for (;;) {
         uint64_t callback;
         uint64_t callback_sp;
-        if (frame->cursor == frame->end) {
+        if (frame->cursor == frame->end || callback_result != 0u) {
             next_ip = frame->return_address;
             process->emulator->x86.ip = next_ip;
             process->emulator->x86.gpr[XXEMUL_X86_RSP] = frame->call_sp + word_size;
-            process->emulator->x86.gpr[XXEMUL_X86_RAX] = 0u;
+            process->emulator->x86.gpr[XXEMUL_X86_RAX] = callback_result;
             --process->initterm_depth;
             break;
         }
@@ -13588,6 +13637,7 @@ int xxemul_windows_try_step(xxemul_windows *process, xxemul_step_info *info, xxe
         frame->end = arguments[1];
         frame->call_sp = process->emulator->x86.gpr[XXEMUL_X86_RSP];
         frame->return_address = return_address;
+        frame->is_e = strcmp(api->name, "_initterm_e") == 0;
         *status = win_initterm_continue(process, ip, info);
         return 1;
     }
@@ -13814,18 +13864,10 @@ static uint64_t win_native_export(xxemul_windows *process, win_module *module, c
         }
         return win_resolve_ordinal(process, module->name, (uint16_t)ordinal);
     }
-    /* P/Invoke must not manufacture the generic unknown-import fallback. */
-    if (name[0] == '#') {
-        uint64_t ordinal = 0u;
-        const char *at = name + 1;
-        if (!*at) return 0u;
-        for (; *at; ++at) {
-            if (*at < '0' || *at > '9' || ordinal > (UINT16_MAX - (unsigned)(*at - '0')) / 10u) return 0u;
-            ordinal = ordinal * 10u + (unsigned)(*at - '0');
-        }
-        if (!ordinal || ordinal > module->api_count) return 0u;
-        return process->apis[module->api_indices[ordinal - 1u]].address;
-    }
+    /* P/Invoke must not manufacture the generic unknown-import fallback.
+     * A generic modeled module has no ordinal table (GetProcAddress returns
+     * NULL for it too); registration order is not an ordinal. */
+    if (name[0] == '#') return 0u;
     for (i = 0u; i < module->api_count; ++i) {
         const win_api *api = &process->apis[module->api_indices[i]];
         if (!strcmp(api->name, name)) return api->address;

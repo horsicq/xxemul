@@ -370,7 +370,7 @@ static xxemul_status xxemul_dos_output_string(xxemul *emulator)
     for (count = 0u; count < 0x10000u; ++count, ++offset) {
         uint8_t character = emulator->region_data[xxemul_dos_linear(segment, offset)];
         if (character == '$') {
-            emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & 0xff00u) | '$';
+            emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | '$';
             return XXEMUL_STATUS_OK;
         }
         xxemul_video_putc(emulator, character);
@@ -409,7 +409,7 @@ static xxemul_status xxemul_dos_read_key(xxemul *emulator, int echo)
     key = emulator->key_queue[emulator->key_head];
     emulator->key_head = (uint8_t)((emulator->key_head + 1u) % 32u);
     --emulator->key_count;
-    emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & 0xff00u) | (key & 0xffu);
+    emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | (key & 0xffu);
     if (echo) {
         xxemul_video_putc(emulator, (uint8_t)key);
     }
@@ -562,14 +562,14 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
         case 0x02u:
             character = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RDX];
             xxemul_video_putc(emulator, character);
-            emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & 0xff00u) | character;
+            emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | character;
             break;
         case 0x06u:
             character = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RDX];
             if (character == 0xffu) {
                 if (emulator->key_count == 0u) {
                     emulator->x86.flags |= UINT64_C(0x40);
-                    emulator->x86.gpr[XXEMUL_X86_RAX] &= 0xff00u;
+                    emulator->x86.gpr[XXEMUL_X86_RAX] &= ~UINT64_C(0xff);
                     return XXEMUL_STATUS_OK;
                 }
                 status = xxemul_dos_read_key(emulator, 0);
@@ -577,7 +577,7 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
                 return status;
             }
             xxemul_video_putc(emulator, character);
-            emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & 0xff00u) | character;
+            emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | character;
             break;
         case 0x09u:
             status = xxemul_dos_output_string(emulator);
@@ -593,7 +593,7 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
                 return status;
             }
             break;
-        case 0x0bu: emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & 0xff00u) | (emulator->key_count == 0u ? 0x00u : 0xffu); break;
+        case 0x0bu: emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | (emulator->key_count == 0u ? 0x00u : 0xffu); break;
         case 0x0cu: {
             uint8_t input_function = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX];
             status = xxemul_dos_flush_input_begin(emulator, input_function);

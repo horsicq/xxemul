@@ -169,6 +169,8 @@ xxemul *xxemul_create(const xxemul_config *config, xxemul_status *status)
     } else {
         emulator->arm.pc = config->entry_address;
         emulator->arm.sp = stack_top;
+        /* CPSR.T must agree with the execution state selected by the mode. */
+        if (config->mode == XXEMUL_MODE_ARM_T32) emulator->arm.pstate |= UINT32_C(0x20);
     }
 
     if (status != NULL) {
@@ -715,7 +717,14 @@ static xxemul_status xxemul_step_inner(xxemul *emulator, xxemul_step_info *info)
         xxemul_arm_state before = emulator->arm;
         emulator->fault_address_valid = 0; emulator->windows_exception_code = 0;
         status = xxemul_arm_step(emulator, info);
-        if (emulator->windows_fault_dispatch && xxemul_windows_fault_status(status) && xxemul_windows_try_arm_exception(emulator->windows, &before, status, info)) return XXEMUL_STATUS_OK;
+        if (emulator->windows_fault_dispatch && xxemul_windows_fault_status(status)) {
+            /* BKPT/BRK leave PC past the instruction, but a Windows ARM
+             * breakpoint context reports PC at the trapping instruction. */
+            uint64_t after_pc = emulator->arm.pc;
+            if (status == XXEMUL_STATUS_BREAKPOINT) emulator->arm.pc = before.pc;
+            if (xxemul_windows_try_arm_exception(emulator->windows, &before, status, info)) return XXEMUL_STATUS_OK;
+            if (status == XXEMUL_STATUS_BREAKPOINT && emulator->arm.pc == before.pc) emulator->arm.pc = after_pc;
+        }
         return status;
     }
     return xxemul_arm_step(emulator, info);
@@ -809,7 +818,13 @@ xxemul_status xxemul_x86_linear_address(const xxemul *emulator, unsigned segment
         }
         return XXEMUL_STATUS_OK;
     }
-    *address = offset;
+    /* Flat modes: only FS/GS carry a base (Windows TEB / Linux TLS), added to
+     * the offset exactly as guest memory operands do. */
+    {
+        uint64_t base = 0;
+        (void)xxemul_x86_get_segment_base(emulator, segment_index, &base);
+        *address = offset + base;
+    }
     return XXEMUL_STATUS_OK;
 }
 

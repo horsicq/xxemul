@@ -51,6 +51,8 @@ xxemul *xxemul_image_allocate(xxemul_arch arch, xxemul_mode mode, uint64_t base,
     } else {
         emulator->arm.pc = entry;
         emulator->arm.sp = stack_top;
+        /* CPSR.T must agree with the execution state the loader selected. */
+        if (mode == XXEMUL_MODE_ARM_T32) emulator->arm.pstate |= UINT32_C(0x20);
     }
     *status = XXEMUL_STATUS_OK;
     return emulator;

@@ -352,6 +352,29 @@ static xxemul_status dpmi_allocate_dos(xxemul *emulator)
     unsigned i;
     xxemul_status status;
 
+    if (paragraphs == 0u) {
+        /* A zero-sized block has no valid descriptor (16-bit: no selector,
+         * 32-bit: limit 0 - 1 = 4 GiB). Fail like DOS 48h with AX=0008h
+         * and BX = largest available block. */
+        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x4800u;
+        emulator->x86.gpr[XXEMUL_X86_RBX] = 0xffffu;
+        status = xxemul_msdos_interrupt(emulator, 0x21u);
+        largest = (emulator->x86.flags & DPMI_CF) ? (uint16_t)emulator->x86.gpr[XXEMUL_X86_RBX] : 0u;
+        segment = (emulator->x86.flags & DPMI_CF) ? 0u : (uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX];
+        emulator->x86 = saved;
+        if (status != XXEMUL_STATUS_OK) return status;
+        if (segment != 0u) { /* cannot happen below 1 MiB; release it anyway */
+            emulator->x86.gpr[XXEMUL_X86_RAX] = 0x4900u;
+            emulator->x86.segment[XXEMUL_X86_ES] = segment;
+            status = xxemul_msdos_interrupt(emulator, 0x21u);
+            emulator->x86 = saved;
+            if (status != XXEMUL_STATUS_OK) return status;
+        }
+        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x0008u;
+        emulator->x86.gpr[XXEMUL_X86_RBX] = largest;
+        emulator->x86.flags |= DPMI_CF;
+        return XXEMUL_STATUS_OK;
+    }
     if (selector == 0u) {
         emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8011u;
         emulator->x86.gpr[XXEMUL_X86_RBX] = 0u;

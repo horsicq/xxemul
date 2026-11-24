@@ -117,6 +117,11 @@ static uint32_t xxemul_x86_dos_a20(const xxemul *emulator, uint32_t physical)
     return (emulator->dos_port_92 & 2u) != 0u ? physical : physical & ~UINT32_C(0x100000);
 }
 
+/* Access flag OR-ed into the "writing" argument of the guest-memory helpers:
+ * an implicit system access (descriptor tables, IDT, TSS, a privileged
+ * interrupt frame) is a supervisor access whatever the current CPL is. */
+#define XXEMUL_X86_ACCESS_SYSTEM 2
+
 static xxemul_status xxemul_x86_dos_translate(xxemul *emulator, uint32_t linear, int writing, uint32_t *physical, uint32_t *page_fault_error)
 {
     uint64_t pde_address;
@@ -124,7 +129,10 @@ static xxemul_status xxemul_x86_dos_translate(xxemul *emulator, uint32_t linear,
     uint64_t entry;
     uint32_t pde;
     uint32_t pte;
+    int user = (writing & XXEMUL_X86_ACCESS_SYSTEM) == 0 && (emulator->dos_cr0 & 1u) != 0u && (emulator->x86.segment[XXEMUL_X86_CS] & 3u) == 3u;
     xxemul_status status;
+
+    writing &= 1;
 
     if ((emulator->dos_cr0 & UINT32_C(0x80000000)) == 0u) {
         *physical = xxemul_x86_dos_a20(emulator, linear);
@@ -141,7 +149,10 @@ static xxemul_status xxemul_x86_dos_translate(xxemul *emulator, uint32_t linear,
     if (status != XXEMUL_STATUS_OK) goto fault;
     pte = (uint32_t)entry;
     if ((pte & 1u) == 0u) goto not_present;
-    if (writing && (emulator->dos_cr0 & UINT32_C(0x10000)) != 0u && ((pde & pte & 2u) == 0u)) goto protection;
+    /* User accesses need U/S in both levels and, for writes, R/W in both
+     * whatever CR0.WP is. Supervisor writes honour R/W only when WP is set. */
+    if (user && (pde & pte & 4u) == 0u) goto protection;
+    if (writing && (user || (emulator->dos_cr0 & UINT32_C(0x10000)) != 0u) && ((pde & pte & 2u) == 0u)) goto protection;
 
     if ((pde & 0x20u) == 0u) {
         status = xxemul_store_integer(emulator, pde_address, 4u, pde | 0x20u);
@@ -155,11 +166,11 @@ static xxemul_status xxemul_x86_dos_translate(xxemul *emulator, uint32_t linear,
     return XXEMUL_STATUS_OK;
 
 not_present:
-    emulator->dos_pending_page_fault_error = (writing ? 2u : 0u) | ((emulator->x86.segment[XXEMUL_X86_CS] & 3u) != 0u ? 4u : 0u);
+    emulator->dos_pending_page_fault_error = (writing ? 2u : 0u) | (user ? 4u : 0u);
     if (page_fault_error != NULL) *page_fault_error = emulator->dos_pending_page_fault_error;
     goto fault;
 protection:
-    emulator->dos_pending_page_fault_error = 1u | (writing ? 2u : 0u) | ((emulator->x86.segment[XXEMUL_X86_CS] & 3u) != 0u ? 4u : 0u);
+    emulator->dos_pending_page_fault_error = 1u | (writing ? 2u : 0u) | (user ? 4u : 0u);
     if (page_fault_error != NULL) *page_fault_error = emulator->dos_pending_page_fault_error;
 fault:
     emulator->dos_cr2 = linear;
@@ -169,7 +180,9 @@ fault:
 static xxemul_status xxemul_x86_guest_memory_tracked(xxemul *emulator, uint64_t address, void *buffer, size_t size, int writing, uint32_t *page_fault_error)
 {
     size_t done = 0u;
+    int system_access = writing & XXEMUL_X86_ACCESS_SYSTEM;
 
+    writing &= 1;
     if (page_fault_error != NULL) *page_fault_error = UINT32_MAX;
     if (emulator->memory_hook != NULL && emulator->in_step && !emulator->x86_fetching && size != 0u) {
         emulator->memory_hook(emulator->memory_hook_context, address, size, writing);
@@ -188,7 +201,7 @@ static xxemul_status xxemul_x86_guest_memory_tracked(xxemul *emulator, uint64_t 
             xxemul_status status;
 
             if (chunk > size - checked) chunk = size - checked;
-            status = xxemul_x86_dos_translate(emulator, linear, 1, &physical, page_fault_error);
+            status = xxemul_x86_dos_translate(emulator, linear, 1 | system_access, &physical, page_fault_error);
             if (status != XXEMUL_STATUS_OK) return status;
             status = xxemul_read_memory(emulator, physical, &probe, 1u);
             if (status == XXEMUL_STATUS_OK) status = xxemul_read_memory(emulator, (uint64_t)physical + chunk - 1u, &probe, 1u);
@@ -206,7 +219,7 @@ static xxemul_status xxemul_x86_guest_memory_tracked(xxemul *emulator, uint64_t 
         xxemul_status status;
 
         if (chunk > size - done) chunk = size - done;
-        status = xxemul_x86_dos_translate(emulator, linear, writing, &physical, page_fault_error);
+        status = xxemul_x86_dos_translate(emulator, linear, writing | system_access, &physical, page_fault_error);
         if (status != XXEMUL_STATUS_OK) return status;
         status = writing ? xxemul_write_memory(emulator, physical, (const uint8_t *)buffer + done, chunk)
                          : xxemul_read_memory(emulator, physical, (uint8_t *)buffer + done, chunk);
@@ -309,7 +322,7 @@ static xxemul_status xxemul_x86_dos_read_descriptor_tracked(xxemul *emulator, ui
     }
     if (index > limit || limit - index < 7u || (selector & ~3u) == 0u) return XXEMUL_STATUS_ADDRESS_FAULT;
     *address = base + index;
-    return xxemul_x86_guest_memory_tracked(emulator, *address, descriptor, 8u, 0, page_fault_error);
+    return xxemul_x86_guest_memory_tracked(emulator, *address, descriptor, 8u, XXEMUL_X86_ACCESS_SYSTEM, page_fault_error);
 }
 
 static xxemul_status xxemul_x86_dos_read_descriptor(xxemul *emulator, uint16_t selector, uint16_t ldt_selector, uint32_t ldt_base, uint32_t ldt_limit,
@@ -368,7 +381,7 @@ static xxemul_status xxemul_x86_load_dos_segment(xxemul *emulator, uint8_t segme
     return XXEMUL_STATUS_OK;
 }
 
-static xxemul_status xxemul_x86_dos_preflight_write(xxemul *emulator, uint32_t address, size_t size)
+static xxemul_status xxemul_x86_dos_preflight_write_access(xxemul *emulator, uint32_t address, size_t size, int system_access)
 {
     size_t done = 0u;
 
@@ -380,13 +393,18 @@ static xxemul_status xxemul_x86_dos_preflight_write(xxemul *emulator, uint32_t a
         xxemul_status status;
 
         if (chunk > size - done) chunk = size - done;
-        status = xxemul_x86_dos_translate(emulator, linear, 1, &physical, NULL);
+        status = xxemul_x86_dos_translate(emulator, linear, 1 | system_access, &physical, NULL);
         if (status != XXEMUL_STATUS_OK) return status;
         status = xxemul_read_memory(emulator, (uint64_t)physical + chunk - 1u, &probe, 1u);
         if (status != XXEMUL_STATUS_OK) return status;
         done += chunk;
     }
     return XXEMUL_STATUS_OK;
+}
+
+static xxemul_status xxemul_x86_dos_preflight_write(xxemul *emulator, uint32_t address, size_t size)
+{
+    return xxemul_x86_dos_preflight_write_access(emulator, address, size, 0);
 }
 
 static int xxemul_x86_dos_task_segment_valid(uint8_t segment_index, uint16_t selector, const xxemul_x86_segment_cache *cache, uint8_t cpl)
@@ -449,9 +467,9 @@ static xxemul_status xxemul_x86_dos_task_jump(xxemul *emulator, uint16_t target_
     new_tss_limit = xxemul_x86_dos_descriptor_limit(new_descriptor);
     if (new_tss_limit < 0x67u) return XXEMUL_STATUS_ADDRESS_FAULT;
 
-    status = xxemul_x86_guest_memory(emulator, emulator->dos_tr_base, old_tss, sizeof(old_tss), 0);
+    status = xxemul_x86_guest_memory(emulator, emulator->dos_tr_base, old_tss, sizeof(old_tss), XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) return status;
-    status = xxemul_x86_guest_memory(emulator, new_tss_base, new_tss, sizeof(new_tss), 0);
+    status = xxemul_x86_guest_memory(emulator, new_tss_base, new_tss, sizeof(new_tss), XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) return status;
     memcpy(saved_tss, old_tss, sizeof(saved_tss));
     new_cr3 = xxemul_x86_dos_u32(new_tss + 0x1cu);
@@ -500,30 +518,30 @@ restore_cr3:
     emulator->dos_cr3 = old_cr3;
     if (status != XXEMUL_STATUS_OK) return status;
 
-    status = xxemul_x86_dos_preflight_write(emulator, emulator->dos_tr_base, sizeof(old_tss));
+    status = xxemul_x86_dos_preflight_write_access(emulator, emulator->dos_tr_base, sizeof(old_tss), XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) return status;
-    status = xxemul_x86_dos_preflight_write(emulator, old_descriptor_address + 5u, 1u);
+    status = xxemul_x86_dos_preflight_write_access(emulator, old_descriptor_address + 5u, 1u, XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) return status;
-    status = xxemul_x86_dos_preflight_write(emulator, new_descriptor_address + 5u, 1u);
+    status = xxemul_x86_dos_preflight_write_access(emulator, new_descriptor_address + 5u, 1u, XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) return status;
 
     xxemul_x86_dos_put_u32(saved_tss + 0x20u, resume_ip);
     xxemul_x86_dos_put_u32(saved_tss + 0x24u, (uint32_t)emulator->x86.flags);
     for (index = 0u; index < 8u; ++index) xxemul_x86_dos_put_u32(saved_tss + 0x28u + 4u * index, (uint32_t)emulator->x86.gpr[index]);
     for (index = 0u; index < XXEMUL_X86_SEGMENT_COUNT; ++index) xxemul_x86_dos_put_u16(saved_tss + 0x48u + 4u * index, emulator->x86.segment[index]);
-    status = xxemul_x86_guest_memory(emulator, emulator->dos_tr_base, saved_tss, sizeof(saved_tss), 1);
+    status = xxemul_x86_guest_memory(emulator, emulator->dos_tr_base, saved_tss, sizeof(saved_tss), 1 | XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) return status;
     byte = (uint8_t)(old_access & 0xfdu);
-    status = xxemul_x86_guest_memory(emulator, old_descriptor_address + 5u, &byte, 1u, 1);
+    status = xxemul_x86_guest_memory(emulator, old_descriptor_address + 5u, &byte, 1u, 1 | XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) {
-        xxemul_x86_guest_memory(emulator, emulator->dos_tr_base, old_tss, sizeof(old_tss), 1);
+        xxemul_x86_guest_memory(emulator, emulator->dos_tr_base, old_tss, sizeof(old_tss), 1 | XXEMUL_X86_ACCESS_SYSTEM);
         return status;
     }
     byte = new_access | 2u;
-    status = xxemul_x86_guest_memory(emulator, new_descriptor_address + 5u, &byte, 1u, 1);
+    status = xxemul_x86_guest_memory(emulator, new_descriptor_address + 5u, &byte, 1u, 1 | XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) {
-        xxemul_x86_guest_memory(emulator, old_descriptor_address + 5u, &old_access, 1u, 1);
-        xxemul_x86_guest_memory(emulator, emulator->dos_tr_base, old_tss, sizeof(old_tss), 1);
+        xxemul_x86_guest_memory(emulator, old_descriptor_address + 5u, &old_access, 1u, 1 | XXEMUL_X86_ACCESS_SYSTEM);
+        xxemul_x86_guest_memory(emulator, emulator->dos_tr_base, old_tss, sizeof(old_tss), 1 | XXEMUL_X86_ACCESS_SYSTEM);
         return status;
     }
 
@@ -585,7 +603,7 @@ static int xxemul_x86_dpmi_default_vector(xxemul *emulator, uint8_t vector)
     uint8_t gate[8];
     uint32_t at = (uint32_t)vector * 8u;
     if (at + 7u > emulator->dos_idtr_limit ||
-        xxemul_x86_guest_memory(emulator, (uint64_t)emulator->dos_idtr_base + at, gate, sizeof(gate), 0) != XXEMUL_STATUS_OK) return 0;
+        xxemul_x86_guest_memory(emulator, (uint64_t)emulator->dos_idtr_base + at, gate, sizeof(gate), XXEMUL_X86_ACCESS_SYSTEM) != XXEMUL_STATUS_OK) return 0;
     return xxemul_x86_dos_u16(gate + 2u) == XXEMUL_DPMI_HOST_SELECTOR &&
            xxemul_x86_dos_u16(gate) == XXEMUL_DPMI_HOST_VECTOR_BASE + (uint32_t)vector * 4u &&
            gate[4] == 0u && gate[5] == (emulator->dos_dpmi_client32 ? 0x8eu : 0x86u) &&
@@ -617,8 +635,18 @@ static xxemul_status xxemul_x86_dpmi_host_thunk(xxemul *emulator, uint8_t vector
     return xxemul_x86_guest_store_integer(emulator, address, width, flags);
 }
 
-static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vector, uint32_t resume_ip, int hardware_fault, uint32_t error_code, uint64_t *target_ip)
+/* Delivery kinds for xxemul_x86_dos_interrupt_gate. A CPU exception or an
+ * external interrupt skips the gate DPL check; only #DF, #TS, #NP, #SS, #GP,
+ * #PF, #AC and #CP also push an error code. */
+#define XXEMUL_X86_GATE_SOFTWARE 0
+#define XXEMUL_X86_GATE_EXCEPTION 1
+#define XXEMUL_X86_GATE_ERROR_CODE 2
+
+static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vector, uint32_t resume_ip, int kind, uint32_t error_code, uint64_t *target_ip)
 {
+    int hardware_fault = (kind & XXEMUL_X86_GATE_EXCEPTION) != 0;
+    int has_error_code = (kind & XXEMUL_X86_GATE_ERROR_CODE) != 0;
+    int frame_access;
     uint8_t gate[8];
     uint8_t stack_pointer[6];
     uint8_t frame[24];
@@ -644,12 +672,12 @@ static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vec
 
     if ((uint32_t)vector * 8u + 7u > emulator->dos_idtr_limit) return XXEMUL_STATUS_ADDRESS_FAULT;
     if ((emulator->x86.flags & XXEMUL_X86_FLAG_VM) != 0u) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-    status = xxemul_x86_guest_memory(emulator, (uint64_t)emulator->dos_idtr_base + (uint32_t)vector * 8u, gate, sizeof(gate), 0);
+    status = xxemul_x86_guest_memory(emulator, (uint64_t)emulator->dos_idtr_base + (uint32_t)vector * 8u, gate, sizeof(gate), XXEMUL_X86_ACCESS_SYSTEM);
     if (status != XXEMUL_STATUS_OK) return status;
     if ((gate[5] & 0x97u) != 0x86u || gate[4] != 0u || (!hardware_fault && old_cpl > ((gate[5] >> 5u) & 3u))) return XXEMUL_STATUS_ADDRESS_FAULT;
     width = (gate[5] & 8u) ? 4u : 2u;
     if (width == 2u && xxemul_x86_dos_u16(gate + 6u)) return XXEMUL_STATUS_ADDRESS_FAULT;
-    return_frame = frame + (hardware_fault ? width : 0u);
+    return_frame = frame + (has_error_code ? width : 0u);
     code_selector = xxemul_x86_dos_u16(gate + 2u);
     code_offset = xxemul_x86_dos_u16(gate) | ((uint32_t)xxemul_x86_dos_u16(gate + 6u) << 16u);
     status = xxemul_x86_decode_dos_segment(emulator, XXEMUL_X86_CS, code_selector, emulator->dos_ldtr_selector, emulator->dos_ldtr_base, emulator->dos_ldtr_limit,
@@ -658,14 +686,16 @@ static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vec
     dpl = (code_cache.access >> 5u) & 3u;
     if (dpl > old_cpl || code_offset > code_cache.limit) return XXEMUL_STATUS_ADDRESS_FAULT;
     new_cpl = (code_cache.access & 4u) != 0u ? old_cpl : dpl;
-    status = xxemul_x86_guest_memory(emulator, code_cache.base + code_offset, &fetch_byte, 1u, 0);
+    /* The handler fetch and its frame are accessed at the handler's CPL. */
+    frame_access = new_cpl == 3u ? 0 : XXEMUL_X86_ACCESS_SYSTEM;
+    status = xxemul_x86_guest_memory(emulator, code_cache.base + code_offset, &fetch_byte, 1u, frame_access);
     if (status != XXEMUL_STATUS_OK) return status;
 
     stack_switch = new_cpl < old_cpl;
     if (stack_switch) {
         if (emulator->dos_tr_selector == 0u || emulator->dos_tr_limit < 9u + 8u * new_cpl) return XXEMUL_STATUS_ADDRESS_FAULT;
         tss_offset = 4u + 8u * new_cpl;
-        status = xxemul_x86_guest_memory(emulator, emulator->dos_tr_base + tss_offset, stack_pointer, sizeof(stack_pointer), 0);
+        status = xxemul_x86_guest_memory(emulator, emulator->dos_tr_base + tss_offset, stack_pointer, sizeof(stack_pointer), XXEMUL_X86_ACCESS_SYSTEM);
         if (status != XXEMUL_STATUS_OK) return status;
         stack_offset = xxemul_x86_dos_u32(stack_pointer);
         stack_selector = xxemul_x86_dos_u16(stack_pointer + 4u);
@@ -675,12 +705,12 @@ static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vec
         if ((stack_selector & 3u) != new_cpl || ((stack_cache.access >> 5u) & 3u) != new_cpl) return XXEMUL_STATUS_ADDRESS_FAULT;
     }
     stack_mask = (stack_cache.flags & 4u) != 0u ? UINT32_MAX : UINT16_MAX;
-    frame_size = width * (stack_switch ? 5u : 3u) + (hardware_fault ? width : 0u);
+    frame_size = width * (stack_switch ? 5u : 3u) + (has_error_code ? width : 0u);
     frame_offset = (stack_offset - (uint32_t)frame_size) & stack_mask;
     status = xxemul_x86_dos_stack_address(&stack_cache, frame_offset, frame_size, &frame_address);
     if (status != XXEMUL_STATUS_OK) return status;
     if (width == 4u) {
-        if (hardware_fault) xxemul_x86_dos_put_u32(frame, error_code);
+        if (has_error_code) xxemul_x86_dos_put_u32(frame, error_code);
         xxemul_x86_dos_put_u32(return_frame, resume_ip);
         xxemul_x86_dos_put_u32(return_frame + 4u, emulator->x86.segment[XXEMUL_X86_CS]);
         xxemul_x86_dos_put_u32(return_frame + 8u, (uint32_t)emulator->x86.flags);
@@ -689,7 +719,7 @@ static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vec
             xxemul_x86_dos_put_u32(return_frame + 16u, emulator->x86.segment[XXEMUL_X86_SS]);
         }
     } else {
-        if (hardware_fault) xxemul_x86_dos_put_u16(frame, (uint16_t)error_code);
+        if (has_error_code) xxemul_x86_dos_put_u16(frame, (uint16_t)error_code);
         xxemul_x86_dos_put_u16(return_frame, (uint16_t)resume_ip);
         xxemul_x86_dos_put_u16(return_frame + 2u, emulator->x86.segment[XXEMUL_X86_CS]);
         xxemul_x86_dos_put_u16(return_frame + 4u, (uint16_t)emulator->x86.flags);
@@ -698,9 +728,9 @@ static xxemul_status xxemul_x86_dos_interrupt_gate(xxemul *emulator, uint8_t vec
             xxemul_x86_dos_put_u16(return_frame + 8u, emulator->x86.segment[XXEMUL_X86_SS]);
         }
     }
-    status = xxemul_x86_dos_preflight_write(emulator, frame_address, frame_size);
+    status = xxemul_x86_dos_preflight_write_access(emulator, frame_address, frame_size, frame_access);
     if (status != XXEMUL_STATUS_OK) return status;
-    status = xxemul_x86_guest_memory(emulator, frame_address, frame, frame_size, 1);
+    status = xxemul_x86_guest_memory(emulator, frame_address, frame, frame_size, 1 | frame_access);
     if (status != XXEMUL_STATUS_OK) return status;
 
     if (stack_switch) {
@@ -1273,7 +1303,8 @@ static xxemul_status xxemul_x86_pop(xxemul *emulator, uint64_t *value)
 static xxemul_status xxemul_x86_dos_fault_interrupt(xxemul *emulator, uint8_t vector, uint64_t resume_ip, uint64_t *target_ip)
 {
     if ((emulator->dos_cr0 & 1u) != 0u) {
-        return xxemul_x86_dos_interrupt_gate(emulator, vector, (uint32_t)resume_ip, 1, 0u, target_ip);
+        /* #DE, #DB, #OF and #UD carry no error code. */
+        return xxemul_x86_dos_interrupt_gate(emulator, vector, (uint32_t)resume_ip, XXEMUL_X86_GATE_EXCEPTION, 0u, target_ip);
     }
     {
         uint64_t vector_offset = 0u;
@@ -1687,7 +1718,7 @@ static xxemul_status xxemul_x86_dos_page_fault(xxemul *emulator, xxemul_status s
 {
     if (status == XXEMUL_STATUS_ADDRESS_FAULT && page_fault_error != UINT32_MAX && emulator->dos_mode && (emulator->dos_cr0 & 1u) != 0u) {
         emulator->dos_pending_page_fault_error = UINT32_MAX;
-        return xxemul_x86_dos_interrupt_gate(emulator, 14u, (uint32_t)current_ip, 1, page_fault_error, next_ip);
+        return xxemul_x86_dos_interrupt_gate(emulator, 14u, (uint32_t)current_ip, XXEMUL_X86_GATE_EXCEPTION | XXEMUL_X86_GATE_ERROR_CODE, page_fault_error, next_ip);
     }
     return status;
 }
@@ -1705,7 +1736,7 @@ xxemul_status xxemul_x86_dispatch_pending_page_fault(xxemul *emulator, xxemul_st
     error = emulator->dos_pending_page_fault_error;
     emulator->dos_pending_page_fault_error = UINT32_MAX;
     fault_address = (uint64_t)emulator->dos_segments[XXEMUL_X86_CS].base + fault_ip;
-    status = xxemul_x86_dos_interrupt_gate(emulator, 14u, (uint32_t)fault_ip, 1, error, &next_ip);
+    status = xxemul_x86_dos_interrupt_gate(emulator, 14u, (uint32_t)fault_ip, XXEMUL_X86_GATE_EXCEPTION | XXEMUL_X86_GATE_ERROR_CODE, error, &next_ip);
     if (status != XXEMUL_STATUS_OK) {
         return status;
     }
@@ -2602,7 +2633,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             uint64_t fault_address = (uint64_t)emulator->dos_segments[XXEMUL_X86_CS].base + current_ip;
 
             emulator->dos_pending_page_fault_error = UINT32_MAX;
-            status = xxemul_x86_dos_interrupt_gate(emulator, 14u, (uint32_t)current_ip, 1, page_fault_error, &next_ip);
+            status = xxemul_x86_dos_interrupt_gate(emulator, 14u, (uint32_t)current_ip, XXEMUL_X86_GATE_EXCEPTION | XXEMUL_X86_GATE_ERROR_CODE, page_fault_error, &next_ip);
             if (status != XXEMUL_STATUS_OK) return status;
             emulator->x86.ip = next_ip;
             emulator->x86.flags |= UINT64_C(2);
@@ -2925,13 +2956,12 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 uint8_t ah;
                 if (instruction.operand_count >= 1u) xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[0], next_ip, &imm);
                 if ((uint8_t)imm == 0u) {
-                    /* Division by zero: undefined, just zero out. */
-                    ah = 0u;
-                    al = 0u;
-                } else {
-                    ah = al / (uint8_t)imm;
-                    al = al % (uint8_t)imm;
+                    /* AAM 0 raises #DE like DIV; AX and flags stay unchanged. */
+                    status = xxemul_x86_dos_fault_interrupt(emulator, 0u, current_ip, &next_ip);
+                    break;
                 }
+                ah = al / (uint8_t)imm;
+                al = al % (uint8_t)imm;
                 emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xffff)) | al | ((uint16_t)ah << 8);
                 xxemul_x86_set_szp_flags(emulator, al, 1u);
                 status = XXEMUL_STATUS_OK;
@@ -4471,6 +4501,8 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 for (i = 0u; i < 8u && status == XXEMUL_STATUS_OK; ++i) {
                     status = xxemul_x86_push_width(emulator, order[i] == XXEMUL_X86_RSP ? pusha_original_sp : emulator->x86.gpr[order[i]], op_size);
                 }
+                /* All or nothing: a faulting push must not leave SP moved. */
+                if (status != XXEMUL_STATUS_OK) emulator->x86.gpr[XXEMUL_X86_RSP] = pusha_original_sp;
             }
             break;
         case CDISASM_X86_NAME_POPA:
@@ -4482,16 +4514,23 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 static const uint8_t order[8] = {XXEMUL_X86_RDI, XXEMUL_X86_RSI, XXEMUL_X86_RBP, XXEMUL_X86_RSP,
                                                  XXEMUL_X86_RBX, XXEMUL_X86_RDX, XXEMUL_X86_RCX, XXEMUL_X86_RAX};
                 uint8_t op_size = (instruction.name_id == CDISASM_X86_NAME_POPA) ? 2u : 4u;
+                uint64_t popped[8];
                 unsigned i;
+                /* All or nothing: read the whole frame before committing any
+                 * register, and leave SP alone when a pop faults. */
+                original_sp = emulator->x86.gpr[XXEMUL_X86_RSP];
                 status = XXEMUL_STATUS_OK;
-                for (i = 0u; i < 8u && status == XXEMUL_STATUS_OK; ++i) {
-                    status = xxemul_x86_pop_width(emulator, &right, op_size);
-                    if (status == XXEMUL_STATUS_OK && order[i] != XXEMUL_X86_RSP) {
-                        if (op_size == 2u) {
-                            emulator->x86.gpr[order[i]] = (emulator->x86.gpr[order[i]] & ~UINT64_C(0xffff)) | (right & 0xffffu);
-                        } else {
-                            emulator->x86.gpr[order[i]] = (uint32_t)right;
-                        }
+                for (i = 0u; i < 8u && status == XXEMUL_STATUS_OK; ++i) status = xxemul_x86_pop_width(emulator, &popped[i], op_size);
+                if (status != XXEMUL_STATUS_OK) {
+                    emulator->x86.gpr[XXEMUL_X86_RSP] = original_sp;
+                    break;
+                }
+                for (i = 0u; i < 8u; ++i) {
+                    if (order[i] == XXEMUL_X86_RSP) continue;
+                    if (op_size == 2u) {
+                        emulator->x86.gpr[order[i]] = (emulator->x86.gpr[order[i]] & ~UINT64_C(0xffff)) | (popped[i] & 0xffffu);
+                    } else {
+                        emulator->x86.gpr[order[i]] = (uint32_t)popped[i];
                     }
                 }
             }
@@ -4565,7 +4604,20 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                      * 16-bit POPF preserves the upper EFLAGS half. RF clears. */
                     emulator->x86.flags = ((emulator->x86.flags & ~mask) | (right & mask) | UINT64_C(2)) &
                         ~UINT64_C(0x18028);
-                } else emulator->x86.flags = (right & xxemul_mask_for_size(size)) | UINT64_C(2);
+                } else {
+                    /* Only the operand-size part of the writable flags is
+                     * replaced: a 16-bit POPF keeps EFLAGS bits 16+, VM/VIF/VIP
+                     * are never loaded, reserved bits stay clear and a 32/64-bit
+                     * POPF clears RF. Outside ring 0 IOPL is kept, and IF too
+                     * when CPL > IOPL. Windows and Linux guests run in ring 3. */
+                    uint64_t mask = size == 2u ? UINT64_C(0x7fd5) : UINT64_C(0x247fd5);
+                    unsigned cpl = emulator->dos_mode ? (unsigned)(emulator->x86.segment[XXEMUL_X86_CS] & 3u)
+                                                      : (emulator->windows != NULL || emulator->linux_process != NULL) ? 3u : 0u;
+                    if (cpl != 0u) mask &= ~UINT64_C(0x3000);
+                    if (cpl > ((emulator->x86.flags >> 12u) & 3u)) mask &= ~XXEMUL_X86_FLAG_IF;
+                    emulator->x86.flags = ((emulator->x86.flags & ~mask) | (right & mask) | UINT64_C(2)) & UINT64_C(0x3f7fd7);
+                    if (size != 2u) emulator->x86.flags &= ~XXEMUL_X86_FLAG_RF;
+                }
             } else {
                 status = xxemul_x86_dos_page_fault(emulator, status, page_fault_error, current_ip, &next_ip);
             }
@@ -4664,7 +4716,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                     status = xxemul_dpmi_reflect_interrupt(emulator, (uint8_t)right);
                     break;
                 }
-                status = xxemul_x86_dos_interrupt_gate(emulator, (uint8_t)right, (uint32_t)next_ip, 0, 0u, &next_ip);
+                status = xxemul_x86_dos_interrupt_gate(emulator, (uint8_t)right, (uint32_t)next_ip, XXEMUL_X86_GATE_SOFTWARE, 0u, &next_ip);
                 break;
             }
             if (emulator->dos_mode && right <= 0xffu) {
@@ -4981,20 +5033,22 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
             status = xxemul_x86_read_operand(emulator, &instruction, &instruction.opcode[1], next_ip, &right);
             if (status != XXEMUL_STATUS_OK) return status;
             size = instruction.opcode[0].size;
-            status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, right & xxemul_mask_for_size(size));
-            if (status != XXEMUL_STATUS_OK) return status;
             {
                 uint8_t segment_index = instruction.name_id == CDISASM_X86_NAME_LDS   ? XXEMUL_X86_DS
                                         : instruction.name_id == CDISASM_X86_NAME_LES ? XXEMUL_X86_ES
                                         : instruction.name_id == CDISASM_X86_NAME_LFS ? XXEMUL_X86_FS
                                         : instruction.name_id == CDISASM_X86_NAME_LGS ? XXEMUL_X86_GS
                                                                                       : XXEMUL_X86_SS;
+                /* The segment load can fault: do it before the offset
+                 * register is written so a fault leaves both unchanged. */
                 if (emulator->dos_mode) {
                     status = xxemul_x86_load_dos_segment(emulator, segment_index, (uint16_t)(right >> (size * 8u)));
+                    if (status != XXEMUL_STATUS_OK) break;
                 } else {
                     emulator->x86.segment[segment_index] = (uint16_t)(right >> (size * 8u));
                 }
             }
+            status = xxemul_x86_write_operand(emulator, &instruction, &instruction.opcode[0], next_ip, right & xxemul_mask_for_size(size));
             break;
         case CDISASM_X86_NAME_ADD:
         case CDISASM_X86_NAME_ADC:
@@ -5118,8 +5172,17 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                     break;
                 }
             }
+            original_sp = emulator->x86.gpr[XXEMUL_X86_RSP];
             if (instruction.name_id == CDISASM_X86_NAME_CALL_FAR) {
-                status = xxemul_x86_push_width(emulator, emulator->x86.segment[XXEMUL_X86_CS], size);
+                /* Validate the target descriptor before the return address is
+                 * pushed, and undo the pushes when a later step faults, so a
+                 * restarted far CALL never pushes CS:IP twice. */
+                if (emulator->dos_mode) {
+                    xxemul_x86_segment_cache target_cache;
+                    status = xxemul_x86_decode_dos_segment(emulator, XXEMUL_X86_CS, (uint16_t)right, emulator->dos_ldtr_selector, emulator->dos_ldtr_base,
+                                                           emulator->dos_ldtr_limit, &target_cache);
+                }
+                if (status == XXEMUL_STATUS_OK) status = xxemul_x86_push_width(emulator, emulator->x86.segment[XXEMUL_X86_CS], size);
                 if (status == XXEMUL_STATUS_OK) status = xxemul_x86_push_width(emulator, next_ip, size);
             }
             if (status == XXEMUL_STATUS_OK) {
@@ -5130,6 +5193,7 @@ xxemul_status xxemul_x86_step(xxemul *emulator, xxemul_step_info *info)
                 }
                 if (status == XXEMUL_STATUS_OK) next_ip = target;
             }
+            if (status != XXEMUL_STATUS_OK) emulator->x86.gpr[XXEMUL_X86_RSP] = original_sp;
             break;
         case CDISASM_X86_NAME_RET:
         case CDISASM_X86_NAME_RET_NEAR:
@@ -5279,15 +5343,35 @@ instruction_complete:
     if (status == XXEMUL_STATUS_OK && emulator->dos_mode && (emulator->x86.flags & XXEMUL_X86_FLAG_TF) != 0u && instruction.name_id != CDISASM_X86_NAME_POPF &&
         instruction.name_id != CDISASM_X86_NAME_POPFD && instruction.name_id != CDISASM_X86_NAME_IRET && instruction.name_id != CDISASM_X86_NAME_IRETD) {
         uint64_t int1_offset = 0u, int1_segment = 0u;
-        if (xxemul_load_integer(emulator, 1u * 4u, 2u, &int1_offset) == XXEMUL_STATUS_OK &&
-            xxemul_load_integer(emulator, 1u * 4u + 2u, 2u, &int1_segment) == XXEMUL_STATUS_OK && (int1_offset != 0u || int1_segment != 0u)) {
+        int int1_installed;
+        if ((emulator->dos_cr0 & 1u) != 0u) {
+            /* Protected mode: #DB goes through IDT gate 1, never the
+             * real-mode IVT. As in real mode, an absent handler (no present
+             * gate, or the unhooked DPMI host default) leaves TF ignored. */
+            uint8_t int1_gate[8];
+            int1_installed = emulator->dos_idtr_limit >= 15u &&
+                             xxemul_x86_guest_memory(emulator, (uint64_t)emulator->dos_idtr_base + 8u, int1_gate, sizeof(int1_gate), XXEMUL_X86_ACCESS_SYSTEM) == XXEMUL_STATUS_OK &&
+                             (int1_gate[5] & 0x97u) == 0x86u &&
+                             !(emulator->dos_dpmi_next_selector != 0u && xxemul_x86_dpmi_default_vector(emulator, 1u));
+            emulator->dos_pending_page_fault_error = UINT32_MAX;
+        } else {
+            int1_installed = xxemul_load_integer(emulator, 1u * 4u, 2u, &int1_offset) == XXEMUL_STATUS_OK &&
+                             xxemul_load_integer(emulator, 1u * 4u + 2u, 2u, &int1_segment) == XXEMUL_STATUS_OK && (int1_offset != 0u || int1_segment != 0u);
+        }
+        if (int1_installed) {
             uint64_t tf_target = 0u;
             status = xxemul_x86_dos_fault_interrupt(emulator, 1u, next_ip, &tf_target);
             if (status == XXEMUL_STATUS_OK) {
                 emulator->x86.ip = tf_target;
                 if (info != NULL) {
-                    info->next_address = xxemul_dos_physical(emulator, emulator->x86.segment[XXEMUL_X86_CS], (uint16_t)tf_target);
+                    info->next_address = emulator->dos_segments[XXEMUL_X86_CS].valid
+                                             ? (uint64_t)emulator->dos_segments[XXEMUL_X86_CS].base + tf_target
+                                             : xxemul_dos_physical(emulator, emulator->x86.segment[XXEMUL_X86_CS], (uint16_t)tf_target);
                 }
+            } else {
+                /* The instruction has completed: a failed trap delivery must
+                 * not be turned into a restartable #PF of that instruction. */
+                emulator->dos_pending_page_fault_error = UINT32_MAX;
             }
         }
     }

@@ -894,16 +894,16 @@ static xxemul_status scan_input(xxemul_darwin *process)
     const char *input = guest_string(process, state->gpr[0]), *format = guest_string(process, state->gpr[1]);
     const char *begin = input;
     uint64_t cursor = state->sp;
-    int assigned = 0;
+    int assigned = 0, converted = 0, input_failure = 0;
     if (input == NULL || format == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
     while (*format) {
         int suppress = 0, width = 0, long_value = 0;
         uint64_t target = 0;
         char conversion;
         if (isspace((unsigned char)*format)) { while (isspace((unsigned char)*input)) ++input; ++format; continue; }
-        if (*format != '%') { if (*input != *format) break; ++input; ++format; continue; }
+        if (*format != '%') { if (*input != *format) { input_failure = *input == '\0'; break; } ++input; ++format; continue; }
         ++format;
-        if (*format == '%') { if (*input != '%') break; ++input; ++format; continue; }
+        if (*format == '%') { if (*input != '%') { input_failure = *input == '\0'; break; } ++input; ++format; continue; }
         if (*format == '*') { suppress = 1; ++format; }
         while (isdigit((unsigned char)*format)) { if (width > 100000) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; width = width * 10 + (*format++ - '0'); }
         if (*format == 'l') { long_value = 1; ++format; if (*format == 'l') ++format; }
@@ -912,20 +912,25 @@ static xxemul_status scan_input(xxemul_darwin *process)
         if (strchr("diuoxX", conversion) != NULL && conversion != 0) {
             char text[128], *end;
             size_t count = 0;
-            long long value;
+            uint64_t value;
             while (isspace((unsigned char)*input)) ++input;
             while (input[count] && count + 1u < sizeof(text) && (width == 0 || count < (size_t)width)) { text[count] = input[count]; ++count; }
             text[count] = '\0';
-            value = strtoll(text, &end, conversion == 'i' ? 0 : conversion == 'o' ? 8 : (conversion == 'x' || conversion == 'X') ? 16 : 10);
-            if (end == text) break;
+            /* Unsigned conversions use strtoull: strtoll would clamp values
+             * above INT64_MAX (e.g. 0xffffffffffffffff) on ERANGE. */
+            if (conversion == 'd' || conversion == 'i') value = (uint64_t)strtoll(text, &end, conversion == 'i' ? 0 : 10);
+            else value = (uint64_t)strtoull(text, &end, conversion == 'o' ? 8 : (conversion == 'x' || conversion == 'X') ? 16 : 10);
+            if (end == text) { input_failure = *input == '\0'; break; }
             input += end - text;
-            if (!suppress) { if (!store(process, target, long_value ? 8 : 4, (uint64_t)value)) return XXEMUL_STATUS_ADDRESS_FAULT; ++assigned; }
+            converted = 1;
+            if (!suppress) { if (!store(process, target, long_value ? 8 : 4, value)) return XXEMUL_STATUS_ADDRESS_FAULT; ++assigned; }
         } else if (conversion == 's' || conversion == 'c') {
             size_t count = 0;
             if (conversion == 's') while (isspace((unsigned char)*input)) ++input;
             if (width == 0) width = conversion == 'c' ? 1 : (int)DARWIN_MAX_STRING;
             while (input[count] && count < (size_t)width && (conversion == 'c' || !isspace((unsigned char)input[count]))) ++count;
-            if (count == 0) break;
+            if (count == 0) { input_failure = input[0] == '\0'; break; }
+            converted = 1;
             if (!suppress) {
                 if (!guest_range(process, target, count + (conversion == 's'))) return XXEMUL_STATUS_ADDRESS_FAULT;
                 xxemul_write_memory(process->emulator, target, input, count);
@@ -936,7 +941,8 @@ static xxemul_status scan_input(xxemul_darwin *process)
         } else if (conversion == 'n') { if (!suppress && !store(process, target, long_value ? 8 : 4, (uint64_t)(input - begin))) return XXEMUL_STATUS_ADDRESS_FAULT; }
         else return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
-    state->gpr[0] = (uint32_t)assigned;
+    /* Input failure before the first conversion returns EOF. */
+    state->gpr[0] = input_failure && !converted ? UINT64_MAX : (uint32_t)assigned;
     return XXEMUL_STATUS_OK;
 }
 

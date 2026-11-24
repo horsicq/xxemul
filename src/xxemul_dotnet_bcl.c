@@ -480,17 +480,46 @@ static int64_t decode_tell(xx_io_device *device)
 {
     return (int64_t)((bcl_decode_sink *)device->priv)->position;
 }
+/* Iterative and stops at an already closed stream: a guest-built source
+ * chain must not recurse on the host stack, and a cycle must terminate. */
 static void close_stream(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm, bcl_object *o)
 {
-    o->closed = 1;
-    if (o->codec) {
-        bcl_object *source = lookup(h, vm, o->source);
-        if (source && !o->channel)
-            close_stream(h, vm, source);
-        host_free(h, o->bytes, o->capacity);
-        o->bytes = NULL;
-        o->capacity = 0;
+    while (o && !o->closed) {
+        bcl_object *source = NULL;
+        o->closed = 1;
+        if (o->codec) {
+            if (!o->channel)
+                source = lookup(h, vm, o->source);
+            host_free(h, o->bytes, o->capacity);
+            o->bytes = NULL;
+            o->capacity = 0;
+        }
+        o = source && source->kind == BCL_STREAM ? source : NULL;
     }
+}
+/* Drop a stream's state before a .ctor runs again on an existing object. */
+static void reset_stream(xxemul_dotnet_bcl_host *h, bcl_object *o)
+{
+    host_free(h, o->bytes, o->capacity);
+    o->bytes = NULL;
+    o->length = o->capacity = o->position = 0;
+    o->closed = o->codec = o->decoded = o->channel = o->insensitive = 0;
+    o->source = 0;
+}
+/* Would making `target` read from `source` close a cycle of codec streams? */
+static int stream_source_cycle(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm, const bcl_object *target, const bcl_object *source)
+{
+    size_t steps = 0, limit = 0;
+    const bcl_object *p;
+    for (p = h->objects; p; p = p->next)
+        ++limit;
+    for (p = source; p && p->kind == BCL_STREAM; p = lookup(h, vm, p->source)) {
+        if (p == target || ++steps > limit)
+            return 1;
+        if (!p->codec)
+            break;
+    }
+    return 0;
 }
 static xxemul_status stream_decode(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm, bcl_object *o)
 {
@@ -1177,6 +1206,10 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             o = attach(h, vm, (uint32_t)a[0].bits, BCL_EXCEPTION);
             if (!o)
                 return XXEMUL_STATUS_LIMIT_REACHED;
+            if (o->name) { /* .ctor called again on an existing object */
+                host_free(h, o->name, strlen(o->name) + 1); /* same accounting as host destroy */
+                o->name = NULL;
+            }
             o->name = host_string(h, s, n);
             return o->name ? XXEMUL_STATUS_OK : XXEMUL_STATUS_LIMIT_REACHED;
         }
@@ -1486,12 +1519,14 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             status = byte_array(h, vm, a[1], &bytes, &size);
             if (status != XXEMUL_STATUS_OK)
                 return status;
+            reset_stream(h, o); /* a repeated .ctor must not leak the old buffer */
             o->bytes = bytes;
             o->length = size;
             o->capacity = size ? size : 1;
             o->source = (uint32_t)a[1].bits;
             o->insensitive = 1;
-        }
+        } else
+            reset_stream(h, o);
         return XXEMUL_STATUS_OK;
     }
     if ((!strcmp(t, "System.IO.Compression.DeflateStream") || !strcmp(t, "System.IO.Compression.GZipStream") ||
@@ -1505,6 +1540,9 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         o = attach(h, vm, (uint32_t)a[0].bits, BCL_STREAM);
         if (!o)
             return XXEMUL_STATUS_LIMIT_REACHED;
+        if (stream_source_cycle(h, vm, o, source)) /* self or a chain back to this stream */
+            return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
+        reset_stream(h, o);
         o->source = (uint32_t)a[1].bits;
         o->codec = !strcmp(t, "System.IO.Compression.DeflateStream") ? 2 : !strcmp(t, "System.IO.Compression.GZipStream") ? 3 : 1;
         o->channel = count == 4 && a[3].bits ? 1 : 0;

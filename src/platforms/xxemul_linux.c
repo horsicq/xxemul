@@ -23,12 +23,18 @@
 #define LINUX_EACCES 13
 #define LINUX_EFAULT 14
 #define LINUX_EINVAL 22
+#define LINUX_EMFILE 24
 #define LINUX_EFBIG 27
 #define LINUX_ENOSYS 38
 
+/* files[] holds open file descriptions (indexes 3..LINUX_MAX_FDS-1);
+ * fd_table maps a descriptor number to one: 0..2 = host stdio stream,
+ * 3.. = files[] index, -1 = closed. dup'd descriptors share a description
+ * (and its offset); refs counts the descriptors that refer to it. */
 typedef struct linux_file {
     int used;
     int open;
+    int refs;
     int writable;
     int dirty;
     int self;
@@ -85,6 +91,7 @@ struct xxemul_linux_process {
     uint8_t auxv_data[17u * 2u * 8u];
     size_t auxv_size;
     linux_file files[LINUX_MAX_FDS];
+    int fd_table[LINUX_MAX_FDS];
     linux_map maps[LINUX_MAX_MAPS];
     xxemul_linux_output_callback output;
     void *output_context;
@@ -184,21 +191,129 @@ static int linux_file_reserve(linux_file *file, size_t size)
 
 static linux_file *linux_fd(xxemul_linux_process *process, int fd)
 {
-    if (fd < 3 || fd >= LINUX_MAX_FDS || !process->files[fd].used) return NULL;
-    return &process->files[fd];
+    int index;
+    if (fd < 0 || fd >= LINUX_MAX_FDS) return NULL;
+    index = process->fd_table[fd];
+    if (index < 3 || index >= LINUX_MAX_FDS || !process->files[index].used) return NULL;
+    return &process->files[index];
 }
 
+/* Host stdio stream (0..2) a descriptor refers to, or -1. */
+static int linux_stdio(const xxemul_linux_process *process, int fd)
+{
+    if (fd < 0 || fd >= LINUX_MAX_FDS || process->fd_table[fd] < 0 || process->fd_table[fd] > 2) return -1;
+    return process->fd_table[fd];
+}
+
+static int linux_lowest_free_fd(const xxemul_linux_process *process)
+{
+    int fd;
+    for (fd = 0; fd < LINUX_MAX_FDS; ++fd) {
+        if (process->fd_table[fd] < 0) return fd;
+    }
+    return -1;
+}
+
+static int linux_file_save(linux_file *file);
+
+/* A description without descriptors stays alive while a shared mapping
+ * writes through it or a pending exec image refers to it. */
+static int linux_file_referenced(const xxemul_linux_process *process, int index)
+{
+    int map;
+    if (process->exec_fd == index) return 1;
+    for (map = 0; map < LINUX_MAX_MAPS; ++map) {
+        if (process->maps[map].used && process->maps[map].shared && process->maps[map].fd == index) return 1;
+    }
+    return 0;
+}
+
+static void linux_file_reset(linux_file *file)
+{
+    linux_file_save(file);
+    free(file->data);
+    memset(file, 0, sizeof(*file));
+}
+
+static void linux_file_release(xxemul_linux_process *process, int index)
+{
+    linux_file *file = &process->files[index];
+    if (file->refs > 0) --file->refs;
+    if (file->refs > 0) return;
+    file->open = 0;
+    if (!linux_file_referenced(process, index)) linux_file_reset(file);
+}
+
+/* Allocate the lowest free descriptor and a fresh description for it.
+ * Closed descriptions are recycled once nothing refers to them. */
 static int linux_new_fd(xxemul_linux_process *process)
 {
     int index;
+    int fd = linux_lowest_free_fd(process);
+    if (fd < 0) return -1;
     for (index = 3; index < LINUX_MAX_FDS; ++index) {
-        if (!process->files[index].used) {
-            process->files[index].used = 1;
-            process->files[index].open = 1;
-            return index;
-        }
+        linux_file *file = &process->files[index];
+        if (file->used && (file->refs > 0 || linux_file_referenced(process, index))) continue;
+        if (file->used) linux_file_reset(file);
+        file->used = 1;
+        file->open = 1;
+        file->refs = 1;
+        process->fd_table[fd] = index;
+        return fd;
     }
     return -1;
+}
+
+/* Undo linux_new_fd when open fails before the descriptor is returned. */
+static uint64_t linux_open_failed(xxemul_linux_process *process, int fd, int error)
+{
+    linux_file *file = &process->files[process->fd_table[fd]];
+    free(file->data);
+    memset(file, 0, sizeof(*file));
+    process->fd_table[fd] = -1;
+    return linux_error((unsigned)error);
+}
+
+static uint64_t linux_close(xxemul_linux_process *process, int fd)
+{
+    int index;
+    if (fd < 0 || fd >= LINUX_MAX_FDS || process->fd_table[fd] < 0) return linux_error(LINUX_EBADF);
+    index = process->fd_table[fd];
+    if (index < 3) {
+        /* Closing the original stdio descriptors stays a no-op as before;
+         * a dup'd copy of a stdio stream is simply dropped. */
+        if (fd >= 3) process->fd_table[fd] = -1;
+        return 0;
+    }
+    if (!linux_file_save(&process->files[index])) return linux_error(LINUX_EIO);
+    process->fd_table[fd] = -1;
+    linux_file_release(process, index);
+    return 0;
+}
+
+/* dup/dup2/dup3: the new descriptor shares the open file description. */
+static uint64_t linux_dup(xxemul_linux_process *process, int old_fd, int new_fd, int mode, uint64_t flags)
+{
+    int index;
+    if (old_fd < 0 || old_fd >= LINUX_MAX_FDS || process->fd_table[old_fd] < 0) return linux_error(LINUX_EBADF);
+    index = process->fd_table[old_fd];
+    if (mode == 0) {
+        new_fd = linux_lowest_free_fd(process);
+        if (new_fd < 0) return linux_error(LINUX_EMFILE);
+    } else {
+        if (mode == 3 && (flags & ~UINT64_C(0x80000)) != 0u) return linux_error(LINUX_EINVAL); /* only O_CLOEXEC */
+        if (new_fd < 0 || new_fd >= LINUX_MAX_FDS) return linux_error(LINUX_EBADF);
+        if (new_fd == old_fd) return mode == 3 ? linux_error(LINUX_EINVAL) : (uint64_t)new_fd;
+        if (process->fd_table[new_fd] >= 3) {
+            int previous = process->fd_table[new_fd];
+            linux_file_save(&process->files[previous]); /* dup2 closes silently */
+            process->fd_table[new_fd] = -1;
+            linux_file_release(process, previous);
+        }
+    }
+    process->fd_table[new_fd] = index;
+    if (index >= 3) ++process->files[index].refs;
+    return (uint64_t)new_fd;
 }
 
 static int linux_file_save(linux_file *file)
@@ -245,8 +360,9 @@ static int linux_map_transfer(xxemul_linux_process *process, uint64_t address, v
         if (chunk > (size_t)map->size - offset) chunk = (size_t)map->size - offset;
         if (write) {
             int i;
-            if (map->shared && map->fd >= 3) {
-                linux_file *file = linux_fd(process, map->fd);
+            if (map->shared && map->fd >= 3 && map->fd < LINUX_MAX_FDS) {
+                /* map->fd is a files[] description index, valid after close */
+                linux_file *file = process->files[map->fd].used ? &process->files[map->fd] : NULL;
                 uint64_t file_offset = map->file_offset + offset;
                 if (file == NULL || file_offset > LINUX_MAX_FILE || chunk > LINUX_MAX_FILE - file_offset || !linux_file_reserve(file, (size_t)file_offset + chunk))
                     return -1;
@@ -503,6 +619,10 @@ static xxemul_linux_process *linux_new_process(xxemul *emulator, const char *gue
     process->big_endian = emulator->mode == XXEMUL_MODE_MIPS32_BE || emulator->mode == XXEMUL_MODE_MIPS64_BE;
     process->next_map = process->is_64 ? UINT64_C(0x100000000) : UINT64_C(0x10000000);
     process->exec_fd = -1;
+    {
+        int fd;
+        for (fd = 0; fd < LINUX_MAX_FDS; ++fd) process->fd_table[fd] = fd < 3 ? fd : -1;
+    }
 #if defined(_MSC_VER)
     {
         size_t value_size = 0u;
@@ -780,8 +900,8 @@ static uint64_t linux_open(xxemul_linux_process *process, const char *guest, uin
         if (original & 0x008u) flags |= 0x400u; /* O_APPEND */
     }
     if (process->syscall_stats_enabled && !memfd) fprintf(stderr, "linux open path=\"%s\" flags=0x%" PRIx64 "\n", guest, flags);
-    if (fd < 0) return linux_error(LINUX_ENOMEM);
-    file = &process->files[fd];
+    if (fd < 0) return linux_error(LINUX_EMFILE);
+    file = linux_fd(process, fd);
     file->writable = memfd || (flags & 3u) != 0u;
     if (memfd) return (uint64_t)fd;
     if (flags & UINT64_C(0x400000)) { /* __O_TMPFILE */
@@ -792,12 +912,10 @@ static uint64_t linux_open(xxemul_linux_process *process, const char *guest, uin
                                  ? UINT64_C(0x4000) : UINT64_C(0x10000);
         uint64_t access = flags & 3u;
         if (!(flags & directory) || access == 0u || access == 3u) {
-            memset(file, 0, sizeof(*file));
-            return linux_error(LINUX_EINVAL);
+            return linux_open_failed(process, fd, LINUX_EINVAL);
         }
         if (strcmp(guest, "/dev/shm") != 0) {
-            memset(file, 0, sizeof(*file));
-            return linux_error(LINUX_EPERM);
+            return linux_open_failed(process, fd, LINUX_EPERM);
         }
         return (uint64_t)fd;
     }
@@ -812,8 +930,7 @@ static uint64_t linux_open(xxemul_linux_process *process, const char *guest, uin
     }
     if (!process->freebsd && strcmp(guest, "/proc/self/auxv") == 0) {
         if ((flags & 3u) != 0u) {
-            memset(file, 0, sizeof(*file));
-            return linux_error(LINUX_EACCES);
+            return linux_open_failed(process, fd, LINUX_EACCES);
         }
         file->data = (uint8_t *)malloc(process->auxv_size + 1u);
         if (file->data == NULL) goto no_memory;
@@ -823,13 +940,11 @@ static uint64_t linux_open(xxemul_linux_process *process, const char *guest, uin
         return (uint64_t)fd;
     }
     if (!linux_host_path(process, guest, file->host_path, sizeof(file->host_path))) {
-        memset(file, 0, sizeof(*file));
-        return linux_error(LINUX_EPERM);
+        return linux_open_failed(process, fd, LINUX_EPERM);
     }
     exists = xx_io_file_exists_a(file->host_path);
     if (!exists && (flags & 0x40u) == 0u) {
-        memset(file, 0, sizeof(*file));
-        return linux_error(LINUX_ENOENT);
+        return linux_open_failed(process, fd, LINUX_ENOENT);
     }
     if (exists && (flags & 0x200u) == 0u) {
         file->data = linux_read_file(file->host_path, &file->size);
@@ -840,20 +955,20 @@ static uint64_t linux_open(xxemul_linux_process *process, const char *guest, uin
     if ((flags & 0x400u) != 0u) file->offset = file->size;
     return (uint64_t)fd;
 no_memory:
-    free(file->data);
-    memset(file, 0, sizeof(*file));
-    return linux_error(LINUX_ENOMEM);
+    return linux_open_failed(process, fd, LINUX_ENOMEM);
 }
 
 static void linux_sync_file_maps(xxemul_linux_process *process, int fd, uint64_t offset, size_t size)
 {
     linux_file *file = linux_fd(process, fd);
     int index;
+    int description;
     if (file == NULL) return;
+    description = process->fd_table[fd];
     for (index = 0; index < LINUX_MAX_MAPS; ++index) {
         linux_map *map = &process->maps[index];
         uint64_t begin, end;
-        if (!map->used || !map->shared || map->fd != fd) continue;
+        if (!map->used || !map->shared || map->fd != description) continue;
         begin = offset > map->file_offset ? offset : map->file_offset;
         end = offset + size;
         if (end > map->file_offset + map->size) end = map->file_offset + map->size;
@@ -889,7 +1004,8 @@ static uint64_t linux_file_write(xxemul_linux_process *process, int fd, uint64_t
 
 static uint64_t linux_write(xxemul_linux_process *process, int fd, uint64_t address, uint64_t count)
 {
-    if (fd == 1 || fd == 2) {
+    int stream = linux_stdio(process, fd);
+    if (stream == 1 || stream == 2) {
         uint8_t *bytes;
         if (count > 1024u * 1024u) return linux_error(LINUX_EINVAL);
         if (count == 0) return 0;
@@ -899,11 +1015,11 @@ static uint64_t linux_write(xxemul_linux_process *process, int fd, uint64_t addr
             free(bytes);
             return linux_error(LINUX_EFAULT);
         }
-        if (process->output != NULL) process->output(process->output_context, fd, bytes, (size_t)count);
+        if (process->output != NULL) process->output(process->output_context, stream, bytes, (size_t)count);
         free(bytes);
         return count;
     }
-    if (fd < 3) return linux_error(LINUX_EBADF);
+    if (stream == 0) return linux_error(LINUX_EBADF);
     {
         linux_file *file = linux_fd(process, fd);
         if (file == NULL) return linux_error(LINUX_EBADF);
@@ -915,7 +1031,7 @@ static uint64_t linux_read(xxemul_linux_process *process, int fd, uint64_t addre
 {
     linux_file *file = linux_fd(process, fd);
     size_t available;
-    if (fd == 0) return 0;
+    if (linux_stdio(process, fd) == 0) return 0;
     if (file == NULL || !file->open) return linux_error(LINUX_EBADF);
     if (file->offset >= file->size) return 0;
     available = file->size - (size_t)file->offset;
@@ -1086,7 +1202,7 @@ static int linux_host_size(xxemul_linux_process *process, const char *guest, uin
 static uint64_t linux_fstat(xxemul_linux_process *process, int fd, uint64_t address)
 {
     linux_file *file;
-    if (fd >= 0 && fd <= 2) return linux_stat_buffer(process, address, 0) ? 0 : linux_error(LINUX_EFAULT);
+    if (linux_stdio(process, fd) >= 0) return linux_stat_buffer(process, address, 0) ? 0 : linux_error(LINUX_EFAULT);
     file = linux_fd(process, fd);
     if (file == NULL || !file->open) return linux_error(LINUX_EBADF);
     return linux_stat_buffer(process, address, file->size) ? 0 : linux_error(LINUX_EFAULT);
@@ -1179,7 +1295,7 @@ static uint64_t linux_mmap(xxemul_linux_process *process, uint64_t address, uint
     if (map->data == NULL) return linux_error(LINUX_ENOMEM);
     map->base = address;
     map->size = size;
-    map->fd = file == NULL ? -1 : fd;
+    map->fd = file == NULL ? -1 : process->fd_table[fd]; /* description index */
     map->file_offset = offset;
     map->shared = file != NULL && (flags & 1u) != 0u;
     map->generation = ++process->map_generation;
@@ -1329,7 +1445,7 @@ static uint64_t linux_execve(xxemul_linux_process *process, int at)
     process->exec_flags = flags;
     process->exec_owned_image = owned_image;
     process->exec_owned_size = owned_size;
-    process->exec_fd = fd;
+    process->exec_fd = fd < 0 ? -1 : process->fd_table[fd]; /* description index */
     process->exited = 1;
     process->exit_code = 0;
     process->emulator->halted = 1;
@@ -1352,13 +1468,7 @@ static uint64_t linux_dispatch_amd64(xxemul_linux_process *process, uint32_t num
         case 257:
             if (!linux_guest_string(process, number == 257 ? b : a, path, sizeof(path))) return linux_error(LINUX_EFAULT);
             return linux_open(process, path, number == 257 ? c : b, 0);
-        case 3:
-            file = linux_fd(process, (int)a);
-            if (file == NULL) return a < 3u ? 0 : linux_error(LINUX_EBADF);
-            if (!file->open) return linux_error(LINUX_EBADF);
-            if (!linux_file_save(file)) return linux_error(LINUX_EIO);
-            file->open = 0;
-            return 0;
+        case 3: return linux_close(process, (int)a);
         case 4:
         case 6: return linux_stat(process, a, b);
         case 5: return linux_fstat(process, (int)a, b);
@@ -1370,8 +1480,9 @@ static uint64_t linux_dispatch_amd64(xxemul_linux_process *process, uint32_t num
         case 18: return linux_file_write(process, (int)a, b, c, d, 0);
         case 20: return linux_writev(process, (int)a, b, c);
         case 26: return 0; /* shared mappings are synchronized on every write */
-        case 32:
-        case 33: return a; /* no independent cursor is needed by the packer */
+        case 32: return linux_dup(process, (int)a, -1, 0, 0);
+        case 33: return linux_dup(process, (int)a, (int)b, 2, 0);
+        case 292: return linux_dup(process, (int)a, (int)b, 3, c);
         case 59: return linux_execve(process, 0);
         case 60:
         case 231:
@@ -1453,17 +1564,11 @@ static uint64_t linux_dispatch_i386(xxemul_linux_process *process, uint32_t numb
         case 295:
             if (!linux_guest_string(process, number == 295 ? b : a, path, sizeof(path))) return linux_error(LINUX_EFAULT);
             return linux_open(process, path, number == 295 ? c : b, 0);
-        case 6:
-            file = linux_fd(process, (int)a);
-            if (file == NULL) return a < 3u ? 0 : linux_error(LINUX_EBADF);
-            if (!file->open) return linux_error(LINUX_EBADF);
-            if (!linux_file_save(file)) return linux_error(LINUX_EIO);
-            file->open = 0;
-            return 0;
+        case 6: return linux_close(process, (int)a);
         case 11: return linux_execve(process, 0);
         case 19: return linux_lseek(process, (int)a, (int32_t)b, c);
-        case 41:
-        case 63: return a;
+        case 41: return linux_dup(process, (int)a, -1, 0, 0);
+        case 63: return linux_dup(process, (int)a, (int)b, 2, 0);
         case 45: return linux_brk(process, a);
         case 85: return linux_readlink(process, a, b, c);
         case 90: {
@@ -1574,7 +1679,7 @@ static uint64_t linux_dispatch_arm64(xxemul_linux_process *process, uint32_t num
     uint32_t service;
     switch (number) {
         case 23: service = 32; break; /* dup */
-        case 24: service = 33; break; /* dup3 */
+        case 24: service = 292; break; /* dup3 */
         case 46: service = 77; break;
         case 48: return 0;
         case 56: service = 257; break;
@@ -1749,7 +1854,6 @@ static uint64_t freebsd_dispatch_i386(xxemul_linux_process *process, uint32_t nu
     uint64_t value, offset, flags;
     unsigned count, index;
     char path[1024];
-    linux_file *file;
     memset(args, 0, sizeof(process->freebsd_arguments));
     if (number == 0 || number == 198) {
         if (!linux_guest_value(process, parameters, 4, &value)) return linux_error(LINUX_EFAULT);
@@ -1788,12 +1892,7 @@ static uint64_t freebsd_dispatch_i386(xxemul_linux_process *process, uint32_t nu
             if (args[1] & 0x400u) flags |= 0x200u;
             if (args[1] & 0x8u) flags |= 0x400u;
             return linux_open(process, path, flags, 0);
-        case 6:
-            file = linux_fd(process, (int)args[0]);
-            if (!file || !file->open) return args[0] < 3u ? 0 : linux_error(LINUX_EBADF);
-            if (!linux_file_save(file)) return linux_error(LINUX_EIO);
-            file->open = 0;
-            return 0;
+        case 6: return linux_close(process, (int)(int32_t)args[0]);
         case 20: return 1000;
         case 73: return linux_munmap(process, args[0], args[1]);
         case 74: return freebsd_mprotect(args[0], args[1]);

@@ -1706,8 +1706,14 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
             break;
         case CDISASM_ARM_NAME_BKPT:
         case CDISASM_ARM_NAME_BRK:
+            /* Like x86 INT3, a reported breakpoint leaves PC past the
+             * instruction (see XXEMUL_STATUS_BREAKPOINT). */
             if (emulator->windows) {
                 emulator->windows_exception_code = UINT32_C(0x80000003);
+                status = XXEMUL_STATUS_BREAKPOINT;
+                break;
+            }
+            if (emulator->debug_traps) {
                 status = XXEMUL_STATUS_BREAKPOINT;
                 break;
             }
@@ -1722,8 +1728,10 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
                 instruction.operand[0].type != CDISASM_OPERAND_IMMEDIATE ||
                 instruction.operand[0].imm != UINT64_C(0x1068f) ||
                 instruction.operand[1].type != CDISASM_OPERAND_REGISTER ||
-                instruction.operand[1].reg < CDISASM_ARM_REG_R0 || instruction.operand[1].reg > CDISASM_ARM_REG_R14)
-                return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                instruction.operand[1].reg < CDISASM_ARM_REG_R0 || instruction.operand[1].reg > CDISASM_ARM_REG_R14) {
+                status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                break;
+            }
             if (instruction.name_id == CDISASM_ARM_NAME_MRC)
                 status = xxemul_arm_write_register(emulator, instruction.operand[1].reg,
                     emulator->arm_thread_pointer_valid ? emulator->arm_thread_pointer : xxemul_windows_teb_address(emulator->windows));
@@ -2067,7 +2075,7 @@ xxemul_status xxemul_arm_step(xxemul *emulator, xxemul_step_info *info)
         default: status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; break;
     }
 
-    if (status != XXEMUL_STATUS_OK && status != XXEMUL_STATUS_HALTED) {
+    if (status != XXEMUL_STATUS_OK && status != XXEMUL_STATUS_HALTED && status != XXEMUL_STATUS_BREAKPOINT) {
         emulator->arm.pc = current_pc;
     } else {
         if (itstate & 15u) xxemul_arm_advance_it(emulator, itstate);

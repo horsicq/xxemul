@@ -224,7 +224,9 @@ xxemul_status xxemul_mips64_step(xxemul *e, xxemul_step_info *info)
                 unsigned position = sa + (fn == 2u ? 32u : 0u);
                 unsigned bits = rd + (fn == 1u ? 33u : 1u), limit = fn == 0u ? 32u : 64u;
                 if (position + bits > limit) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
-                r.gpr[rt] = (a >> position) & m64_mask(bits);
+                value = (a >> position) & m64_mask(bits);
+                /* EXT produces a 32-bit result, sign-extended like other word ops. */
+                r.gpr[rt] = fn == 0u ? m64_word((uint32_t)value) : value;
             } else if (fn >= 4u && fn <= 7u) { /* INS / DINSM / DINSU / DINS */
                 unsigned position = sa + (fn == 6u ? 32u : 0u), top = rd + ((fn == 5u || fn == 6u) ? 32u : 0u);
                 uint64_t field;
