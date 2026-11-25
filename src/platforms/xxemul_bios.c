@@ -89,7 +89,7 @@ static uint8_t xxemul_bios_ah(const xxemul *emulator)
 
 static void xxemul_bios_set_ax(xxemul *emulator, uint16_t value)
 {
-    emulator->x86.gpr[XXEMUL_X86_RAX] = value;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, value);
 }
 
 static xxemul_status xxemul_bios_video(xxemul *emulator)
@@ -126,8 +126,8 @@ static xxemul_status xxemul_bios_video(xxemul *emulator)
             }
             return XXEMUL_STATUS_OK;
         case 0x03u:
-            emulator->x86.gpr[XXEMUL_X86_RDX] = (uint16_t)(((uint16_t)emulator->cursor_row << 8) | emulator->cursor_column);
-            emulator->x86.gpr[XXEMUL_X86_RCX] = 0x0607u;
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, (uint16_t)(((uint16_t)emulator->cursor_row << 8) | emulator->cursor_column));
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, 0x0607u);
             return XXEMUL_STATUS_OK;
         case 0x09u:
         case 0x0au:
@@ -213,12 +213,12 @@ static xxemul_status xxemul_bios_multiplex(xxemul *emulator)
             return XXEMUL_STATUS_OK;
         }
         xxemul_bios_set_ax(emulator, 0u);
-        emulator->x86.gpr[XXEMUL_X86_RBX] = 1u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, 1u);
         /* DPMI 0.9, 386 CPU, no caller-allocated private paragraphs. */
-        emulator->x86.gpr[XXEMUL_X86_RCX] = 3u;
-        emulator->x86.gpr[XXEMUL_X86_RDX] = 0x005au;
-        emulator->x86.gpr[XXEMUL_X86_RSI] = 0u;
-        emulator->x86.gpr[XXEMUL_X86_RDI] = 0x0200u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, 3u);
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, 0x005au);
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RSI, 0u);
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDI, 0x0200u);
         emulator->x86.segment[XXEMUL_X86_ES] = 0xf000u;
         return XXEMUL_STATUS_OK;
     }
@@ -257,8 +257,8 @@ xxemul_status xxemul_bios_interrupt(xxemul *emulator, uint8_t vector)
         case 0x1au:
             if (xxemul_bios_ah(emulator) == 0u) {
                 uint32_t ticks = bios_ticks(emulator);
-                emulator->x86.gpr[XXEMUL_X86_RCX] = ticks >> 16u;
-                emulator->x86.gpr[XXEMUL_X86_RDX] = ticks & 0xffffu;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, ticks >> 16u);
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, ticks & 0xffffu);
                 emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | emulator->region_data[0x470u];
                 emulator->region_data[0x470u] = 0;
                 emulator->x86.flags &= ~UINT64_C(1);
@@ -279,14 +279,14 @@ xxemul_status xxemul_bios_interrupt(xxemul *emulator, uint8_t vector)
         case 0x33u:
             if ((uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX] == 0u) {
                 xxemul_bios_set_ax(emulator, 0u);
-                emulator->x86.gpr[XXEMUL_X86_RBX] = 0u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, 0u);
                 return XXEMUL_STATUS_OK;
             }
             if ((uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX] == 3u) {
                 /* No pointing device supplies movement or button events. */
-                emulator->x86.gpr[XXEMUL_X86_RBX] = 0u;
-                emulator->x86.gpr[XXEMUL_X86_RCX] = 0u;
-                emulator->x86.gpr[XXEMUL_X86_RDX] = 0u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, 0u);
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, 0u);
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, 0u);
                 return XXEMUL_STATUS_OK;
             }
             if ((uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX] == 0x1du && (uint16_t)emulator->x86.gpr[XXEMUL_X86_RBX] == 0u) {
@@ -294,7 +294,7 @@ xxemul_status xxemul_bios_interrupt(xxemul *emulator, uint8_t vector)
                 return XXEMUL_STATUS_OK;
             }
             if ((uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX] == 0x1eu) {
-                emulator->x86.gpr[XXEMUL_X86_RBX] = 0u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, 0u);
                 return XXEMUL_STATUS_OK;
             }
             if ((uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX] == 1u || (uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX] == 2u ||

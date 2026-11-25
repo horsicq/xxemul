@@ -1078,6 +1078,12 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                 host_free(h, o->name, strlen(o->name) + 1); /* same accounting as host destroy */
                 o->name = NULL;
             }
+            {
+                /* get_Message stops at the first NUL; storing only that prefix keeps
+                 * the allocation equal to the strlen + 1 that every free accounts. */
+                const char *nul = n ? (const char *)memchr(s, 0, n) : NULL;
+                if (nul) n = (size_t)(nul - s);
+            }
             o->name = host_string(h, s, n);
             return o->name ? XXEMUL_STATUS_OK : XXEMUL_STATUS_LIMIT_REACHED;
         }

@@ -205,7 +205,7 @@ static void dos_forget_temp_attributes(dos_session *session, const char *host)
 
 static void dos_result(xxemul *emulator, uint16_t value, int error)
 {
-    emulator->x86.gpr[XXEMUL_X86_RAX] = value;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, value);
     if (error) {
         emulator->x86.flags |= DOS_CF;
     } else {
@@ -518,7 +518,7 @@ static uint16_t dos_open_extended(xxemul *emulator, dos_session *session)
     error = dos_open_file_path(emulator, session, guest, access, creating);
     if (error == 0u) {
         session->handles[(uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX]].no_inherit = no_inherit;
-        emulator->x86.gpr[XXEMUL_X86_RCX] = result_action;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, result_action);
     }
     return error;
 }
@@ -1193,7 +1193,7 @@ static uint16_t dos_seek(xxemul *emulator, dos_session *session)
         return 1u;
     }
     dos_sft_update(emulator, session, handle);
-    emulator->x86.gpr[XXEMUL_X86_RDX] = (uint16_t)(position >> 16);
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, (uint16_t)(position >> 16));
     dos_result(emulator, (uint16_t)position, 0);
     return 0u;
 }
@@ -1657,8 +1657,8 @@ static uint16_t dos_process_memory(xxemul *emulator, uint16_t function, uint16_t
     xxemul_x86_state saved = emulator->x86;
     xxemul_status status;
     uint16_t error;
-    emulator->x86.gpr[XXEMUL_X86_RAX] = (uint16_t)(function << 8u);
-    emulator->x86.gpr[XXEMUL_X86_RBX] = argument;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, (uint16_t)(function << 8u));
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, argument);
     if (function == 0x49u) emulator->x86.segment[XXEMUL_X86_ES] = argument;
     status = xxemul_msdos_interrupt(emulator, 0x21u);
     error = status != XXEMUL_STATUS_OK ? 8u : emulator->x86.flags & DOS_CF ? (uint16_t)emulator->x86.gpr[XXEMUL_X86_RAX] : 0u;
@@ -2049,11 +2049,11 @@ xxemul_status xxemul_dos_files_interrupt(xxemul *emulator, uint8_t function)
             if (subfunction != 0u) {
                 error = 1u;
             } else if (handle <= 2u) {
-                emulator->x86.gpr[XXEMUL_X86_RDX] = 0x80d3u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, 0x80d3u);
                 emulator->x86.flags &= ~DOS_CF;
                 error = 0u;
             } else if (session != NULL && handle >= 5u && handle < DOS_MAX_HANDLES && session->handles[handle].device != NULL) {
-                emulator->x86.gpr[XXEMUL_X86_RDX] = 2u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, 2u);
                 emulator->x86.flags &= ~DOS_CF;
                 error = 0u;
             } else {
@@ -2069,8 +2069,8 @@ xxemul_status xxemul_dos_files_interrupt(xxemul *emulator, uint8_t function)
             if (session == NULL || handle < 5u || handle >= DOS_MAX_HANDLES || session->handles[handle].device == NULL) {
                 error = 6u;
             } else if (subfunction == 0u && dos_metadata(session, session->handles[handle].host_path, &metadata)) {
-                emulator->x86.gpr[XXEMUL_X86_RCX] = metadata.time;
-                emulator->x86.gpr[XXEMUL_X86_RDX] = metadata.date;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, metadata.time);
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, metadata.date);
                 emulator->x86.flags &= ~DOS_CF;
                 error = 0u;
             } else if (subfunction == 1u &&

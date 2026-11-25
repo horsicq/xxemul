@@ -182,7 +182,7 @@ static xxemul_status xxemul_dos_memory_allocate(xxemul *emulator)
     uint16_t next;
 
     if ((strategy & 0x40u) != 0u) {
-        emulator->x86.gpr[XXEMUL_X86_RBX] = 0u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, 0u);
         xxemul_dos_result(emulator, 8u, 1);
         return XXEMUL_STATUS_OK;
     }
@@ -256,7 +256,7 @@ static xxemul_status xxemul_dos_memory_allocate(xxemul *emulator)
         xxemul_dos_result(emulator, (uint16_t)(chosen_segment + 1u), 0);
         return XXEMUL_STATUS_OK;
     }
-    emulator->x86.gpr[XXEMUL_X86_RBX] = largest;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, largest);
     xxemul_dos_result(emulator, 8u, 1);
     return XXEMUL_STATUS_OK;
 }
@@ -327,7 +327,7 @@ static xxemul_status xxemul_dos_memory_resize(xxemul *emulator)
         next = following_next;
     }
     if (requested > possible) {
-        emulator->x86.gpr[XXEMUL_X86_RBX] = possible;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, possible);
         xxemul_dos_result(emulator, 8u, 1);
         return XXEMUL_STATUS_OK;
     }
@@ -360,7 +360,7 @@ static uint8_t xxemul_dos_ah(const xxemul *emulator)
 
 static void xxemul_dos_set_ax(xxemul *emulator, uint16_t value)
 {
-    emulator->x86.gpr[XXEMUL_X86_RAX] = value;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, value);
 }
 
 static xxemul_status xxemul_dos_output_string(xxemul *emulator)
@@ -618,9 +618,9 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
                 xxemul_dos_result(emulator, 1u, 1);
                 return XXEMUL_STATUS_OK;
             }
-            emulator->x86.gpr[XXEMUL_X86_RAX] = (uint8_t)local.tm_wday;
-            emulator->x86.gpr[XXEMUL_X86_RCX] = (uint16_t)(local.tm_year + 1900);
-            emulator->x86.gpr[XXEMUL_X86_RDX] = ((uint16_t)(local.tm_mon + 1) << 8u) | (uint8_t)local.tm_mday;
+            emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | (uint8_t)((uint8_t)local.tm_wday);
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, (uint16_t)(local.tm_year + 1900));
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, ((uint16_t)(local.tm_mon + 1) << 8u) | (uint8_t)local.tm_mday);
             break;
         }
         case 0x2cu: {
@@ -631,8 +631,8 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
              * leaves those loops unable to make progress. */
             uint32_t hundredths = (uint32_t)(((uint64_t)(ticks % 0x1800b0u) * UINT64_C(8640000)) / 0x1800b0u);
             uint32_t seconds = hundredths / 100u;
-            emulator->x86.gpr[XXEMUL_X86_RCX] = ((seconds / 3600u) << 8u) | ((seconds / 60u) % 60u);
-            emulator->x86.gpr[XXEMUL_X86_RDX] = ((seconds % 60u) << 8u) | (hundredths % 100u);
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, ((seconds / 3600u) << 8u) | ((seconds / 60u) % 60u));
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, ((seconds % 60u) << 8u) | (hundredths % 100u));
             break;
         }
         case 0x19u: emulator->x86.gpr[XXEMUL_X86_RAX] = (emulator->x86.gpr[XXEMUL_X86_RAX] & ~UINT64_C(0xff)) | 2u; break;
@@ -651,18 +651,18 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
         case 0x29u: return xxemul_dos_parse_fcb(emulator);
         case 0x2fu:
             emulator->x86.segment[XXEMUL_X86_ES] = emulator->dos_dta_segment;
-            emulator->x86.gpr[XXEMUL_X86_RBX] = emulator->dos_dta_offset;
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, emulator->dos_dta_offset);
             break;
         case 0x35u: {
             uint8_t interrupt = (uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX];
             const uint8_t *entry = emulator->region_data + (size_t)interrupt * 4u;
-            emulator->x86.gpr[XXEMUL_X86_RBX] = xxemul_dos_read_word(entry);
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, xxemul_dos_read_word(entry));
             emulator->x86.segment[XXEMUL_X86_ES] = xxemul_dos_read_word(entry + 2u);
             break;
         }
         case 0x33u:
             if ((uint8_t)emulator->x86.gpr[XXEMUL_X86_RAX] <= 1u) {
-                emulator->x86.gpr[XXEMUL_X86_RDX] = 0u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, 0u);
             } else {
                 xxemul_dos_result(emulator, 1u, 1);
                 return XXEMUL_STATUS_OK;
@@ -677,9 +677,9 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
                 xxemul_dos_result(emulator, UINT16_MAX, 0);
                 return XXEMUL_STATUS_OK;
             }
-            emulator->x86.gpr[XXEMUL_X86_RBX] = available;
-            emulator->x86.gpr[XXEMUL_X86_RCX] = 512u;
-            emulator->x86.gpr[XXEMUL_X86_RDX] = total;
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, available);
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, 512u);
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, total);
             xxemul_dos_result(emulator, 8u, 0);
             return XXEMUL_STATUS_OK;
         }
@@ -734,11 +734,11 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
                 return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             }
             emulator->x86.segment[XXEMUL_X86_ES] = segment;
-            emulator->x86.gpr[XXEMUL_X86_RBX] = offset;
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, offset);
             break;
         }
         case 0x51u:
-        case 0x62u: emulator->x86.gpr[XXEMUL_X86_RBX] = emulator->psp_segment; break;
+        case 0x62u: xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, emulator->psp_segment); break;
         case 0x0au: {
             status = xxemul_dos_buffered_input(emulator);
             if (status != XXEMUL_STATUS_OK) return status;

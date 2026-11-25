@@ -165,9 +165,10 @@ static xxemul_status dpmi_protected_vector(xxemul *emulator, int setting)
     gate = emulator->region_data + emulator->dos_idtr_base + at;
     if (!setting) {
         if ((gate[5] & 0x9fu) != (emulator->dos_dpmi_client32 ? 0x8eu : 0x86u) || gate[4]) goto invalid;
-        emulator->x86.gpr[XXEMUL_X86_RCX] = dpmi_u16(gate + 2u);
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, dpmi_u16(gate + 2u));
         offset = dpmi_u16(gate) | ((uint32_t)dpmi_u16(gate + 6u) << 16u);
-        emulator->x86.gpr[XXEMUL_X86_RDX] = emulator->dos_dpmi_client32 ? offset : (uint16_t)offset;
+        if (emulator->dos_dpmi_client32) emulator->x86.gpr[XXEMUL_X86_RDX] = offset;
+        else xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, offset);
         return XXEMUL_STATUS_OK;
     }
     selector = (uint16_t)emulator->x86.gpr[XXEMUL_X86_RCX];
@@ -186,7 +187,7 @@ static xxemul_status dpmi_protected_vector(xxemul *emulator, int setting)
     dpmi_put_u16(gate + 6u, emulator->dos_dpmi_client32 ? (uint16_t)(offset >> 16u) : 0u);
     return XXEMUL_STATUS_OK;
 invalid:
-    emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8022u;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8022u);
     emulator->x86.flags |= DPMI_CF;
     return XXEMUL_STATUS_OK;
 }
@@ -302,7 +303,7 @@ static xxemul_status dpmi_callback_allocate(xxemul *emulator)
         if (!emulator->dos_dpmi_callbacks[slot].procedure_selector) break;
     alias = dpmi_find_descriptors(emulator, 1u);
     if (slot == XXEMUL_DPMI_CALLBACK_SLOTS || !alias || !dpmi_pointer(emulator, procedure, offset, 1u, 1) || !dpmi_pointer(emulator, packet, packet_offset, 0x32u, 0)) {
-        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8015u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8015u);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
@@ -313,8 +314,8 @@ static xxemul_status dpmi_callback_allocate(xxemul *emulator)
     emulator->dos_dpmi_callbacks[slot].packet_selector = packet;
     emulator->dos_dpmi_callbacks[slot].packet_offset = packet_offset;
     emulator->dos_dpmi_callbacks[slot].stack_alias = alias;
-    emulator->x86.gpr[XXEMUL_X86_RCX] = 0xf000u;
-    emulator->x86.gpr[XXEMUL_X86_RDX] = DPMI_CALLBACK_FIRST + slot * 16u;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, 0xf000u);
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, DPMI_CALLBACK_FIRST + slot * 16u);
     return XXEMUL_STATUS_OK;
 }
 
@@ -329,7 +330,7 @@ static xxemul_status dpmi_callback_free(xxemul *emulator)
         memset(emulator->dos_dpmi_callbacks + slot, 0, sizeof(emulator->dos_dpmi_callbacks[slot]));
         return XXEMUL_STATUS_OK;
     }
-    emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8024u;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8024u);
     emulator->x86.flags |= DPMI_CF;
     return XXEMUL_STATUS_OK;
 }
@@ -362,14 +363,14 @@ static xxemul_status dpmi_allocate_dos(xxemul *emulator)
             emulator->x86 = saved;
             if (status != XXEMUL_STATUS_OK) return status;
         }
-        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x0008u;
-        emulator->x86.gpr[XXEMUL_X86_RBX] = largest;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x0008u);
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, largest);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
     if (selector == 0u) {
-        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8011u;
-        emulator->x86.gpr[XXEMUL_X86_RBX] = 0u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8011u);
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, 0u);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
@@ -381,8 +382,8 @@ static xxemul_status dpmi_allocate_dos(xxemul *emulator)
     emulator->x86 = saved;
     if (status != XXEMUL_STATUS_OK) return status;
     if (error != 0u) {
-        emulator->x86.gpr[XXEMUL_X86_RAX] = error;
-        emulator->x86.gpr[XXEMUL_X86_RBX] = largest;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, error);
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, largest);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
@@ -394,8 +395,8 @@ static xxemul_status dpmi_allocate_dos(xxemul *emulator)
     dpmi_descriptors_used(emulator, selector, count);
     emulator->dos_dpmi_dos_segment[selector / 8u] = segment;
     emulator->dos_dpmi_dos_descriptors[selector / 8u] = (uint8_t)count;
-    emulator->x86.gpr[XXEMUL_X86_RAX] = segment;
-    emulator->x86.gpr[XXEMUL_X86_RDX] = selector;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, segment);
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, selector);
     emulator->x86.flags &= ~DPMI_CF;
     return XXEMUL_STATUS_OK;
 }
@@ -409,7 +410,7 @@ static xxemul_status dpmi_free_dos(xxemul *emulator)
     xxemul_status status;
 
     if ((selector & 7u) != 0u || selector >= 0x1000u || (segment = emulator->dos_dpmi_dos_segment[selector / 8u]) == 0u) {
-        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8022u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8022u);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
@@ -421,7 +422,7 @@ static xxemul_status dpmi_free_dos(xxemul *emulator)
     emulator->x86 = saved;
     if (status != XXEMUL_STATUS_OK) return status;
     if (error != 0u) {
-        emulator->x86.gpr[XXEMUL_X86_RAX] = error;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, error);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
@@ -572,13 +573,13 @@ static xxemul_status dpmi_memory(xxemul *emulator, uint16_t function)
     block->size = size;
     block->handle = dpmi_new_memory_handle(emulator);
     dpmi_update_heap_end(emulator);
-    emulator->x86.gpr[XXEMUL_X86_RBX] = base >> 16u;
-    emulator->x86.gpr[XXEMUL_X86_RCX] = base & 0xffffu;
-    emulator->x86.gpr[XXEMUL_X86_RSI] = block->handle >> 16u;
-    emulator->x86.gpr[XXEMUL_X86_RDI] = block->handle & 0xffffu;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, base >> 16u);
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, base & 0xffffu);
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RSI, block->handle >> 16u);
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDI, block->handle & 0xffffu);
     return XXEMUL_STATUS_OK;
 failed:
-    emulator->x86.gpr[XXEMUL_X86_RAX] = error;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, error);
     emulator->x86.flags |= DPMI_CF;
     return XXEMUL_STATUS_OK;
 }
@@ -611,7 +612,7 @@ static xxemul_status dpmi_resident_region(xxemul *emulator)
        virtual memory. Every valid byte here already has resident backing. */
     return XXEMUL_STATUS_OK;
 invalid:
-    emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8025u;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8025u);
     emulator->x86.flags |= DPMI_CF;
     return XXEMUL_STATUS_OK;
 }
@@ -732,12 +733,12 @@ static xxemul_status dpmi_begin_real_interrupt(xxemul *emulator, uint8_t vector,
                       emulator->x86.ip == XXEMUL_DPMI_HOST_VECTOR_BASE + (kind == DPMI_TRANSITION_SIMULATE ? 0x31u : (uint32_t)vector) * 4u;
     if (!cs && !ip) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     if ((emulator->dos_cr0 & UINT32_C(0x80000000)) || emulator->dos_dpmi_transition_depth >= XXEMUL_DPMI_TRANSITIONS) {
-        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8012u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8012u);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
     if (words > 128u || (kind == DPMI_TRANSITION_SIMULATE && (emulator->x86.gpr[XXEMUL_X86_RBX] & 0xff00u))) {
-        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8021u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8021u);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
@@ -991,7 +992,7 @@ static xxemul_status dpmi_simulate_interrupt(xxemul *emulator)
     frame = dpmi_descriptor_buffer(emulator, 1, 0x32u);
     if (!frame) return XXEMUL_STATUS_ADDRESS_FAULT;
     if (vector > 0xffu || (uint16_t)emulator->x86.gpr[XXEMUL_X86_RCX] > 128u) {
-        emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8021u;
+        xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8021u);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
     }
@@ -1044,25 +1045,25 @@ xxemul_status xxemul_dpmi_interrupt(xxemul *emulator)
             if (selector == 0u) break;
             for (i = 0u; i < count; ++i) dpmi_descriptor(emulator, (uint16_t)(selector + i * 8u), 0u, 0xffffu, 0x93u, 0u);
             dpmi_descriptors_used(emulator, selector, count);
-            emulator->x86.gpr[XXEMUL_X86_RAX] = selector;
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, selector);
             return XXEMUL_STATUS_OK;
         }
         case 0x0006u:
             descriptor = dpmi_client_descriptor(emulator, selector);
             if (descriptor == NULL) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8022u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8022u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
             address = dpmi_descriptor_base(descriptor);
-            emulator->x86.gpr[XXEMUL_X86_RCX] = address >> 16u;
-            emulator->x86.gpr[XXEMUL_X86_RDX] = address & 0xffffu;
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, address >> 16u);
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, address & 0xffffu);
             return XXEMUL_STATUS_OK;
         case 0x0007u:
         case 0x0008u:
         case 0x0009u:
             if (dpmi_callback_owns_selector(emulator, selector)) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8022u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8022u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
@@ -1091,13 +1092,13 @@ xxemul_status xxemul_dpmi_interrupt(xxemul *emulator)
             uint16_t alias;
             if (selector < 8u || selector == XXEMUL_DPMI_HOST_SELECTOR || selector == XXEMUL_DPMI_STACK_SELECTOR || selector >= emulator->dos_dpmi_next_selector ||
                 (selector & 7u) != 0u || (emulator->region_data[DPMI_GDT_BASE + selector + 5u] & 0x90u) != 0x90u) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8022u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8022u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
             alias = dpmi_find_descriptors(emulator, 1u);
             if (alias == 0u) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8011u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8011u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
@@ -1105,26 +1106,26 @@ xxemul_status xxemul_dpmi_interrupt(xxemul *emulator)
             memcpy(descriptor, emulator->region_data + DPMI_GDT_BASE + selector, 8u);
             descriptor[5] = (uint8_t)((descriptor[5] & 0xf0u) | 3u); /* writable data alias */
             dpmi_descriptors_used(emulator, alias, 1u);
-            emulator->x86.gpr[XXEMUL_X86_RAX] = alias;
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, alias);
             return XXEMUL_STATUS_OK;
         }
         case 0x000bu:
         case 0x000cu: {
             uint8_t *buffer, replacement[8];
             if (function == 0x000cu && dpmi_callback_owns_selector(emulator, selector)) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8022u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8022u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
             descriptor = dpmi_client_descriptor(emulator, selector);
             if (descriptor == NULL) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8022u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8022u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
             buffer = dpmi_descriptor_buffer(emulator, function == 0x000bu, 8u);
             if (buffer == NULL) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8025u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8025u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
@@ -1135,12 +1136,12 @@ xxemul_status xxemul_dpmi_interrupt(xxemul *emulator)
             memcpy(replacement, buffer, 8u);
             if (!(replacement[5] & 0x10u) || ((replacement[5] >> 5u) & 3u) != (emulator->x86.segment[XXEMUL_X86_CS] & 3u) ||
                 ((replacement[5] & 0x80u) && (replacement[6] & 0x20u))) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8021u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8021u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
             if ((replacement[5] & 0x80u) && (uint64_t)dpmi_descriptor_base(replacement) + dpmi_descriptor_limit(replacement) > UINT32_MAX) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8025u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8025u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
@@ -1151,7 +1152,7 @@ xxemul_status xxemul_dpmi_interrupt(xxemul *emulator)
         case 0x0500u: {
             uint8_t *buffer = dpmi_descriptor_buffer(emulator, 1, 0x30u);
             if (!buffer) {
-                emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8025u;
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8025u);
                 emulator->x86.flags |= DPMI_CF;
                 return XXEMUL_STATUS_OK;
             }
@@ -1172,8 +1173,8 @@ xxemul_status xxemul_dpmi_interrupt(xxemul *emulator)
         case 0x0201u: {
             uint8_t *entry = emulator->region_data + (uint8_t)selector * 4u;
             if (function == 0x0200u) {
-                emulator->x86.gpr[XXEMUL_X86_RCX] = dpmi_u16(entry + 2u);
-                emulator->x86.gpr[XXEMUL_X86_RDX] = dpmi_u16(entry);
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, dpmi_u16(entry + 2u));
+                xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, dpmi_u16(entry));
             } else {
                 dpmi_put_u16(entry, (uint16_t)emulator->x86.gpr[XXEMUL_X86_RDX]);
                 dpmi_put_u16(entry + 2u, (uint16_t)emulator->x86.gpr[XXEMUL_X86_RCX]);
@@ -1184,14 +1185,14 @@ xxemul_status xxemul_dpmi_interrupt(xxemul *emulator)
         case 0x0303u: return dpmi_callback_allocate(emulator);
         case 0x0304u: return dpmi_callback_free(emulator);
         case 0x0400u:
-            emulator->x86.gpr[XXEMUL_X86_RAX] = 0x005au;
-            emulator->x86.gpr[XXEMUL_X86_RBX] = 3u; /* 386 host, real reflection, resident/no virtual memory */
-            emulator->x86.gpr[XXEMUL_X86_RCX] = 3u;
-            emulator->x86.gpr[XXEMUL_X86_RDX] = ((uint32_t)emulator->dos_pic_master_offset << 8u) | emulator->dos_pic_slave_offset;
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x005au);
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, 3u); /* 386 host, real reflection, resident/no virtual memory */
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, 3u);
+            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, ((uint32_t)emulator->dos_pic_master_offset << 8u) | emulator->dos_pic_slave_offset);
             return XXEMUL_STATUS_OK;
         default: break;
     }
-    emulator->x86.gpr[XXEMUL_X86_RAX] = 0x8001u;
+    xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8001u);
     emulator->x86.flags |= DPMI_CF;
     return XXEMUL_STATUS_OK;
 }

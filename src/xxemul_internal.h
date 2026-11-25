@@ -257,4 +257,11 @@ size_t xxemul_mips_format_current(xxemul *emulator, char *buffer, size_t buffer_
 xxemul_status xxemul_mips64_step(xxemul *emulator, xxemul_step_info *info);
 size_t xxemul_mips64_format_current(xxemul *emulator, char *buffer, size_t buffer_size);
 
+/* Real-mode DOS/BIOS services return 16-bit values: only the low word of the
+ * register changes, bits 16-63 (e.g. EAX's upper half) are preserved. */
+static inline void xxemul_x86_set_reg16(xxemul *emulator, unsigned reg, uint64_t value)
+{
+    emulator->x86.gpr[reg] = (emulator->x86.gpr[reg] & ~UINT64_C(0xffff)) | (uint16_t)value;
+}
+
 #endif

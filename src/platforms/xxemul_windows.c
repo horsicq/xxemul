@@ -582,6 +582,7 @@ struct xxemul_windows {
     uint64_t image_base;
     uint64_t image_size;
     uint32_t image_entry_rva;
+    uint8_t image_is_managed;
     uint16_t image_subsystem, image_subsystem_major, image_subsystem_minor;
     uint8_t image_is_dll;
     uint64_t runtime_base;
@@ -3620,6 +3621,9 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
             process->resource_rva = win_le32(optional + dir_off + 16u);
             process->resource_size = win_le32(optional + dir_off + 20u);
         }
+        /* COM descriptor (data directory 14): marks a managed image. */
+        if (optional_size >= dir_off + 15u * 8u && win_le32(optional + dir_off - 4u) > 14u)
+            process->image_is_managed = win_le32(optional + dir_off + 14u * 8u) != 0u && win_le32(optional + dir_off + 14u * 8u + 4u) != 0u;
     }
     process->runtime_base = (emulator->region_address + emulator->region_size - WIN_RUNTIME_SIZE) & ~(WIN_ALLOCATION_GRANULARITY - 1u);
     if (process->runtime_base < emulator->region_address || process->runtime_base - emulator->region_address < (uint64_t)image_size + 0x80000u) {
@@ -3679,6 +3683,13 @@ xxemul_windows *xxemul_windows_create(xxemul *emulator, const char *program_path
     }
     if (emulator->arch == XXEMUL_ARCH_X86) {
         size_t slot;
+        /* An IL-only EXE without a native entry stub (what csc /platform:x64
+         * emits: AddressOfEntryPoint 0, no imports) is started by the Windows
+         * loader through mscoree!_CorExeMain, like the x86 jmp stub does. */
+        if (process->image_is_managed && !process->image_is_dll && process->image_entry_rva == 0u) {
+            uint64_t managed_entry = win_resolve(process, "mscoree.dll", "_CorExeMain");
+            if (managed_entry) emulator->x86.ip = managed_entry;
+        }
         if (process->main_dll_slot) process->modules[process->main_dll_slot - 1u].init_order = ++process->dll_sequence;
         process->startup_pending = (uint8_t)(process->main_tls.callbacks != 0u);
         for (slot = 0u; slot < process->module_count; ++slot)
