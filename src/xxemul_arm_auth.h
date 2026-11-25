@@ -15,14 +15,12 @@ static inline uint64_t xxemul_arm_auth_strip(uint64_t pointer)
     return pointer & XXEMUL_ARM_AUTH_ADDRESS_MASK;
 }
 
-static inline xxemul_status xxemul_arm_auth_sign(const xxemul *emulator, uint64_t pointer,
-                                               uint64_t modifier, unsigned key, uint64_t *result)
+static inline xxemul_status xxemul_arm_auth_sign(const xxemul *emulator, uint64_t pointer, uint64_t modifier, unsigned key, uint64_t *result)
 {
     uint64_t hash;
     if (!emulator || !result || key > 3u) return XXEMUL_STATUS_INVALID_ARGUMENT;
     if (pointer & ~XXEMUL_ARM_AUTH_ADDRESS_MASK) return XXEMUL_STATUS_ADDRESS_FAULT;
-    hash = pointer ^ modifier ^ (emulator->region_address * UINT64_C(0x9e3779b97f4a7c15)) ^
-           ((uint64_t)(key + 1u) * UINT64_C(0xd6e8feb86659fd93));
+    hash = pointer ^ modifier ^ (emulator->region_address * UINT64_C(0x9e3779b97f4a7c15)) ^ ((uint64_t)(key + 1u) * UINT64_C(0xd6e8feb86659fd93));
     hash = (hash ^ (hash >> 30u)) * UINT64_C(0xbf58476d1ce4e5b9);
     hash = (hash ^ (hash >> 27u)) * UINT64_C(0x94d049bb133111eb);
     hash ^= hash >> 31u;
@@ -32,8 +30,7 @@ static inline xxemul_status xxemul_arm_auth_sign(const xxemul *emulator, uint64_
     return XXEMUL_STATUS_OK;
 }
 
-static inline xxemul_status xxemul_arm_auth_check(const xxemul *emulator, uint64_t pointer,
-                                                uint64_t modifier, unsigned key, uint64_t *result)
+static inline xxemul_status xxemul_arm_auth_check(const xxemul *emulator, uint64_t pointer, uint64_t modifier, unsigned key, uint64_t *result)
 {
     uint64_t expected;
     xxemul_status status;

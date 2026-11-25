@@ -64,9 +64,9 @@ xxemul *xxemul_create_dos_at(xxemul_dos_format format, const void *image, size_t
      * environment, list-of-lists and JFT regions. COM also needs its full
      * 64 KiB PSP segment because SS:SP starts at PSP:FFFE. MZ image, stack
      * and allocation bounds are checked by the MZ loader itself. */
-    if (image_base != 0 && ((image_base & 15u) != 0u ||
-        image_base < ((uint64_t)XXEMUL_DOS_PSP_SEGMENT + 0x10u) * 16u || image_base >= 0xa0000u ||
-        (format == XXEMUL_DOS_COM && image_base > 0xa0000u - 0xff00u))) return NULL;
+    if (image_base != 0 && ((image_base & 15u) != 0u || image_base < ((uint64_t)XXEMUL_DOS_PSP_SEGMENT + 0x10u) * 16u || image_base >= 0xa0000u ||
+                            (format == XXEMUL_DOS_COM && image_base > 0xa0000u - 0xff00u)))
+        return NULL;
     io = xx_io_mem_open_ro(image, image_size);
     if (io == NULL) {
         if (status != NULL) {

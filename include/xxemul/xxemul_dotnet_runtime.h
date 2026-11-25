@@ -35,11 +35,11 @@ typedef xxemul_status (*xxemul_dotnet_external_callback)(void *context, xxemul_d
  * Unhandled calls execute their CIL or use external_callback normally. A handled
  * failure is never converted into success or retried as CIL. */
 typedef xxemul_status (*xxemul_dotnet_intrinsic_callback)(void *context, xxemul_dotnet_vm *vm, const xxemul_dotnet_method_info *method,
-    const xxemul_dotnet_value *arguments, size_t argument_count, xxemul_dotnet_value *result, int *handled);
+                                                          const xxemul_dotnet_value *arguments, size_t argument_count, xxemul_dotnet_value *result, int *handled);
 /** Static MemberRef fields use an explicit host implementation. Unknown fields
  * fail; they never read as an implicit zero or accept an ignored write. */
-typedef xxemul_status (*xxemul_dotnet_field_callback)(void *context, xxemul_dotnet_vm *vm,
-    const xxemul_dotnet_field_info *field, int store, xxemul_dotnet_value *value, int *handled);
+typedef xxemul_status (*xxemul_dotnet_field_callback)(void *context, xxemul_dotnet_vm *vm, const xxemul_dotnet_field_info *field, int store, xxemul_dotnet_value *value,
+                                                      int *handled);
 
 typedef void (*xxemul_dotnet_trace_callback)(void *context, const xxemul_dotnet_method_info *method, uint32_t pc, const char *mnemonic);
 
@@ -88,8 +88,8 @@ XXEMUL_API xxemul_status xxemul_dotnet_vm_invoke(xxemul_dotnet_vm *vm, size_t me
  * Shares the active VM's heap, statics, call-depth and root instruction budget.
  * result.instructions is the increment consumed by this nested call. A failed
  * call leaves its diagnostic/pending exception active for the host to propagate. */
-XXEMUL_API xxemul_status xxemul_dotnet_vm_invoke_nested(xxemul_dotnet_vm *vm, size_t method_index,
-    const xxemul_dotnet_value *arguments, size_t argument_count, xxemul_dotnet_result *result);
+XXEMUL_API xxemul_status xxemul_dotnet_vm_invoke_nested(xxemul_dotnet_vm *vm, size_t method_index, const xxemul_dotnet_value *arguments, size_t argument_count,
+                                                        xxemul_dotnet_result *result);
 
 XXEMUL_API xxemul_status xxemul_dotnet_vm_new_object(xxemul_dotnet_vm *vm, const char *type_name, uint32_t *reference);
 XXEMUL_API xxemul_status xxemul_dotnet_vm_new_string(xxemul_dotnet_vm *vm, const char *utf8, size_t byte_count, uint32_t *reference);

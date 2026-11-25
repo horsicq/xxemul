@@ -58,13 +58,13 @@ static xxemul_status macho_linkedit(const uint8_t *image, size_t size, int is64,
             result->strings_offset = macho_u32(image + offset + 16);
             result->strings_size = macho_u32(image + offset + 20);
             if (!macho_range(size, result->symbols_offset, (uint64_t)result->symbols_count * (is64 ? 16u : 12u)) ||
-                !macho_range(size, result->strings_offset, result->strings_size)) return XXEMUL_STATUS_INVALID_IMAGE;
+                !macho_range(size, result->strings_offset, result->strings_size))
+                return XXEMUL_STATUS_INVALID_IMAGE;
         } else if (command == 0x22u || command == UINT32_C(0x80000022)) { /* LC_DYLD_INFO[_ONLY] */
             if (length < 48) return XXEMUL_STATUS_INVALID_IMAGE;
-            if (macho_u32(image + offset + 12) || macho_u32(image + offset + 20) ||
-                macho_u32(image + offset + 28) || macho_u32(image + offset + 36)) result->has_old_fixups = 1;
-        } else if (command == 0xcu || command == UINT32_C(0x80000018) ||
-                   command == UINT32_C(0x8000001f) || command == UINT32_C(0x80000023)) {
+            if (macho_u32(image + offset + 12) || macho_u32(image + offset + 20) || macho_u32(image + offset + 28) || macho_u32(image + offset + 36))
+                result->has_old_fixups = 1;
+        } else if (command == 0xcu || command == UINT32_C(0x80000018) || command == UINT32_C(0x8000001f) || command == UINT32_C(0x80000023)) {
             ++result->dylib_count;
         } else if (command == 0x19u && is64) { /* LC_SEGMENT_64 */
             uint32_t section_count, section;
@@ -75,8 +75,7 @@ static xxemul_status macho_linkedit(const uint8_t *image, size_t size, int is64,
                 const uint8_t *record = image + offset + 72u + (size_t)section * 80u;
                 uint32_t kind = macho_u32(record + 64u) & 0xffu;
                 /* Constructors, TLS constructors, compact constructor offsets. */
-                if (macho_u64(record + 40u) && (kind == 9u || kind == 0x15u || kind == 0x16u))
-                    result->has_initializers = 1;
+                if (macho_u64(record + 40u) && (kind == 9u || kind == 0x15u || kind == 0x16u)) result->has_initializers = 1;
             }
         } else if (command == 0x1au) { /* LC_ROUTINES_64 */
             if (length < 72u) return XXEMUL_STATUS_INVALID_IMAGE;
@@ -89,8 +88,8 @@ static xxemul_status macho_linkedit(const uint8_t *image, size_t size, int is64,
 
 /* Dyld's weak/flat/self lookup must retain definitions in the executable.
  * In particular, libc++ inline templates in the guest are not host shims. */
-static xxemul_status macho_defined_symbol(const uint8_t *image, const xxemul_macho_linkedit *linkedit,
-                                         const xx_macho *macho, const char *name, uint64_t *value, int *found)
+static xxemul_status macho_defined_symbol(const uint8_t *image, const xxemul_macho_linkedit *linkedit, const xx_macho *macho, const char *name, uint64_t *value,
+                                          int *found)
 {
     uint32_t i;
     *found = 0;
@@ -107,8 +106,7 @@ static xxemul_status macho_defined_symbol(const uint8_t *image, const xxemul_mac
         *value = macho_u64(symbol + 8);
         for (segment_index = 0; segment_index < xx_macho_get_number_of_segments(macho); ++segment_index) {
             const xx_macho_segment *segment = xx_macho_get_segment(macho, segment_index);
-            if (segment && !xxemul_macho_is_pagezero(segment) && *value >= segment->virtual_address &&
-                *value - segment->virtual_address < segment->virtual_size) {
+            if (segment && !xxemul_macho_is_pagezero(segment) && *value >= segment->virtual_address && *value - segment->virtual_address < segment->virtual_size) {
                 *found = 1;
                 return XXEMUL_STATUS_OK;
             }
@@ -139,16 +137,15 @@ static int macho_rebase_target(const xx_macho *macho, uint64_t value, int64_t sl
     for (index = 0; index < xx_macho_get_number_of_segments(macho); ++index) {
         const xx_macho_segment *segment = xx_macho_get_segment(macho, index);
         uint64_t begin;
-        if (!segment || xxemul_macho_is_pagezero(segment) || !segment->virtual_size ||
-            macho_add_signed(segment->virtual_address, slide, &begin) != XXEMUL_STATUS_OK) continue;
+        if (!segment || xxemul_macho_is_pagezero(segment) || !segment->virtual_size || macho_add_signed(segment->virtual_address, slide, &begin) != XXEMUL_STATUS_OK)
+            continue;
         if (value >= begin && value - begin <= segment->virtual_size) return 1;
     }
     return 0;
 }
 
-static xxemul_status macho_chained_imports(xxemul *emulator, const uint8_t *image,
-                                         const xxemul_macho_linkedit *linkedit, const xx_macho *macho,
-                                         const uint8_t *data, size_t size, int64_t slide, uint64_t **out_values, uint32_t *out_count)
+static xxemul_status macho_chained_imports(xxemul *emulator, const uint8_t *image, const xxemul_macho_linkedit *linkedit, const xx_macho *macho, const uint8_t *data,
+                                           size_t size, int64_t slide, uint64_t **out_values, uint32_t *out_count)
 {
     uint32_t imports_offset = macho_u32(data + 8), names_offset = macho_u32(data + 12);
     uint32_t count = macho_u32(data + 16), format = macho_u32(data + 20);
@@ -160,8 +157,7 @@ static xxemul_status macho_chained_imports(xxemul *emulator, const uint8_t *imag
     *out_count = 0;
     if (format < 1u || format > 3u) return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
     item_size = format == 1u ? 4u : format == 2u ? 8u : 16u;
-    if (names_offset > size || imports_offset < 28u || !macho_range(size, imports_offset, (uint64_t)count * item_size))
-        return XXEMUL_STATUS_INVALID_IMAGE;
+    if (names_offset > size || imports_offset < 28u || !macho_range(size, imports_offset, (uint64_t)count * item_size)) return XXEMUL_STATUS_INVALID_IMAGE;
     if (count == 0) return XXEMUL_STATUS_OK;
     if ((uint64_t)count * sizeof(*values) > SIZE_MAX) return XXEMUL_STATUS_INVALID_IMAGE;
     values = (uint64_t *)xx_mem_calloc(count, sizeof(*values));
@@ -174,7 +170,10 @@ static xxemul_status macho_chained_imports(xxemul *emulator, const uint8_t *imag
         const char *name;
         if (format == 3u) {
             raw = macho_u64(record);
-            if ((raw >> 17u) & 0x7fffu) { status = XXEMUL_STATUS_INVALID_IMAGE; break; }
+            if ((raw >> 17u) & 0x7fffu) {
+                status = XXEMUL_STATUS_INVALID_IMAGE;
+                break;
+            }
             ordinal = (int)(raw & 0xffffu);
             if (ordinal > 0xfff0) ordinal -= 0x10000;
             name_offset = raw >> 32u;
@@ -190,12 +189,17 @@ static xxemul_status macho_chained_imports(xxemul *emulator, const uint8_t *imag
             }
         }
         if (ordinal < -3 || (ordinal > 0 && (uint32_t)ordinal > linkedit->dylib_count)) {
-            status = XXEMUL_STATUS_INVALID_IMAGE; break;
+            status = XXEMUL_STATUS_INVALID_IMAGE;
+            break;
         }
-        if (name_offset >= size - names_offset) { status = XXEMUL_STATUS_INVALID_IMAGE; break; }
+        if (name_offset >= size - names_offset) {
+            status = XXEMUL_STATUS_INVALID_IMAGE;
+            break;
+        }
         name = (const char *)data + names_offset + (size_t)name_offset;
         if (!*name || !memchr(name, 0, size - names_offset - (size_t)name_offset)) {
-            status = XXEMUL_STATUS_INVALID_IMAGE; break;
+            status = XXEMUL_STATUS_INVALID_IMAGE;
+            break;
         }
         if (ordinal <= 0) status = macho_defined_symbol(image, linkedit, macho, name, &values[i], &found);
         if (status != XXEMUL_STATUS_OK) break;
@@ -204,22 +208,27 @@ static xxemul_status macho_chained_imports(xxemul *emulator, const uint8_t *imag
             if (status != XXEMUL_STATUS_OK) break;
         }
         if (!found) {
-            if (ordinal == 0 || ordinal == -1) { status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; break; }
+            if (ordinal == 0 || ordinal == -1) {
+                status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+                break;
+            }
             status = xxemul_darwin_resolve_import(emulator->darwin, name, &values[i]);
             if (status != XXEMUL_STATUS_OK) break;
         }
         status = macho_add_signed(values[i], addend, &values[i]);
         if (status != XXEMUL_STATUS_OK) break;
     }
-    if (status != XXEMUL_STATUS_OK) { xx_mem_free(values); return status; }
+    if (status != XXEMUL_STATUS_OK) {
+        xx_mem_free(values);
+        return status;
+    }
     *out_values = values;
     *out_count = count;
     return XXEMUL_STATUS_OK;
 }
 
-static xxemul_status macho_chained_fixups(xxemul *emulator, const uint8_t *image,
-                                        const xxemul_macho_linkedit *linkedit, const xx_macho *macho,
-                                        uint64_t preferred_base, int64_t slide)
+static xxemul_status macho_chained_fixups(xxemul *emulator, const uint8_t *image, const xxemul_macho_linkedit *linkedit, const xx_macho *macho, uint64_t preferred_base,
+                                          int64_t slide)
 {
     const uint8_t *data = image + linkedit->fixups_offset;
     size_t size = linkedit->fixups_size;
@@ -233,8 +242,8 @@ static xxemul_status macho_chained_fixups(xxemul *emulator, const uint8_t *image
     starts_offset = macho_u32(data + 4);
     if (starts_offset < 28u || !macho_range(size, starts_offset, 4u)) return XXEMUL_STATUS_INVALID_IMAGE;
     segment_count = macho_u32(data + starts_offset);
-    if (segment_count > xx_macho_get_number_of_segments(macho) ||
-        !macho_range(size, starts_offset + 4u, (uint64_t)segment_count * 4u)) return XXEMUL_STATUS_INVALID_IMAGE;
+    if (segment_count > xx_macho_get_number_of_segments(macho) || !macho_range(size, starts_offset + 4u, (uint64_t)segment_count * 4u))
+        return XXEMUL_STATUS_INVALID_IMAGE;
     status = macho_chained_imports(emulator, image, linkedit, macho, data, size, slide, &imports, &import_count);
     if (status != XXEMUL_STATUS_OK) return status;
     for (index = 0; index < segment_count; ++index) {
@@ -250,29 +259,32 @@ static xxemul_status macho_chained_fixups(xxemul *emulator, const uint8_t *image
         page_size = macho_u16(data + (size_t)offset + 4u);
         pointer_format = macho_u16(data + (size_t)offset + 6u);
         page_count = macho_u16(data + (size_t)offset + 20u);
-        if (pointer_format != 1u && pointer_format != 2u && pointer_format != 6u &&
-            pointer_format != 9u && pointer_format != 12u) { status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; goto done; }
-        if (record_size < 22u + (uint32_t)page_count * 2u || !macho_range(size, offset, record_size) ||
-            (page_size != 4096u && page_size != 16384u) || xxemul_macho_is_pagezero(segment) ||
-            segment->virtual_address < preferred_base ||
-            macho_u64(data + (size_t)offset + 8u) != segment->virtual_address - preferred_base ||
-            macho_u32(data + (size_t)offset + 16u) != 0u ||
-            (page_count && (uint64_t)(page_count - 1u) * page_size >= segment->virtual_size)) goto done;
+        if (pointer_format != 1u && pointer_format != 2u && pointer_format != 6u && pointer_format != 9u && pointer_format != 12u) {
+            status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+            goto done;
+        }
+        if (record_size < 22u + (uint32_t)page_count * 2u || !macho_range(size, offset, record_size) || (page_size != 4096u && page_size != 16384u) ||
+            xxemul_macho_is_pagezero(segment) || segment->virtual_address < preferred_base ||
+            macho_u64(data + (size_t)offset + 8u) != segment->virtual_address - preferred_base || macho_u32(data + (size_t)offset + 16u) != 0u ||
+            (page_count && (uint64_t)(page_count - 1u) * page_size >= segment->virtual_size))
+            goto done;
         for (page = 0; page < page_count; ++page) {
             uint16_t start = macho_u16(data + (size_t)offset + 22u + (size_t)page * 2u);
             uint64_t page_offset = (uint64_t)page * page_size, within = start;
             if (start == 0xffffu) continue;
-            if (start & 0x8000u) { status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; goto done; }
+            if (start & 0x8000u) {
+                status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+                goto done;
+            }
             for (;;) {
                 uint64_t raw, value, next;
                 uint64_t in_segment = page_offset + within;
                 uint64_t location;
                 int arm64e = pointer_format == 1u || pointer_format == 9u || pointer_format == 12u;
                 unsigned stride = arm64e ? 8u : 4u;
-                if (within > page_size - 8u || (within & (stride - 1u)) ||
-                    in_segment > segment->file_size || 8u > segment->file_size - in_segment) goto done;
-                if (segment->virtual_address > UINT64_MAX - in_segment ||
-                    macho_add_signed(segment->virtual_address + in_segment, slide, &location) != XXEMUL_STATUS_OK) goto done;
+                if (within > page_size - 8u || (within & (stride - 1u)) || in_segment > segment->file_size || 8u > segment->file_size - in_segment) goto done;
+                if (segment->virtual_address > UINT64_MAX - in_segment || macho_add_signed(segment->virtual_address + in_segment, slide, &location) != XXEMUL_STATUS_OK)
+                    goto done;
                 raw = macho_u64(image + (size_t)(segment->file_offset + in_segment));
                 next = (raw >> 51u) & (arm64e ? 0x7ffu : 0xfffu);
                 if (arm64e) {
@@ -303,8 +315,7 @@ static xxemul_status macho_chained_fixups(xxemul *emulator, const uint8_t *image
                     }
                     if (!bound && !macho_rebase_target(macho, value, slide)) goto done;
                     if (authenticated) {
-                        uint64_t modifier = xxemul_arm_auth_modifier(location,
-                                                                    (uint16_t)(raw >> 32u), (int)((raw >> 48u) & 1u));
+                        uint64_t modifier = xxemul_arm_auth_modifier(location, (uint16_t)(raw >> 32u), (int)((raw >> 48u) & 1u));
                         unsigned key = (unsigned)((raw >> 49u) & 3u);
                         if (xxemul_arm_auth_sign(emulator, value, modifier, key, &value) != XXEMUL_STATUS_OK) {
                             status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;

@@ -28,7 +28,8 @@ xxemul *xxemul_image_allocate(xxemul_arch arch, xxemul_mode mode, uint64_t base,
         *status = XXEMUL_STATUS_INVALID_IMAGE;
         return NULL;
     }
-    if (((mode == XXEMUL_MODE_ARM_A32 || mode == XXEMUL_MODE_ARM_A64 || arch == XXEMUL_ARCH_MIPS) && (entry & 3u) != 0u) || (mode == XXEMUL_MODE_ARM_T32 && (entry & 1u) != 0u)) {
+    if (((mode == XXEMUL_MODE_ARM_A32 || mode == XXEMUL_MODE_ARM_A64 || arch == XXEMUL_ARCH_MIPS) && (entry & 3u) != 0u) ||
+        (mode == XXEMUL_MODE_ARM_T32 && (entry & 1u) != 0u)) {
         *status = XXEMUL_STATUS_INVALID_IMAGE;
         return NULL;
     }
@@ -74,12 +75,11 @@ xxemul *xxemul_create_image_at(xxemul_image_format format, const void *image, si
     }
     *status = XXEMUL_STATUS_INVALID_ARGUMENT;
     if (format < XXEMUL_IMAGE_COM || format > XXEMUL_IMAGE_AMIGA_HUNK || image == NULL || image_size == 0u || image_size > (size_t)LONG_MAX) {
-        if (format == XXEMUL_IMAGE_AMIGA_HUNK && image != NULL && image_size == 0u)
-            *status = XXEMUL_STATUS_INVALID_IMAGE;
+        if (format == XXEMUL_IMAGE_AMIGA_HUNK && image != NULL && image_size == 0u) *status = XXEMUL_STATUS_INVALID_IMAGE;
         return NULL;
     }
-    if (image_base != 0 && format != XXEMUL_IMAGE_PE32 && format != XXEMUL_IMAGE_PE64 &&
-        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ && format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64 && format != XXEMUL_IMAGE_AMIGA_HUNK) {
+    if (image_base != 0 && format != XXEMUL_IMAGE_PE32 && format != XXEMUL_IMAGE_PE64 && format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ &&
+        format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64 && format != XXEMUL_IMAGE_AMIGA_HUNK) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }
@@ -123,8 +123,8 @@ xxemul *xxemul_create_image_file_at(xxemul_image_format format, const char *path
     if (path == NULL || format < XXEMUL_IMAGE_COM || format > XXEMUL_IMAGE_AMIGA_HUNK) {
         return NULL;
     }
-    if (image_base != 0 && format != XXEMUL_IMAGE_PE32 && format != XXEMUL_IMAGE_PE64 &&
-        format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ && format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64 && format != XXEMUL_IMAGE_AMIGA_HUNK) {
+    if (image_base != 0 && format != XXEMUL_IMAGE_PE32 && format != XXEMUL_IMAGE_PE64 && format != XXEMUL_IMAGE_COM && format != XXEMUL_IMAGE_MZ &&
+        format != XXEMUL_IMAGE_ELF32 && format != XXEMUL_IMAGE_ELF64 && format != XXEMUL_IMAGE_AMIGA_HUNK) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }

@@ -19,21 +19,18 @@ static void xxemul_dos_set_ax(xxemul *emulator, uint16_t value);
  * option bit zero additionally skips one nonblank separator. */
 static int xxemul_dos_fcb_separator(uint8_t c)
 {
-    return c == ':' || c == '<' || c == '|' || c == '>' ||
-        c == '+' || c == '=' || c == ';' || c == ',';
+    return c == ':' || c == '<' || c == '|' || c == '>' || c == '+' || c == '=' || c == ';' || c == ',';
 }
 
 static int xxemul_dos_fcb_terminator(uint8_t c)
 {
-    return c <= ' ' || c == '.' || c == '"' || c == '/' ||
-        c == '\\' || c == '[' || c == ']' || xxemul_dos_fcb_separator(c);
+    return c <= ' ' || c == '.' || c == '"' || c == '/' || c == '\\' || c == '[' || c == ']' || xxemul_dos_fcb_separator(c);
 }
 
 static xxemul_status xxemul_dos_fcb_peek(xxemul *emulator, uint16_t si, size_t consumed, uint8_t *c)
 {
     if (consumed >= 0x10000u) return XXEMUL_STATUS_ADDRESS_FAULT;
-    return xxemul_read_memory(emulator, xxemul_dos_physical(emulator,
-        emulator->x86.segment[XXEMUL_X86_DS], si), c, 1u);
+    return xxemul_read_memory(emulator, xxemul_dos_physical(emulator, emulator->x86.segment[XXEMUL_X86_DS], si), c, 1u);
 }
 
 static xxemul_status xxemul_dos_parse_fcb(xxemul *emulator)
@@ -60,10 +57,12 @@ static xxemul_status xxemul_dos_parse_fcb(xxemul *emulator)
             status = xxemul_dos_fcb_peek(emulator, si, consumed, &c);
             if (status != XXEMUL_STATUS_OK) return status;
             if (c != ' ' && c != '\t') break;
-            ++si; ++consumed;
+            ++si;
+            ++consumed;
         }
         if (field || !(options & 1u) || !xxemul_dos_fcb_separator(c)) break;
-        ++si; ++consumed;
+        ++si;
+        ++consumed;
     }
     /* A drive prefix is consumed even when its identifier is invalid. */
     if (!xxemul_dos_fcb_terminator(c)) {
@@ -74,7 +73,8 @@ static xxemul_status xxemul_dos_parse_fcb(xxemul *emulator)
             if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
             fcb[0] = (uint8_t)(c - '@');
             if (c < 'A' || c > 'Z') result = 0xffu;
-            si += 2u; consumed += 2u;
+            si += 2u;
+            consumed += 2u;
         }
     }
     for (field = 0; field < 2u; ++field) {
@@ -85,7 +85,8 @@ static xxemul_status xxemul_dos_parse_fcb(xxemul *emulator)
             if (status != XXEMUL_STATUS_OK) return status;
             if (xxemul_dos_fcb_terminator(c)) break;
             present = 1;
-            ++si; ++consumed;
+            ++si;
+            ++consumed;
             if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
             if (filled >= width) continue; /* DOS consumes overlong fields. */
             if (c == '*') {
@@ -101,7 +102,8 @@ static xxemul_status xxemul_dos_parse_fcb(xxemul *emulator)
          * explicitly replaces even an empty extension with blanks. */
         if (present || field) memset(fcb + offset + filled, ' ', width - filled);
         if (field || c != '.') break;
-        ++si; ++consumed;
+        ++si;
+        ++consumed;
     }
     for (i = 0; i < sizeof(fcb); ++i) {
         status = xxemul_write_memory(emulator, xxemul_dos_physical(emulator, es, (uint16_t)(di + i)), fcb + i, 1u);
@@ -623,8 +625,7 @@ xxemul_status xxemul_msdos_interrupt(xxemul *emulator, uint8_t vector)
         }
         case 0x2cu: {
             const uint8_t *clock = emulator->region_data + 0x46cu;
-            uint32_t ticks = (uint32_t)clock[0] | ((uint32_t)clock[1] << 8u) |
-                ((uint32_t)clock[2] << 16u) | ((uint32_t)clock[3] << 24u);
+            uint32_t ticks = (uint32_t)clock[0] | ((uint32_t)clock[1] << 8u) | ((uint32_t)clock[2] << 16u) | ((uint32_t)clock[3] << 24u);
             /* Share INT 1Ah/BDA virtual time, including hundredths used by
              * DOS polling loops. A host-time second with DL always zero
              * leaves those loops unable to make progress. */

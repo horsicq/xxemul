@@ -38,11 +38,30 @@
 #define DARWIN_HEAP_OFFSET UINT64_C(0x10000)
 
 enum darwin_call {
-    CALL_RETURN, CALL_STRLEN, CALL_SENTRY_CTOR, CALL_SENTRY_DTOR,
-    CALL_GETLOC, CALL_USE_FACET, CALL_LOCALE_DTOR, CALL_WIDEN,
-    CALL_XSPUTN, CALL_OVERFLOW, CALL_SYNC, CALL_STRING_INIT,
-    CALL_STRING_DTOR, CALL_IOS_CLEAR, CALL_WRITE, CALL_EXIT,
-    CALL_LIBC, CALL_POSIX, CALL_QSORT_RETURN, CALL_ARCHIVE, CALL_ARCHIVE_RETURN, CALL_ZLIB, CALL_BZIP2, CALL_UNSUPPORTED
+    CALL_RETURN,
+    CALL_STRLEN,
+    CALL_SENTRY_CTOR,
+    CALL_SENTRY_DTOR,
+    CALL_GETLOC,
+    CALL_USE_FACET,
+    CALL_LOCALE_DTOR,
+    CALL_WIDEN,
+    CALL_XSPUTN,
+    CALL_OVERFLOW,
+    CALL_SYNC,
+    CALL_STRING_INIT,
+    CALL_STRING_DTOR,
+    CALL_IOS_CLEAR,
+    CALL_WRITE,
+    CALL_EXIT,
+    CALL_LIBC,
+    CALL_POSIX,
+    CALL_QSORT_RETURN,
+    CALL_ARCHIVE,
+    CALL_ARCHIVE_RETURN,
+    CALL_ZLIB,
+    CALL_BZIP2,
+    CALL_UNSUPPORTED
 };
 
 struct darwin_thunk {
@@ -66,9 +85,14 @@ struct xxemul_darwin {
     xxemul_darwin_bzip2 *bzip2;
     uint64_t archive_lr, archive_sp;
     int archive_callback_active;
-    struct { uint64_t address, size; int free; } allocations[4096];
+    struct {
+        uint64_t address, size;
+        int free;
+    } allocations[4096];
     unsigned allocation_count;
-    struct { uint64_t base, count, size, compare, i, j, lr; } sorts[8];
+    struct {
+        uint64_t base, count, size, compare, i, j, lr;
+    } sorts[8];
     unsigned sort_depth;
     int redirect;
     uint32_t random_state;
@@ -170,14 +194,10 @@ static uint64_t add_thunk(xxemul_darwin *process, const char *name, enum darwin_
 static int initialize_ostream(xxemul_darwin *process, uint64_t object, uint64_t buffer)
 {
     uint64_t ios = object + 8u;
-    return store(process, object, 8, process->base + DARWIN_OSTREAM_VTABLE_OFFSET + 24u) &&
-           store(process, ios, 8, process->base + DARWIN_OSTREAM_VTABLE_OFFSET + 24u) &&
+    return store(process, object, 8, process->base + DARWIN_OSTREAM_VTABLE_OFFSET + 24u) && store(process, ios, 8, process->base + DARWIN_OSTREAM_VTABLE_OFFSET + 24u) &&
            store(process, ios + 8u, 4, UINT32_C(0x1002)) && /* skipws | dec */
-           store(process, ios + 16u, 8, 6u) &&
-           store(process, ios + 40u, 8, buffer) &&
-           store(process, ios + 48u, 8, process->base + DARWIN_LOCALE_OFFSET) &&
-           store(process, ios + 144u, 4, UINT32_MAX) &&
-           store(process, buffer, 8, process->base + DARWIN_STREAMBUF_VTABLE_OFFSET) &&
+           store(process, ios + 16u, 8, 6u) && store(process, ios + 40u, 8, buffer) && store(process, ios + 48u, 8, process->base + DARWIN_LOCALE_OFFSET) &&
+           store(process, ios + 144u, 4, UINT32_MAX) && store(process, buffer, 8, process->base + DARWIN_STREAMBUF_VTABLE_OFFSET) &&
            store(process, buffer + 8u, 8, process->base + DARWIN_LOCALE_OFFSET);
 }
 
@@ -187,12 +207,15 @@ xxemul_darwin *xxemul_darwin_create(xxemul *emulator, uint64_t runtime_base, xxe
     uint64_t unsupported, xsputn, overflow, sync, widen;
     unsigned i;
     if (status != NULL) *status = XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (emulator == NULL || emulator->arch != XXEMUL_ARCH_ARM || emulator->mode != XXEMUL_MODE_ARM_A64 ||
-        runtime_base < emulator->region_address || (runtime_base & 15u) != 0u ||
-        runtime_base - emulator->region_address > emulator->region_size ||
-        DARWIN_ARENA_SIZE > emulator->region_size - (runtime_base - emulator->region_address)) return NULL;
+    if (emulator == NULL || emulator->arch != XXEMUL_ARCH_ARM || emulator->mode != XXEMUL_MODE_ARM_A64 || runtime_base < emulator->region_address ||
+        (runtime_base & 15u) != 0u || runtime_base - emulator->region_address > emulator->region_size ||
+        DARWIN_ARENA_SIZE > emulator->region_size - (runtime_base - emulator->region_address))
+        return NULL;
     process = (xxemul_darwin *)calloc(1, sizeof(*process));
-    if (process == NULL) { if (status != NULL) *status = XXEMUL_STATUS_OUT_OF_MEMORY; return NULL; }
+    if (process == NULL) {
+        if (status != NULL) *status = XXEMUL_STATUS_OUT_OF_MEMORY;
+        return NULL;
+    }
     process->emulator = emulator;
     process->base = runtime_base;
     process->heap = runtime_base + DARWIN_HEAP_OFFSET;
@@ -267,15 +290,15 @@ xxemul_status xxemul_darwin_kernel_entry(xxemul_darwin *process, const void *byt
     /* UPX stores two backwards offsets just before its LC_UNIXTHREAD entry:
      * one reaches the Mach header, the other its l_info with the UPX! tag.
      * The compatibility svc #0/x8 ABI is enabled only for this structure. */
-    if (darwin_u32(image) != UINT32_C(0xfeedfacf) || darwin_u32(image + 4u) != UINT32_C(0x0100000c) ||
-        darwin_u32(image + 12u) != 2u || process->emulator->arm.pc < process->emulator->region_address) return XXEMUL_STATUS_OK;
+    if (darwin_u32(image) != UINT32_C(0xfeedfacf) || darwin_u32(image + 4u) != UINT32_C(0x0100000c) || darwin_u32(image + 12u) != 2u ||
+        process->emulator->arm.pc < process->emulator->region_address)
+        return XXEMUL_STATUS_OK;
     entry = process->emulator->arm.pc - process->emulator->region_address;
     if (entry < 8u || entry > size - 4u || darwin_u32(image + (size_t)entry - 8u) != entry - 8u) return XXEMUL_STATUS_OK;
     backwards = darwin_u32(image + (size_t)entry - 4u);
     if (backwards > entry - 4u) return XXEMUL_STATUS_OK;
     info = entry - 4u - backwards;
-    if (info > size - 24u || memcmp(image + (size_t)info + 4u, "UPX!", 4u) ||
-        image[(size_t)info + 11u] != 0x25u || size > 32u * 1024u * 1024u) return XXEMUL_STATUS_OK;
+    if (info > size - 24u || memcmp(image + (size_t)info + 4u, "UPX!", 4u) || image[(size_t)info + 11u] != 0x25u || size > 32u * 1024u * 1024u) return XXEMUL_STATUS_OK;
     process->kernel_image = malloc(size);
     if (!process->kernel_image) return XXEMUL_STATUS_OUT_OF_MEMORY;
     memcpy(process->kernel_image, image, size);
@@ -314,51 +337,95 @@ static int install_packed_files(xxemul_darwin *process, const char *path)
     dyld_word(image, thread + 12u, 68u, 4);
     dyld_word(image, thread + 272u, 0x1000u, 8);
     dyld_word(image, 0x1000u, UINT32_C(0xd4200000), 4); /* explicit service trap */
-    return xxemul_darwin_posix_configure_vm(process->posix, process->emulator->region_address, process->base,
-                process->base + DARWIN_ARENA_SIZE, XXEMUL_DARWIN_VM_ARENA_SIZE) &&
+    return xxemul_darwin_posix_configure_vm(process->posix, process->emulator->region_address, process->base, process->base + DARWIN_ARENA_SIZE,
+                                            XXEMUL_DARWIN_VM_ARENA_SIZE) &&
            xxemul_darwin_posix_set_virtual_file(process->posix, path, process->kernel_image, process->kernel_image_size) &&
            xxemul_darwin_posix_set_virtual_file(process->posix, "/usr/lib/dyld", image, sizeof(image));
 }
 
 xxemul_status xxemul_darwin_resolve_import(xxemul_darwin *process, const char *name, uint64_t *address)
 {
-    static const struct { const char *name; enum darwin_call call; } functions[] = {
-        {"_strlen", CALL_STRLEN}, {"_write", CALL_WRITE}, {"_exit", CALL_EXIT}, {"__exit", CALL_EXIT},
-        {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_", CALL_SENTRY_CTOR},
-        {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC2ERS3_", CALL_SENTRY_CTOR},
-        {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev", CALL_SENTRY_DTOR},
-        {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD2Ev", CALL_SENTRY_DTOR},
-        {"__ZNKSt3__18ios_base6getlocEv", CALL_GETLOC},
-        {"__ZNKSt3__16locale9use_facetERNS0_2idE", CALL_USE_FACET},
-        {"__ZNSt3__16localeD1Ev", CALL_LOCALE_DTOR}, {"__ZNSt3__16localeD2Ev", CALL_LOCALE_DTOR},
-        {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc", CALL_STRING_INIT},
-        {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev", CALL_STRING_DTOR},
-        {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev", CALL_STRING_DTOR},
-        {"__ZNSt3__18ios_base5clearEj", CALL_IOS_CLEAR},
-        {"__ZNSt3__18ios_base33__set_badbit_and_consider_rethrowEv", CALL_UNSUPPORTED},
-        {"__Unwind_Resume", CALL_UNSUPPORTED}, {"___cxa_begin_catch", CALL_UNSUPPORTED},
-        {"___cxa_end_catch", CALL_UNSUPPORTED}, {"___gxx_personality_v0", CALL_UNSUPPORTED},
-        {"___cxa_throw", CALL_UNSUPPORTED}, {"__ZSt9terminatev", CALL_UNSUPPORTED},
-        {"_abort", CALL_UNSUPPORTED}
-    };
+    static const struct {
+        const char *name;
+        enum darwin_call call;
+    } functions[] = {{"_strlen", CALL_STRLEN},
+                     {"_write", CALL_WRITE},
+                     {"_exit", CALL_EXIT},
+                     {"__exit", CALL_EXIT},
+                     {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_", CALL_SENTRY_CTOR},
+                     {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC2ERS3_", CALL_SENTRY_CTOR},
+                     {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD1Ev", CALL_SENTRY_DTOR},
+                     {"__ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryD2Ev", CALL_SENTRY_DTOR},
+                     {"__ZNKSt3__18ios_base6getlocEv", CALL_GETLOC},
+                     {"__ZNKSt3__16locale9use_facetERNS0_2idE", CALL_USE_FACET},
+                     {"__ZNSt3__16localeD1Ev", CALL_LOCALE_DTOR},
+                     {"__ZNSt3__16localeD2Ev", CALL_LOCALE_DTOR},
+                     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6__initEmc", CALL_STRING_INIT},
+                     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev", CALL_STRING_DTOR},
+                     {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev", CALL_STRING_DTOR},
+                     {"__ZNSt3__18ios_base5clearEj", CALL_IOS_CLEAR},
+                     {"__ZNSt3__18ios_base33__set_badbit_and_consider_rethrowEv", CALL_UNSUPPORTED},
+                     {"__Unwind_Resume", CALL_UNSUPPORTED},
+                     {"___cxa_begin_catch", CALL_UNSUPPORTED},
+                     {"___cxa_end_catch", CALL_UNSUPPORTED},
+                     {"___gxx_personality_v0", CALL_UNSUPPORTED},
+                     {"___cxa_throw", CALL_UNSUPPORTED},
+                     {"__ZSt9terminatev", CALL_UNSUPPORTED},
+                     {"_abort", CALL_UNSUPPORTED}};
     size_t i;
     if (process == NULL || name == NULL || address == NULL) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (strcmp(name, "__DefaultRuneLocale") == 0) { *address = process->base + 0x5000u; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "___stack_chk_guard") == 0) { *address = process->base + 0x1410u; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "___stdinp") == 0) { *address = process->base + 0x1000u; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "___stdoutp") == 0) { *address = process->base + 0x1008u; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "___stderrp") == 0) { *address = process->base + 0x1010u; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_optarg") == 0) { *address = process->base + DARWIN_OPTARG_OFFSET; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_optind") == 0) { *address = process->base + DARWIN_OPTIND_OFFSET; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_opterr") == 0) { *address = process->base + DARWIN_OPTERR_OFFSET; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_optopt") == 0) { *address = process->base + DARWIN_OPTOPT_OFFSET; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_optreset") == 0) { *address = process->base + DARWIN_OPTRESET_OFFSET; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "__ZNSt3__14coutE") == 0) { *address = process->base + DARWIN_COUT_OFFSET; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "__DefaultRuneLocale") == 0) {
+        *address = process->base + 0x5000u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "___stack_chk_guard") == 0) {
+        *address = process->base + 0x1410u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "___stdinp") == 0) {
+        *address = process->base + 0x1000u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "___stdoutp") == 0) {
+        *address = process->base + 0x1008u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "___stderrp") == 0) {
+        *address = process->base + 0x1010u;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_optarg") == 0) {
+        *address = process->base + DARWIN_OPTARG_OFFSET;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_optind") == 0) {
+        *address = process->base + DARWIN_OPTIND_OFFSET;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_opterr") == 0) {
+        *address = process->base + DARWIN_OPTERR_OFFSET;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_optopt") == 0) {
+        *address = process->base + DARWIN_OPTOPT_OFFSET;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_optreset") == 0) {
+        *address = process->base + DARWIN_OPTRESET_OFFSET;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "__ZNSt3__14coutE") == 0) {
+        *address = process->base + DARWIN_COUT_OFFSET;
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "__ZNSt3__14cerrE") == 0 || strcmp(name, "__ZNSt3__14clogE") == 0) {
         *address = process->base + DARWIN_CERR_OFFSET;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "__ZNSt3__15ctypeIcE2idE") == 0) { *address = process->base + DARWIN_CTYPE_ID_OFFSET; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "__ZNSt3__15ctypeIcE2idE") == 0) {
+        *address = process->base + DARWIN_CTYPE_ID_OFFSET;
+        return XXEMUL_STATUS_OK;
+    }
     for (i = 0; i < sizeof(functions) / sizeof(functions[0]); ++i) {
         if (strcmp(name, functions[i].name) == 0) {
             *address = add_thunk(process, name, functions[i].call);
@@ -366,18 +433,77 @@ xxemul_status xxemul_darwin_resolve_import(xxemul_darwin *process, const char *n
         }
     }
     {
-        static const char *const libc[] = {
-            "_malloc_type_malloc", "_malloc_type_calloc", "_malloc_type_realloc", "_malloc", "_realloc", "_free", "_calloc",
-            "_memcpy", "_memmove", "_memset", "_memset_pattern16", "_bzero", "_memcmp", "_memchr", "_strcpy", "_strncpy", "_strcat", "_strncat",
-            "___memcpy_chk", "___memmove_chk", "___memset_chk",
-            "___strcpy_chk", "___strcat_chk", "___strncat_chk", "_strcmp", "_strncmp", "_strchr", "_strrchr", "_strstr",
-            "_getenv", "_setlocale", "_atoi", "___error", "___maskrune", "___toupper", "___tolower", "___chkstk_darwin", "_rand", "_srand", "_qsort",
-            "_printf", "_fprintf", "_sprintf", "_snprintf", "_vprintf", "_vfprintf", "_vsprintf", "_vsnprintf", "_vasprintf",
-            "___sprintf_chk", "___snprintf_chk", "___vsprintf_chk", "___vsnprintf_chk", "_sscanf",
-            "_getopt_long", "_getopt", "_getprogname", "_basename", "_dirname", "_strlcpy", "___strlcpy_chk", "_strlcat", "___strlcat_chk", "_strndup", "_compat_mode"
-        };
+        static const char *const libc[] = {"_malloc_type_malloc",
+                                           "_malloc_type_calloc",
+                                           "_malloc_type_realloc",
+                                           "_malloc",
+                                           "_realloc",
+                                           "_free",
+                                           "_calloc",
+                                           "_memcpy",
+                                           "_memmove",
+                                           "_memset",
+                                           "_memset_pattern16",
+                                           "_bzero",
+                                           "_memcmp",
+                                           "_memchr",
+                                           "_strcpy",
+                                           "_strncpy",
+                                           "_strcat",
+                                           "_strncat",
+                                           "___memcpy_chk",
+                                           "___memmove_chk",
+                                           "___memset_chk",
+                                           "___strcpy_chk",
+                                           "___strcat_chk",
+                                           "___strncat_chk",
+                                           "_strcmp",
+                                           "_strncmp",
+                                           "_strchr",
+                                           "_strrchr",
+                                           "_strstr",
+                                           "_getenv",
+                                           "_setlocale",
+                                           "_atoi",
+                                           "___error",
+                                           "___maskrune",
+                                           "___toupper",
+                                           "___tolower",
+                                           "___chkstk_darwin",
+                                           "_rand",
+                                           "_srand",
+                                           "_qsort",
+                                           "_printf",
+                                           "_fprintf",
+                                           "_sprintf",
+                                           "_snprintf",
+                                           "_vprintf",
+                                           "_vfprintf",
+                                           "_vsprintf",
+                                           "_vsnprintf",
+                                           "_vasprintf",
+                                           "___sprintf_chk",
+                                           "___snprintf_chk",
+                                           "___vsprintf_chk",
+                                           "___vsnprintf_chk",
+                                           "_sscanf",
+                                           "_getopt_long",
+                                           "_getopt",
+                                           "_getprogname",
+                                           "_basename",
+                                           "_dirname",
+                                           "_strlcpy",
+                                           "___strlcpy_chk",
+                                           "_strlcat",
+                                           "___strlcat_chk",
+                                           "_strndup",
+                                           "_compat_mode"};
         enum darwin_call call = CALL_UNSUPPORTED;
-        for (i = 0; i < sizeof(libc) / sizeof(libc[0]); ++i) if (strcmp(name, libc[i]) == 0) { call = CALL_LIBC; break; }
+        for (i = 0; i < sizeof(libc) / sizeof(libc[0]); ++i)
+            if (strcmp(name, libc[i]) == 0) {
+                call = CALL_LIBC;
+                break;
+            }
         if (call == CALL_UNSUPPORTED && xxemul_darwin_posix_supports(name)) call = CALL_POSIX;
         if (call == CALL_UNSUPPORTED && xxemul_darwin_archive_supports(name)) call = CALL_ARCHIVE;
         if (call == CALL_UNSUPPORTED && xxemul_darwin_zlib_supports(name)) call = CALL_ZLIB;
@@ -416,7 +542,10 @@ xxemul_status xxemul_darwin_start(xxemul_darwin *process, const char *path, cons
         const char *argument = argc == 0 ? path : argv[i];
         size_t length;
         uint64_t destination;
-        if (argument == NULL) { status = XXEMUL_STATUS_INVALID_ARGUMENT; goto failed; }
+        if (argument == NULL) {
+            status = XXEMUL_STATUS_INVALID_ARGUMENT;
+            goto failed;
+        }
         length = strlen(argument);
         if (length >= DARWIN_ARENA_SIZE) goto failed;
         destination = allocate_guest(process, (uint64_t)length + 1u);
@@ -428,8 +557,7 @@ xxemul_status xxemul_darwin_start(xxemul_darwin *process, const char *path, cons
         }
     }
     guest_envp = guest_argv + ((uint64_t)count + 1u) * 8u;
-    if (!store(process, guest_argv + (uint64_t)count * 8u, 8, 0) ||
-        !store(process, guest_envp, 8, 0) || !store(process, guest_envp + 8u, 8, 0)) {
+    if (!store(process, guest_argv + (uint64_t)count * 8u, 8, 0) || !store(process, guest_envp, 8, 0) || !store(process, guest_envp + 8u, 8, 0)) {
         status = XXEMUL_STATUS_ADDRESS_FAULT;
         goto failed;
     }
@@ -446,15 +574,14 @@ xxemul_status xxemul_darwin_start(xxemul_darwin *process, const char *path, cons
         stack = (process->emulator->arm.sp - words * 8u) & ~UINT64_C(15);
         if (!apple_string || !guest_range(process, stack, words * 8u) ||
             xxemul_write_memory(process->emulator, apple_string, "executable_path=", 16u) != XXEMUL_STATUS_OK ||
-            xxemul_write_memory(process->emulator, apple_string + 16u, path, path_length + 1u) != XXEMUL_STATUS_OK ||
-            !store(process, stack, 8, (uint64_t)count)) goto failed;
+            xxemul_write_memory(process->emulator, apple_string + 16u, path, path_length + 1u) != XXEMUL_STATUS_OK || !store(process, stack, 8, (uint64_t)count))
+            goto failed;
         for (i = 0; i < count; ++i) {
             if (!load(process, guest_argv + (uint64_t)i * 8u, 8, &pointer) || !store(process, stack + ((uint64_t)i + 1u) * 8u, 8, pointer)) goto failed;
         }
-        if (!store(process, stack + ((uint64_t)count + 1u) * 8u, 8, 0) ||
-            !store(process, stack + ((uint64_t)count + 2u) * 8u, 8, 0) ||
-            !store(process, stack + ((uint64_t)count + 3u) * 8u, 8, apple_string) ||
-            !store(process, stack + ((uint64_t)count + 4u) * 8u, 8, 0)) goto failed;
+        if (!store(process, stack + ((uint64_t)count + 1u) * 8u, 8, 0) || !store(process, stack + ((uint64_t)count + 2u) * 8u, 8, 0) ||
+            !store(process, stack + ((uint64_t)count + 3u) * 8u, 8, apple_string) || !store(process, stack + ((uint64_t)count + 4u) * 8u, 8, 0))
+            goto failed;
         process->kernel_sp = stack;
         process->main_argv = stack + 8u;
         process->main_envp = stack + ((uint64_t)count + 2u) * 8u;
@@ -476,10 +603,8 @@ failed:
      * bridge initialization. Roll them back with the arena for a safe retry. */
     xxemul_darwin_posix_destroy(process->posix);
     process->posix = NULL;
-    memset(process->emulator->region_data + (size_t)(saved_heap - process->emulator->region_address),
-           0, (size_t)(process->heap - saved_heap));
-    memset(process->allocations + saved_allocation_count, 0,
-           (process->allocation_count - saved_allocation_count) * sizeof(process->allocations[0]));
+    memset(process->emulator->region_data + (size_t)(saved_heap - process->emulator->region_address), 0, (size_t)(process->heap - saved_heap));
+    memset(process->allocations + saved_allocation_count, 0, (process->allocation_count - saved_allocation_count) * sizeof(process->allocations[0]));
     process->allocation_count = saved_allocation_count;
     process->heap = saved_heap;
     return darwin_error(process, status, failure_reason);
@@ -548,7 +673,8 @@ static uint64_t heap_malloc(xxemul_darwin *process, uint64_t count)
 static int heap_index(xxemul_darwin *process, uint64_t address)
 {
     unsigned i;
-    for (i = 0; i < process->allocation_count; ++i) if (process->allocations[i].address == address && !process->allocations[i].free) return (int)i;
+    for (i = 0; i < process->allocation_count; ++i)
+        if (process->allocations[i].address == address && !process->allocations[i].free) return (int)i;
     return -1;
 }
 
@@ -579,8 +705,8 @@ static int option_error(xxemul_darwin *process, int value, int option, const cha
         char message[256];
         int count = snprintf(message, sizeof(message), "getopt: %s: %.160s\n", reason, argument);
         if (count > 0 && process->posix != NULL)
-            (void)xxemul_darwin_posix_write_stream(process->posix, process->base + 0x1300u,
-                                                  message, (size_t)count < sizeof(message) ? (size_t)count : sizeof(message) - 1u);
+            (void)xxemul_darwin_posix_write_stream(process->posix, process->base + 0x1300u, message,
+                                                   (size_t)count < sizeof(message) ? (size_t)count : sizeof(message) - 1u);
     }
     return value;
 }
@@ -596,9 +722,12 @@ static xxemul_status parse_options(xxemul_darwin *process, int long_options)
     unsigned argc = (uint32_t)state->gpr[0], index;
     int ordering = long_options ? 0 : 1, result = -1, missing;
     if (options == NULL || argc > 1024u || (argc && !guest_range(process, argv, (uint64_t)argc * 8u)) ||
-        !load(process, process->base + DARWIN_OPTIND_OFFSET, 4, &exported_index) ||
-        !load(process, process->base + DARWIN_OPTRESET_OFFSET, 4, &reset)) return XXEMUL_STATUS_ADDRESS_FAULT;
-    if (*options == '+' || *options == '-') { ordering = *options == '+' ? 1 : 2; ++options; }
+        !load(process, process->base + DARWIN_OPTIND_OFFSET, 4, &exported_index) || !load(process, process->base + DARWIN_OPTRESET_OFFSET, 4, &reset))
+        return XXEMUL_STATUS_ADDRESS_FAULT;
+    if (*options == '+' || *options == '-') {
+        ordering = *options == '+' ? 1 : 2;
+        ++options;
+    }
     missing = *options == ':' ? ':' : '?';
     if (*options == ':') ++options;
     index = exported_index == 0 ? 1u : (unsigned)exported_index;
@@ -644,8 +773,11 @@ static xxemul_status parse_options(xxemul_darwin *process, int long_options)
             goto done;
         }
         if (argument[0] != '-' || argument[1] == '\0') {
-            if (ordering == 2) { (void)store(process, process->base + DARWIN_OPTARG_OFFSET, 8, address); ++index; result = 1; }
-            else process->getopt_finished = 1;
+            if (ordering == 2) {
+                (void)store(process, process->base + DARWIN_OPTARG_OFFSET, 8, address);
+                ++index;
+                result = 1;
+            } else process->getopt_finished = 1;
             goto done;
         }
         if (table && argument[1] == '-') {
@@ -663,12 +795,24 @@ static xxemul_status parse_options(xxemul_darwin *process, int long_options)
                 if (!guest_range(process, entry, 32u) || !load(process, entry, 8, &name_address)) return XXEMUL_STATUS_ADDRESS_FAULT;
                 if (!name_address) break;
                 name = guest_string(process, name_address);
-                if (name == NULL || !load(process, entry + 8u, 4, &kind) || kind > 2u ||
-                    !load(process, entry + 16u, 8, &flag) || !load(process, entry + 24u, 4, &value)) return XXEMUL_STATUS_ADDRESS_FAULT;
+                if (name == NULL || !load(process, entry + 8u, 4, &kind) || kind > 2u || !load(process, entry + 16u, 8, &flag) || !load(process, entry + 24u, 4, &value))
+                    return XXEMUL_STATUS_ADDRESS_FAULT;
                 if (strncmp(name, argument + 2, length) == 0) {
-                    if (strlen(name) == length) { selected = (int)n; selected_kind = kind; selected_flag = flag; selected_value = value; ambiguous = 0; break; }
+                    if (strlen(name) == length) {
+                        selected = (int)n;
+                        selected_kind = kind;
+                        selected_flag = flag;
+                        selected_value = value;
+                        ambiguous = 0;
+                        break;
+                    }
                     if (selected >= 0) ambiguous = 1;
-                    else { selected = (int)n; selected_kind = kind; selected_flag = flag; selected_value = value; }
+                    else {
+                        selected = (int)n;
+                        selected_kind = kind;
+                        selected_flag = flag;
+                        selected_value = value;
+                    }
                 }
             }
             if (n == 256u) return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Unterminated or oversized getopt long-option table");
@@ -678,14 +822,20 @@ static xxemul_status parse_options(xxemul_darwin *process, int long_options)
                 uint64_t value = 0;
                 if (equal) value = address + (uint64_t)(equal + 1 - argument);
                 else if (selected_kind == 1) {
-                    if (index == argc) { result = option_error(process, missing, (int)selected_value, argument, "missing argument"); goto done; }
+                    if (index == argc) {
+                        result = option_error(process, missing, (int)selected_value, argument, "missing argument");
+                        goto done;
+                    }
                     if (option_argument(process, argv, index++, &value) == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
                 }
-                if ((selected_flag && !guest_range(process, selected_flag, 4)) || (long_index && !guest_range(process, long_index, 4))) return XXEMUL_STATUS_ADDRESS_FAULT;
+                if ((selected_flag && !guest_range(process, selected_flag, 4)) || (long_index && !guest_range(process, long_index, 4)))
+                    return XXEMUL_STATUS_ADDRESS_FAULT;
                 (void)store(process, process->base + DARWIN_OPTARG_OFFSET, 8, value);
                 if (long_index) (void)store(process, long_index, 4, (uint32_t)selected);
-                if (selected_flag) { (void)store(process, selected_flag, 4, selected_value); result = 0; }
-                else result = (int32_t)selected_value;
+                if (selected_flag) {
+                    (void)store(process, selected_flag, 4, selected_value);
+                    result = 0;
+                } else result = (int32_t)selected_value;
             }
             goto done;
         }
@@ -701,8 +851,10 @@ static xxemul_status parse_options(xxemul_darwin *process, int long_options)
         result = option;
         if (found == NULL) result = option_error(process, '?', option, cursor - 1, "unknown option");
         else if (found[1] == ':') {
-            if (*cursor) { (void)store(process, process->base + DARWIN_OPTARG_OFFSET, 8, process->getopt_next); ++index; }
-            else if (found[2] != ':' && ++index < argc) {
+            if (*cursor) {
+                (void)store(process, process->base + DARWIN_OPTARG_OFFSET, 8, process->getopt_next);
+                ++index;
+            } else if (found[2] != ':' && ++index < argc) {
                 if (option_argument(process, argv, index++, &address) == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
                 (void)store(process, process->base + DARWIN_OPTARG_OFFSET, 8, address);
             } else if (found[2] != ':') result = option_error(process, missing, option, cursor - 1, "missing argument");
@@ -710,7 +862,10 @@ static xxemul_status parse_options(xxemul_darwin *process, int long_options)
             process->getopt_next = 0;
             goto done;
         }
-        if (*cursor == '\0') { ++index; process->getopt_next = 0; }
+        if (*cursor == '\0') {
+            ++index;
+            process->getopt_next = 0;
+        }
     }
 done:
     process->getopt_index = index;
@@ -736,12 +891,17 @@ static xxemul_status qsort_next(xxemul_darwin *process, int returned)
                 size_t part = process->sorts[n].size - offset > sizeof(temp) ? sizeof(temp) : (size_t)(process->sorts[n].size - offset);
                 unsigned char *a = guest_pointer(process, left + offset, part), *b = guest_pointer(process, right + offset, part);
                 if (a == NULL || b == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
-                memcpy(temp, a, part); memcpy(a, b, part); memcpy(b, temp, part);
+                memcpy(temp, a, part);
+                memcpy(a, b, part);
+                memcpy(b, temp, part);
                 offset += part;
             }
             --process->sorts[n].j;
         } else process->sorts[n].j = 0;
-        if (process->sorts[n].j == 0) { ++process->sorts[n].i; process->sorts[n].j = process->sorts[n].i; }
+        if (process->sorts[n].j == 0) {
+            ++process->sorts[n].i;
+            process->sorts[n].j = process->sorts[n].i;
+        }
     }
     process->redirect = 1;
     if (process->sorts[n].i >= process->sorts[n].count) {
@@ -771,13 +931,11 @@ static xxemul_status format_output(xxemul_darwin *process, const char *name)
     xxemul_arm_state *state = &process->emulator->arm;
     int allocated = strcmp(name, "_vasprintf") == 0;
     int to_file = strcmp(name, "_fprintf") == 0 || strcmp(name, "_vfprintf") == 0;
-    int bounded = strcmp(name, "_snprintf") == 0 || strcmp(name, "_vsnprintf") == 0 ||
-                  strcmp(name, "___snprintf_chk") == 0 || strcmp(name, "___vsnprintf_chk") == 0;
-    int checked = strcmp(name, "___sprintf_chk") == 0 || strcmp(name, "___snprintf_chk") == 0 ||
-                  strcmp(name, "___vsprintf_chk") == 0 || strcmp(name, "___vsnprintf_chk") == 0;
-    int uses_va_list = allocated || strcmp(name, "_vprintf") == 0 || strcmp(name, "_vfprintf") == 0 ||
-                  strcmp(name, "_vsprintf") == 0 || strcmp(name, "_vsnprintf") == 0 ||
-                  strcmp(name, "___vsprintf_chk") == 0 || strcmp(name, "___vsnprintf_chk") == 0;
+    int bounded = strcmp(name, "_snprintf") == 0 || strcmp(name, "_vsnprintf") == 0 || strcmp(name, "___snprintf_chk") == 0 || strcmp(name, "___vsnprintf_chk") == 0;
+    int checked =
+        strcmp(name, "___sprintf_chk") == 0 || strcmp(name, "___snprintf_chk") == 0 || strcmp(name, "___vsprintf_chk") == 0 || strcmp(name, "___vsnprintf_chk") == 0;
+    int uses_va_list = allocated || strcmp(name, "_vprintf") == 0 || strcmp(name, "_vfprintf") == 0 || strcmp(name, "_vsprintf") == 0 ||
+                       strcmp(name, "_vsnprintf") == 0 || strcmp(name, "___vsprintf_chk") == 0 || strcmp(name, "___vsnprintf_chk") == 0;
     int to_memory = allocated || bounded || checked || strcmp(name, "_sprintf") == 0 || strcmp(name, "_vsprintf") == 0;
     uint64_t destination = state->gpr[0];
     uint64_t capacity = bounded ? state->gpr[1] : checked ? state->gpr[2] : UINT64_MAX;
@@ -788,12 +946,17 @@ static xxemul_status format_output(xxemul_darwin *process, const char *name)
     char *result;
     xxemul_status status = XXEMUL_STATUS_OK;
     if (allocated && !guest_range(process, destination, 8u)) return XXEMUL_STATUS_ADDRESS_FAULT;
-    if (bounded && checked && capacity > state->gpr[3])
-        return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked snprintf limit exceeds destination size");
+    if (bounded && checked && capacity > state->gpr[3]) return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked snprintf limit exceeds destination size");
     format = guest_string(process, state->gpr[format_index]);
     result = (char *)malloc((size_t)DARWIN_MAX_STRING + 1u);
-    if (format == NULL) { free(result); return XXEMUL_STATUS_ADDRESS_FAULT; }
-    if (result == NULL) { status = XXEMUL_STATUS_OUT_OF_MEMORY; goto finished; }
+    if (format == NULL) {
+        free(result);
+        return XXEMUL_STATUS_ADDRESS_FAULT;
+    }
+    if (result == NULL) {
+        status = XXEMUL_STATUS_OUT_OF_MEMORY;
+        goto finished;
+    }
     while (*format != '\0' && status == XXEMUL_STATUS_OK) {
         char spec[96], temporary[8192], flags[8];
         int width = 0, precision = -1, long_value = 0, count;
@@ -801,48 +964,118 @@ static xxemul_status format_output(xxemul_darwin *process, const char *name)
         uint64_t value = 0;
         char conversion;
         if (*format != '%') {
-            if (used == DARWIN_MAX_STRING) { status = XXEMUL_STATUS_OUT_OF_MEMORY; break; }
+            if (used == DARWIN_MAX_STRING) {
+                status = XXEMUL_STATUS_OUT_OF_MEMORY;
+                break;
+            }
             result[used++] = *format++;
             continue;
         }
         ++format;
-        if (*format == '%') { if (used == DARWIN_MAX_STRING) { status = XXEMUL_STATUS_OUT_OF_MEMORY; break; } result[used++] = *format++; continue; }
+        if (*format == '%') {
+            if (used == DARWIN_MAX_STRING) {
+                status = XXEMUL_STATUS_OUT_OF_MEMORY;
+                break;
+            }
+            result[used++] = *format++;
+            continue;
+        }
         while (*format && strchr("-+ #0'", *format) != NULL) {
-            if (nf + 1 >= sizeof(flags)) { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; break; }
+            if (nf + 1 >= sizeof(flags)) {
+                status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                break;
+            }
             if (*format != '\'') flags[nf++] = *format;
             ++format;
         }
         flags[nf] = '\0';
         if (*format == '*') {
-            if (!next_vararg(process, &cursor, &value)) { status = XXEMUL_STATUS_ADDRESS_FAULT; break; }
-            width = (int32_t)value; ++format;
-        } else while (isdigit((unsigned char)*format)) { if (width > 100000) { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; break; } width = width * 10 + (*format++ - '0'); }
+            if (!next_vararg(process, &cursor, &value)) {
+                status = XXEMUL_STATUS_ADDRESS_FAULT;
+                break;
+            }
+            width = (int32_t)value;
+            ++format;
+        } else
+            while (isdigit((unsigned char)*format)) {
+                if (width > 100000) {
+                    status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                    break;
+                }
+                width = width * 10 + (*format++ - '0');
+            }
         if (*format == '.') {
-            ++format; precision = 0;
-            if (*format == '*') { if (!next_vararg(process, &cursor, &value)) { status = XXEMUL_STATUS_ADDRESS_FAULT; break; } precision = (int32_t)value; ++format; }
-            else while (isdigit((unsigned char)*format)) { if (precision > 100000) { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; break; } precision = precision * 10 + (*format++ - '0'); }
+            ++format;
+            precision = 0;
+            if (*format == '*') {
+                if (!next_vararg(process, &cursor, &value)) {
+                    status = XXEMUL_STATUS_ADDRESS_FAULT;
+                    break;
+                }
+                precision = (int32_t)value;
+                ++format;
+            } else
+                while (isdigit((unsigned char)*format)) {
+                    if (precision > 100000) {
+                        status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+                        break;
+                    }
+                    precision = precision * 10 + (*format++ - '0');
+                }
         }
-        if (*format == 'l' || *format == 'z' || *format == 'j' || *format == 't') { long_value = 1; if (*format++ == 'l' && *format == 'l') ++format; }
-        else if (*format == 'h') { ++format; if (*format == 'h') ++format; }
+        if (*format == 'l' || *format == 'z' || *format == 'j' || *format == 't') {
+            long_value = 1;
+            if (*format++ == 'l' && *format == 'l') ++format;
+        } else if (*format == 'h') {
+            ++format;
+            if (*format == 'h') ++format;
+        }
         conversion = *format;
-        if (conversion == '\0') { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; break; }
+        if (conversion == '\0') {
+            status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            break;
+        }
         ++format;
-        if (width < -4096 || width > 4096 || precision > 4096) { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; break; }
-        if (!next_vararg(process, &cursor, &value)) { status = XXEMUL_STATUS_ADDRESS_FAULT; break; }
-        if (conversion == 'n') { if (!store(process, value, long_value ? 8 : 4, used)) status = XXEMUL_STATUS_ADDRESS_FAULT; continue; }
+        if (width < -4096 || width > 4096 || precision > 4096) {
+            status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            break;
+        }
+        if (!next_vararg(process, &cursor, &value)) {
+            status = XXEMUL_STATUS_ADDRESS_FAULT;
+            break;
+        }
+        if (conversion == 'n') {
+            if (!store(process, value, long_value ? 8 : 4, used)) status = XXEMUL_STATUS_ADDRESS_FAULT;
+            continue;
+        }
         snprintf(spec, sizeof(spec), "%%%s*.*%s%c", flags, strchr("diuoxX", conversion) != NULL ? "ll" : "", conversion);
         if (conversion == 's') {
             const char *string = value == 0 ? "(null)" : guest_string(process, value);
-            if (string == NULL) { status = XXEMUL_STATUS_ADDRESS_FAULT; break; }
+            if (string == NULL) {
+                status = XXEMUL_STATUS_ADDRESS_FAULT;
+                break;
+            }
             count = snprintf(temporary, sizeof(temporary), spec, width, precision, string);
-        } else if (conversion == 'd' || conversion == 'i') count = snprintf(temporary, sizeof(temporary), spec, width, precision, (long long)(long_value ? (int64_t)value : (int32_t)value));
-        else if (strchr("uoxX", conversion) != NULL) count = snprintf(temporary, sizeof(temporary), spec, width, precision, (unsigned long long)(long_value ? value : (uint32_t)value));
+        } else if (conversion == 'd' || conversion == 'i')
+            count = snprintf(temporary, sizeof(temporary), spec, width, precision, (long long)(long_value ? (int64_t)value : (int32_t)value));
+        else if (strchr("uoxX", conversion) != NULL)
+            count = snprintf(temporary, sizeof(temporary), spec, width, precision, (unsigned long long)(long_value ? value : (uint32_t)value));
         else if (conversion == 'c') count = snprintf(temporary, sizeof(temporary), spec, width, precision, (int)(unsigned char)value);
         else if (conversion == 'p') count = snprintf(temporary, sizeof(temporary), "0x%llx", (unsigned long long)value);
-        else if (strchr("fFeEgGaA", conversion) != NULL) { double number; memcpy(&number, &value, sizeof(number)); count = snprintf(temporary, sizeof(temporary), spec, width, precision, number); }
-        else { status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; break; }
-        if (count < 0 || (size_t)count >= sizeof(temporary) || (size_t)count > DARWIN_MAX_STRING - used) { status = XXEMUL_STATUS_OUT_OF_MEMORY; break; }
-        memcpy(result + used, temporary, (size_t)count); used += (size_t)count;
+        else if (strchr("fFeEgGaA", conversion) != NULL) {
+            double number;
+            memcpy(&number, &value, sizeof(number));
+            count = snprintf(temporary, sizeof(temporary), spec, width, precision, number);
+        } else {
+            status = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            break;
+        }
+        if (count < 0 || (size_t)count >= sizeof(temporary) || (size_t)count > DARWIN_MAX_STRING - used) {
+            status = XXEMUL_STATUS_OUT_OF_MEMORY;
+            break;
+        }
+        memcpy(result + used, temporary, (size_t)count);
+        used += (size_t)count;
     }
     if (status == XXEMUL_STATUS_OK) {
         result[used] = '\0';
@@ -871,7 +1104,11 @@ static xxemul_status format_output(xxemul_darwin *process, const char *name)
             } else if (used >= capacity || !guest_range(process, destination, used + 1u)) status = XXEMUL_STATUS_ADDRESS_FAULT;
             else status = xxemul_write_memory(process->emulator, destination, result, used + 1u);
         } else if (to_file) {
-            if (xxemul_darwin_posix_write_stream(process->posix, destination, result, used) != (int64_t)used) { state->gpr[0] = UINT64_MAX; free(result); return XXEMUL_STATUS_OK; }
+            if (xxemul_darwin_posix_write_stream(process->posix, destination, result, used) != (int64_t)used) {
+                state->gpr[0] = UINT64_MAX;
+                free(result);
+                return XXEMUL_STATUS_OK;
+            }
         } else if (!xxemul_emit_output(process->emulator, 1, result, used)) {
             if (fwrite(result, 1, used, stdout) != used) status = XXEMUL_STATUS_IO_ERROR;
         }
@@ -900,13 +1137,43 @@ static xxemul_status scan_input(xxemul_darwin *process)
         int suppress = 0, width = 0, long_value = 0;
         uint64_t target = 0;
         char conversion;
-        if (isspace((unsigned char)*format)) { while (isspace((unsigned char)*input)) ++input; ++format; continue; }
-        if (*format != '%') { if (*input != *format) { input_failure = *input == '\0'; break; } ++input; ++format; continue; }
+        if (isspace((unsigned char)*format)) {
+            while (isspace((unsigned char)*input)) ++input;
+            ++format;
+            continue;
+        }
+        if (*format != '%') {
+            if (*input != *format) {
+                input_failure = *input == '\0';
+                break;
+            }
+            ++input;
+            ++format;
+            continue;
+        }
         ++format;
-        if (*format == '%') { if (*input != '%') { input_failure = *input == '\0'; break; } ++input; ++format; continue; }
-        if (*format == '*') { suppress = 1; ++format; }
-        while (isdigit((unsigned char)*format)) { if (width > 100000) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; width = width * 10 + (*format++ - '0'); }
-        if (*format == 'l') { long_value = 1; ++format; if (*format == 'l') ++format; }
+        if (*format == '%') {
+            if (*input != '%') {
+                input_failure = *input == '\0';
+                break;
+            }
+            ++input;
+            ++format;
+            continue;
+        }
+        if (*format == '*') {
+            suppress = 1;
+            ++format;
+        }
+        while (isdigit((unsigned char)*format)) {
+            if (width > 100000) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+            width = width * 10 + (*format++ - '0');
+        }
+        if (*format == 'l') {
+            long_value = 1;
+            ++format;
+            if (*format == 'l') ++format;
+        }
         conversion = *format++;
         if (!suppress && !next_vararg(process, &cursor, &target)) return XXEMUL_STATUS_ADDRESS_FAULT;
         if (strchr("diuoxX", conversion) != NULL && conversion != 0) {
@@ -914,22 +1181,35 @@ static xxemul_status scan_input(xxemul_darwin *process)
             size_t count = 0;
             uint64_t value;
             while (isspace((unsigned char)*input)) ++input;
-            while (input[count] && count + 1u < sizeof(text) && (width == 0 || count < (size_t)width)) { text[count] = input[count]; ++count; }
+            while (input[count] && count + 1u < sizeof(text) && (width == 0 || count < (size_t)width)) {
+                text[count] = input[count];
+                ++count;
+            }
             text[count] = '\0';
             /* Unsigned conversions use strtoull: strtoll would clamp values
              * above INT64_MAX (e.g. 0xffffffffffffffff) on ERANGE. */
             if (conversion == 'd' || conversion == 'i') value = (uint64_t)strtoll(text, &end, conversion == 'i' ? 0 : 10);
             else value = (uint64_t)strtoull(text, &end, conversion == 'o' ? 8 : (conversion == 'x' || conversion == 'X') ? 16 : 10);
-            if (end == text) { input_failure = *input == '\0'; break; }
+            if (end == text) {
+                input_failure = *input == '\0';
+                break;
+            }
             input += end - text;
             converted = 1;
-            if (!suppress) { if (!store(process, target, long_value ? 8 : 4, value)) return XXEMUL_STATUS_ADDRESS_FAULT; ++assigned; }
+            if (!suppress) {
+                if (!store(process, target, long_value ? 8 : 4, value)) return XXEMUL_STATUS_ADDRESS_FAULT;
+                ++assigned;
+            }
         } else if (conversion == 's' || conversion == 'c') {
             size_t count = 0;
-            if (conversion == 's') while (isspace((unsigned char)*input)) ++input;
+            if (conversion == 's')
+                while (isspace((unsigned char)*input)) ++input;
             if (width == 0) width = conversion == 'c' ? 1 : (int)DARWIN_MAX_STRING;
             while (input[count] && count < (size_t)width && (conversion == 'c' || !isspace((unsigned char)input[count]))) ++count;
-            if (count == 0) { input_failure = input[0] == '\0'; break; }
+            if (count == 0) {
+                input_failure = input[0] == '\0';
+                break;
+            }
             converted = 1;
             if (!suppress) {
                 if (!guest_range(process, target, count + (conversion == 's'))) return XXEMUL_STATUS_ADDRESS_FAULT;
@@ -938,8 +1218,9 @@ static xxemul_status scan_input(xxemul_darwin *process)
                 ++assigned;
             }
             input += count;
-        } else if (conversion == 'n') { if (!suppress && !store(process, target, long_value ? 8 : 4, (uint64_t)(input - begin))) return XXEMUL_STATUS_ADDRESS_FAULT; }
-        else return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        } else if (conversion == 'n') {
+            if (!suppress && !store(process, target, long_value ? 8 : 4, (uint64_t)(input - begin))) return XXEMUL_STATUS_ADDRESS_FAULT;
+        } else return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
     /* Input failure before the first conversion returns EOF. */
     state->gpr[0] = input_failure && !converted ? UINT64_MAX : (uint32_t)assigned;
@@ -954,20 +1235,25 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
     unsigned char *dest;
     uint64_t pointer;
     int index;
-    if (strcmp(name, "___error") == 0) { state->gpr[0] = process->base + 0x1400u; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "___error") == 0) {
+        state->gpr[0] = process->base + 0x1400u;
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "___chkstk_darwin") == 0) return XXEMUL_STATUS_OK;
-    if (strcmp(name, "_getenv") == 0) { state->gpr[0] = 0; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_getopt_long") == 0 || strcmp(name, "_getopt") == 0)
-        return parse_options(process, strcmp(name, "_getopt_long") == 0);
+    if (strcmp(name, "_getenv") == 0) {
+        state->gpr[0] = 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_getopt_long") == 0 || strcmp(name, "_getopt") == 0) return parse_options(process, strcmp(name, "_getopt_long") == 0);
     if (strcmp(name, "_getprogname") == 0) {
-        if (!load(process, process->main_argv, 8, &pointer) || (s = guest_string(process, pointer)) == NULL)
-            return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (!load(process, process->main_argv, 8, &pointer) || (s = guest_string(process, pointer)) == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
         t = strrchr(s, '/');
         state->gpr[0] = t ? pointer + (uint64_t)(t + 1 - s) : pointer;
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "_compat_mode") == 0) {
-        s = guest_string(process, a); t = guest_string(process, b);
+        s = guest_string(process, a);
+        t = guest_string(process, b);
         if (s == NULL || t == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
         /* The empty guest environment uses modern Darwin's Unix2003 mode.
          * Other private compatibility modes have no modeled semantics. */
@@ -980,16 +1266,23 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
         size_t length;
         s = a == 0 ? "" : guest_string(process, a);
         if (s == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
-        begin = s; end = s + strlen(s);
+        begin = s;
+        end = s + strlen(s);
         while (end > s && end[-1] == '/') --end;
         while (end > s && end[-1] != '/') --end;
         while (end > s && end[-1] == '/') --end;
-        if (end == s) { begin = *s == '/' ? "/" : "."; length = 1u; }
-        else length = (size_t)(end - s);
-        if (length >= 4096u) { (void)store(process, process->base + 0x1400u, 4, 63); state->gpr[0] = 0; return XXEMUL_STATUS_OK; }
+        if (end == s) {
+            begin = *s == '/' ? "/" : ".";
+            length = 1u;
+        } else length = (size_t)(end - s);
+        if (length >= 4096u) {
+            (void)store(process, process->base + 0x1400u, 4, 63);
+            state->gpr[0] = 0;
+            return XXEMUL_STATUS_OK;
+        }
         pointer = process->base + DARWIN_DIRNAME_OFFSET;
-        if (xxemul_write_memory(process->emulator, pointer, begin, length) != XXEMUL_STATUS_OK ||
-            !store(process, pointer + length, 1, 0)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (xxemul_write_memory(process->emulator, pointer, begin, length) != XXEMUL_STATUS_OK || !store(process, pointer + length, 1, 0))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
         state->gpr[0] = pointer;
         return XXEMUL_STATUS_OK;
     }
@@ -1002,11 +1295,18 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
         while (end > s && end[-1] == '/') --end;
         begin = end;
         while (begin > s && begin[-1] != '/') --begin;
-        if (end == s) { begin = *s == '/' ? "/" : "."; length = 1; }
-        else length = (size_t)(end - begin);
-        if (length >= 4096u) { (void)store(process, process->base + 0x1400u, 4, 63); state->gpr[0] = 0; return XXEMUL_STATUS_OK; }
+        if (end == s) {
+            begin = *s == '/' ? "/" : ".";
+            length = 1;
+        } else length = (size_t)(end - begin);
+        if (length >= 4096u) {
+            (void)store(process, process->base + 0x1400u, 4, 63);
+            state->gpr[0] = 0;
+            return XXEMUL_STATUS_OK;
+        }
         pointer = process->base + DARWIN_BASENAME_OFFSET;
-        if (xxemul_write_memory(process->emulator, pointer, begin, length) != XXEMUL_STATUS_OK || !store(process, pointer + length, 1, 0)) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (xxemul_write_memory(process->emulator, pointer, begin, length) != XXEMUL_STATUS_OK || !store(process, pointer + length, 1, 0))
+            return XXEMUL_STATUS_ADDRESS_FAULT;
         state->gpr[0] = pointer;
         return XXEMUL_STATUS_OK;
     }
@@ -1026,7 +1326,11 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
             else return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Unterminated or oversized strndup input");
         }
         pointer = heap_malloc(process, (uint64_t)length + 1u);
-        if (!pointer) { (void)store(process, process->base + 0x1400u, 4, 12); state->gpr[0] = 0; return XXEMUL_STATUS_OK; }
+        if (!pointer) {
+            (void)store(process, process->base + 0x1400u, 4, 12);
+            state->gpr[0] = 0;
+            return XXEMUL_STATUS_OK;
+        }
         if (length) memmove(guest_pointer(process, pointer, length), guest_pointer(process, a, length), length);
         (void)store(process, pointer + length, 1, 0);
         state->gpr[0] = pointer;
@@ -1035,8 +1339,7 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
     if (strcmp(name, "_strlcat") == 0 || strcmp(name, "___strlcat_chk") == 0) {
         uint64_t destination_length = 0;
         size_t source_length;
-        if (strcmp(name, "___strlcat_chk") == 0 && c > d)
-            return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked strlcat limit exceeds destination size");
+        if (strcmp(name, "___strlcat_chk") == 0 && c > d) return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked strlcat limit exceeds destination size");
         s = guest_string(process, b);
         if (s == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
         source_length = strlen(s);
@@ -1065,8 +1368,7 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
     }
     if (strcmp(name, "_strlcpy") == 0 || strcmp(name, "___strlcpy_chk") == 0) {
         size_t length, written;
-        if (strcmp(name, "___strlcpy_chk") == 0 && c > d)
-            return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked strlcpy limit exceeds destination size");
+        if (strcmp(name, "___strlcpy_chk") == 0 && c > d) return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked strlcpy limit exceeds destination size");
         s = guest_string(process, b);
         if (s == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
         length = strlen(s);
@@ -1084,7 +1386,10 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
         /* Darwin categories are LC_ALL=0 through LC_MESSAGES=6. The guest
          * environment is empty, so its default locale is C. Every supported
          * category stays C; a rejected name leaves that state unchanged. */
-        if ((uint32_t)a > 6u) { state->gpr[0] = 0; return XXEMUL_STATUS_OK; }
+        if ((uint32_t)a > 6u) {
+            state->gpr[0] = 0;
+            return XXEMUL_STATUS_OK;
+        }
         if (b != 0) {
             s = guest_string(process, b);
             if (s == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
@@ -1096,60 +1401,95 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
         state->gpr[0] = process->base + DARWIN_C_LOCALE_NAME_OFFSET;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "___maskrune") == 0) { state->gpr[0] = a < 256u ? rune_type((unsigned)a) & b : 0; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "___toupper") == 0) { state->gpr[0] = a >= 'a' && a <= 'z' ? a - 'a' + 'A' : a; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "___tolower") == 0) { state->gpr[0] = a >= 'A' && a <= 'Z' ? a - 'A' + 'a' : a; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_srand") == 0) { process->random_state = (uint32_t)a; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_rand") == 0) { process->random_state = process->random_state * 1103515245u + 12345u; state->gpr[0] = process->random_state & 0x7fffffffu; return XXEMUL_STATUS_OK; }
-    if (strcmp(name, "_malloc_type_malloc") == 0 || strcmp(name, "_malloc") == 0 ||
-        strcmp(name, "_calloc") == 0 || strcmp(name, "_malloc_type_calloc") == 0) {
+    if (strcmp(name, "___maskrune") == 0) {
+        state->gpr[0] = a < 256u ? rune_type((unsigned)a) & b : 0;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "___toupper") == 0) {
+        state->gpr[0] = a >= 'a' && a <= 'z' ? a - 'a' + 'A' : a;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "___tolower") == 0) {
+        state->gpr[0] = a >= 'A' && a <= 'Z' ? a - 'A' + 'a' : a;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_srand") == 0) {
+        process->random_state = (uint32_t)a;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_rand") == 0) {
+        process->random_state = process->random_state * 1103515245u + 12345u;
+        state->gpr[0] = process->random_state & 0x7fffffffu;
+        return XXEMUL_STATUS_OK;
+    }
+    if (strcmp(name, "_malloc_type_malloc") == 0 || strcmp(name, "_malloc") == 0 || strcmp(name, "_calloc") == 0 || strcmp(name, "_malloc_type_calloc") == 0) {
         int clear = strcmp(name, "_calloc") == 0 || strcmp(name, "_malloc_type_calloc") == 0;
         uint64_t count = a;
         /* The allocation type identifier is an extra argument, never a size. */
-        if (clear) { if (b && a > UINT64_MAX / b) count = UINT64_MAX; else count = a * b; }
+        if (clear) {
+            if (b && a > UINT64_MAX / b) count = UINT64_MAX;
+            else count = a * b;
+        }
         pointer = heap_malloc(process, count);
         if (pointer == 0) store(process, process->base + 0x1400u, 4, 12);
         else if (clear) memset(guest_pointer(process, pointer, count), 0, (size_t)count);
-        state->gpr[0] = pointer; return XXEMUL_STATUS_OK;
+        state->gpr[0] = pointer;
+        return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "_free") == 0) { if (a == 0) return XXEMUL_STATUS_OK; index = heap_index(process, a); if (index < 0) return XXEMUL_STATUS_ADDRESS_FAULT; process->allocations[index].free = 1; return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "_free") == 0) {
+        if (a == 0) return XXEMUL_STATUS_OK;
+        index = heap_index(process, a);
+        if (index < 0) return XXEMUL_STATUS_ADDRESS_FAULT;
+        process->allocations[index].free = 1;
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "_malloc_type_realloc") == 0 || strcmp(name, "_realloc") == 0) {
         index = a == 0 ? -1 : heap_index(process, a);
         if (a && index < 0) return XXEMUL_STATUS_ADDRESS_FAULT;
         if (index >= 0 && b <= process->allocations[index].size && b != 0) return XXEMUL_STATUS_OK;
         pointer = b == 0 ? 0 : heap_malloc(process, b);
         if (index >= 0 && (pointer || b == 0)) {
-            if (pointer) memcpy(guest_pointer(process, pointer, b), guest_pointer(process, a, process->allocations[index].size), (size_t)process->allocations[index].size);
+            if (pointer)
+                memcpy(guest_pointer(process, pointer, b), guest_pointer(process, a, process->allocations[index].size), (size_t)process->allocations[index].size);
             process->allocations[index].free = 1;
         }
         if (pointer == 0 && b) store(process, process->base + 0x1400u, 4, 12);
-        state->gpr[0] = pointer; return XXEMUL_STATUS_OK;
+        state->gpr[0] = pointer;
+        return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "_memchr") == 0) {
         const unsigned char *found;
-        if (!c) { state->gpr[0] = 0; return XXEMUL_STATUS_OK; }
+        if (!c) {
+            state->gpr[0] = 0;
+            return XXEMUL_STATUS_OK;
+        }
         dest = guest_pointer(process, a, c);
         if (dest == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
         found = memchr(dest, (unsigned char)b, (size_t)c);
         state->gpr[0] = found ? a + (uint64_t)(found - dest) : 0;
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "_memcpy") == 0 || strcmp(name, "_memmove") == 0 || strcmp(name, "_memcmp") == 0 ||
-        strcmp(name, "___memcpy_chk") == 0 || strcmp(name, "___memmove_chk") == 0) {
+    if (strcmp(name, "_memcpy") == 0 || strcmp(name, "_memmove") == 0 || strcmp(name, "_memcmp") == 0 || strcmp(name, "___memcpy_chk") == 0 ||
+        strcmp(name, "___memmove_chk") == 0) {
         if ((strcmp(name, "___memcpy_chk") == 0 || strcmp(name, "___memmove_chk") == 0) && c > d)
             return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked memory copy exceeds destination size");
-        unsigned char *source = guest_pointer(process, b, c); dest = guest_pointer(process, a, c);
+        unsigned char *source = guest_pointer(process, b, c);
+        dest = guest_pointer(process, a, c);
         if (source == NULL || dest == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
         if (strcmp(name, "_memcmp") == 0) state->gpr[0] = (uint32_t)memcmp(dest, source, (size_t)c);
         else memmove(dest, source, (size_t)c);
         return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "_memset") == 0 || strcmp(name, "_bzero") == 0 || strcmp(name, "___memset_chk") == 0) {
-        if (strcmp(name, "___memset_chk") == 0 && c > d)
-            return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked memset exceeds destination size");
-        if (strcmp(name, "_bzero") == 0) { c = b; b = 0; }
-        dest = guest_pointer(process, a, c); if (dest == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
-        memset(dest, (int)(unsigned char)b, (size_t)c); return XXEMUL_STATUS_OK;
+        if (strcmp(name, "___memset_chk") == 0 && c > d) return darwin_error(process, XXEMUL_STATUS_ADDRESS_FAULT, "Checked memset exceeds destination size");
+        if (strcmp(name, "_bzero") == 0) {
+            c = b;
+            b = 0;
+        }
+        dest = guest_pointer(process, a, c);
+        if (dest == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
+        memset(dest, (int)(unsigned char)b, (size_t)c);
+        return XXEMUL_STATUS_OK;
     }
     if (strcmp(name, "_memset_pattern16") == 0) {
         unsigned char pattern[16];
@@ -1172,50 +1512,66 @@ static xxemul_status call_libc(xxemul_darwin *process, const char *name)
         uint64_t comparator = d;
         if (b < 2u || c == 0) return XXEMUL_STATUS_OK;
         if (process->sort_depth == 8u || b > UINT64_MAX / c || !guest_range(process, a, b * c)) return XXEMUL_STATUS_ADDRESS_FAULT;
-        if (!guest_range(process, comparator, 4) && xxemul_arm_auth_check(process->emulator, d, 0, 0, &comparator) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (!guest_range(process, comparator, 4) && xxemul_arm_auth_check(process->emulator, d, 0, 0, &comparator) != XXEMUL_STATUS_OK)
+            return XXEMUL_STATUS_ADDRESS_FAULT;
         n = process->sort_depth++;
-        process->sorts[n].base = a; process->sorts[n].count = b; process->sorts[n].size = c;
-        process->sorts[n].compare = comparator; process->sorts[n].lr = state->gpr[30];
-        process->sorts[n].i = 1; process->sorts[n].j = 1;
+        process->sorts[n].base = a;
+        process->sorts[n].count = b;
+        process->sorts[n].size = c;
+        process->sorts[n].compare = comparator;
+        process->sorts[n].lr = state->gpr[30];
+        process->sorts[n].i = 1;
+        process->sorts[n].j = 1;
         return qsort_next(process, 0);
     }
-    if (strcmp(name, "_printf") == 0 || strcmp(name, "_fprintf") == 0 || strcmp(name, "_sprintf") == 0 ||
-        strcmp(name, "_snprintf") == 0 || strcmp(name, "_vprintf") == 0 || strcmp(name, "_vfprintf") == 0 ||
-        strcmp(name, "_vsprintf") == 0 || strcmp(name, "_vsnprintf") == 0 || strcmp(name, "___sprintf_chk") == 0 ||
-        strcmp(name, "___snprintf_chk") == 0 || strcmp(name, "___vsprintf_chk") == 0 || strcmp(name, "___vsnprintf_chk") == 0 ||
+    if (strcmp(name, "_printf") == 0 || strcmp(name, "_fprintf") == 0 || strcmp(name, "_sprintf") == 0 || strcmp(name, "_snprintf") == 0 ||
+        strcmp(name, "_vprintf") == 0 || strcmp(name, "_vfprintf") == 0 || strcmp(name, "_vsprintf") == 0 || strcmp(name, "_vsnprintf") == 0 ||
+        strcmp(name, "___sprintf_chk") == 0 || strcmp(name, "___snprintf_chk") == 0 || strcmp(name, "___vsprintf_chk") == 0 || strcmp(name, "___vsnprintf_chk") == 0 ||
         strcmp(name, "_vasprintf") == 0)
         return format_output(process, name);
     if (strcmp(name, "_sscanf") == 0) return scan_input(process);
     s = guest_string(process, a);
-    if (strcmp(name, "_atoi") == 0) { if (s == NULL) return XXEMUL_STATUS_ADDRESS_FAULT; state->gpr[0] = (uint32_t)strtol(s, NULL, 10); return XXEMUL_STATUS_OK; }
+    if (strcmp(name, "_atoi") == 0) {
+        if (s == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
+        state->gpr[0] = (uint32_t)strtol(s, NULL, 10);
+        return XXEMUL_STATUS_OK;
+    }
     if (strcmp(name, "_strchr") == 0 || strcmp(name, "_strrchr") == 0) {
         const char *found;
         if (s == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
         found = strcmp(name, "_strchr") == 0 ? strchr(s, (int)(unsigned char)b) : strrchr(s, (int)(unsigned char)b);
-        state->gpr[0] = found != NULL ? a + (uint64_t)(found - s) : 0; return XXEMUL_STATUS_OK;
+        state->gpr[0] = found != NULL ? a + (uint64_t)(found - s) : 0;
+        return XXEMUL_STATUS_OK;
     }
     t = guest_string(process, b);
     if (strcmp(name, "_strcmp") == 0 || strcmp(name, "_strncmp") == 0 || strcmp(name, "_strstr") == 0) {
         if (s == NULL || t == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
-        if (strcmp(name, "_strstr") == 0) { const char *found = strstr(s, t); state->gpr[0] = found ? a + (uint64_t)(found - s) : 0; }
-        else state->gpr[0] = (uint32_t)(strcmp(name, "_strcmp") == 0 ? strcmp(s, t) : strncmp(s, t, c > SIZE_MAX ? SIZE_MAX : (size_t)c));
+        if (strcmp(name, "_strstr") == 0) {
+            const char *found = strstr(s, t);
+            state->gpr[0] = found ? a + (uint64_t)(found - s) : 0;
+        } else state->gpr[0] = (uint32_t)(strcmp(name, "_strcmp") == 0 ? strcmp(s, t) : strncmp(s, t, c > SIZE_MAX ? SIZE_MAX : (size_t)c));
         return XXEMUL_STATUS_OK;
     }
-    if (strcmp(name, "_strcpy") == 0 || strcmp(name, "___strcpy_chk") == 0 || strcmp(name, "_strncpy") == 0 ||
-        strcmp(name, "_strcat") == 0 || strcmp(name, "___strcat_chk") == 0 || strcmp(name, "_strncat") == 0 || strcmp(name, "___strncat_chk") == 0) {
+    if (strcmp(name, "_strcpy") == 0 || strcmp(name, "___strcpy_chk") == 0 || strcmp(name, "_strncpy") == 0 || strcmp(name, "_strcat") == 0 ||
+        strcmp(name, "___strcat_chk") == 0 || strcmp(name, "_strncat") == 0 || strcmp(name, "___strncat_chk") == 0) {
         size_t length, offset = 0;
         int bounded = strcmp(name, "_strncpy") == 0 || strcmp(name, "_strncat") == 0 || strcmp(name, "___strncat_chk") == 0;
         int cat = strstr(name, "cat") != NULL;
         uint64_t cap = strstr(name, "_chk") != NULL ? (bounded ? d : c) : UINT64_MAX;
         if (t == NULL || (cat && s == NULL)) return XXEMUL_STATUS_ADDRESS_FAULT;
-        length = strlen(t); if (bounded && c < length) length = (size_t)c;
+        length = strlen(t);
+        if (bounded && c < length) length = (size_t)c;
         if (cat) offset = strlen(s);
         if (strcmp(name, "_strncpy") == 0) {
-            dest = guest_pointer(process, a, c); if (dest == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
-            memcpy(dest, t, length); if (c > length) memset(dest + length, 0, (size_t)c - length);
+            dest = guest_pointer(process, a, c);
+            if (dest == NULL) return XXEMUL_STATUS_ADDRESS_FAULT;
+            memcpy(dest, t, length);
+            if (c > length) memset(dest + length, 0, (size_t)c - length);
         } else {
             if (offset >= cap || length >= cap - offset || !guest_range(process, a, offset + length + 1u)) return XXEMUL_STATUS_ADDRESS_FAULT;
-            dest = guest_pointer(process, a, offset + length + 1u); memmove(dest + offset, t, length); dest[offset + length] = 0;
+            dest = guest_pointer(process, a, offset + length + 1u);
+            memmove(dest + offset, t, length);
+            dest[offset + length] = 0;
         }
         return XXEMUL_STATUS_OK;
     }
@@ -1237,9 +1593,7 @@ static xxemul_status archive_callback(xxemul_darwin *process, int returned)
     if (xxemul_darwin_archive_take_callback(process->archive, &target, arguments, &count)) {
         if (count > 3u || (!returned && process->archive_callback_active))
             return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "Nested archive callbacks are unsupported");
-        if (!guest_range(process, target, 4u) &&
-            xxemul_arm_auth_check(process->emulator, target, 0, 0, &target) != XXEMUL_STATUS_OK)
-            return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (!guest_range(process, target, 4u) && xxemul_arm_auth_check(process->emulator, target, 0, 0, &target) != XXEMUL_STATUS_OK) return XXEMUL_STATUS_ADDRESS_FAULT;
         if ((target & 3u) || !guest_range(process, target, 4u)) return XXEMUL_STATUS_ADDRESS_FAULT;
         callback = add_thunk(process, "<Darwin archive callback return>", CALL_ARCHIVE_RETURN);
         if (!callback) return XXEMUL_STATUS_OUT_OF_MEMORY;
@@ -1274,25 +1628,19 @@ static xxemul_status call_import(xxemul_darwin *process, const struct darwin_thu
             return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         case CALL_QSORT_RETURN: return qsort_next(process, 1);
         case CALL_ARCHIVE:
-            if (!process->archive)
-                process->archive = xxemul_darwin_archive_create(process->emulator, bridge_allocate, process, process->posix);
-            if (!process->archive)
-                return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "The libarchive runtime adapter is unavailable on this host");
+            if (!process->archive) process->archive = xxemul_darwin_archive_create(process->emulator, bridge_allocate, process, process->posix);
+            if (!process->archive) return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "The libarchive runtime adapter is unavailable on this host");
             if (!xxemul_darwin_archive_dispatch(process->archive, thunk->name, &status)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             return status == XXEMUL_STATUS_OK ? archive_callback(process, 0) : status;
         case CALL_ARCHIVE_RETURN: return archive_callback(process, 1);
         case CALL_ZLIB:
-            if (!process->zlib)
-                process->zlib = xxemul_darwin_zlib_create(process->emulator, bridge_allocate, process);
-            if (!process->zlib)
-                return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "The zlib runtime adapter is unavailable on this host");
+            if (!process->zlib) process->zlib = xxemul_darwin_zlib_create(process->emulator, bridge_allocate, process);
+            if (!process->zlib) return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "The zlib runtime adapter is unavailable on this host");
             if (!xxemul_darwin_zlib_dispatch(process->zlib, thunk->name, &status)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             return status;
         case CALL_BZIP2:
-            if (!process->bzip2)
-                process->bzip2 = xxemul_darwin_bzip2_create(process->emulator, bridge_allocate, process, process->posix);
-            if (!process->bzip2)
-                return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "The bzip2 runtime adapter is unavailable on this host");
+            if (!process->bzip2) process->bzip2 = xxemul_darwin_bzip2_create(process->emulator, bridge_allocate, process, process->posix);
+            if (!process->bzip2) return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "The bzip2 runtime adapter is unavailable on this host");
             if (!xxemul_darwin_bzip2_dispatch(process->bzip2, thunk->name, &status)) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             return status;
         case CALL_RETURN:
@@ -1305,7 +1653,10 @@ static xxemul_status call_import(xxemul_darwin *process, const struct darwin_thu
             for (value = 0; value < DARWIN_MAX_STRING; ++value) {
                 uint64_t ch;
                 if (a > UINT64_MAX - value || !load(process, a + value, 1, &ch)) return XXEMUL_STATUS_ADDRESS_FAULT;
-                if (ch == 0) { state->gpr[0] = value; return XXEMUL_STATUS_OK; }
+                if (ch == 0) {
+                    state->gpr[0] = value;
+                    return XXEMUL_STATUS_OK;
+                }
             }
             return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "Darwin strlen input exceeds 1 MiB");
         case CALL_SENTRY_CTOR:
@@ -1321,27 +1672,28 @@ static xxemul_status call_import(xxemul_darwin *process, const struct darwin_thu
             if (!store(process, state->gpr[8], 8, process->base + DARWIN_LOCALE_OFFSET)) return XXEMUL_STATUS_ADDRESS_FAULT;
             return XXEMUL_STATUS_OK;
         case CALL_USE_FACET:
-            if (b != process->base + DARWIN_CTYPE_ID_OFFSET) return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "Only the default char ctype facet is supported");
+            if (b != process->base + DARWIN_CTYPE_ID_OFFSET)
+                return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "Only the default char ctype facet is supported");
             state->gpr[0] = process->base + DARWIN_FACET_OFFSET;
             return XXEMUL_STATUS_OK;
-        case CALL_WIDEN:
-            state->gpr[0] = (uint32_t)(int32_t)(int8_t)b;
-            return XXEMUL_STATUS_OK;
+        case CALL_WIDEN: state->gpr[0] = (uint32_t)(int32_t)(int8_t)b; return XXEMUL_STATUS_OK;
         case CALL_XSPUTN:
-            if (a != process->base + DARWIN_COUT_BUFFER_OFFSET && a != process->base + DARWIN_CERR_BUFFER_OFFSET) return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "Unsupported libc++ stream buffer");
+            if (a != process->base + DARWIN_COUT_BUFFER_OFFSET && a != process->base + DARWIN_CERR_BUFFER_OFFSET)
+                return darwin_error(process, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "Unsupported libc++ stream buffer");
             status = write_guest(process, a == process->base + DARWIN_COUT_BUFFER_OFFSET ? 1 : 2, b, c);
             if (status == XXEMUL_STATUS_OK) state->gpr[0] = c;
             return status;
         case CALL_OVERFLOW:
-            if ((uint32_t)b == UINT32_MAX) { state->gpr[0] = 0; return XXEMUL_STATUS_OK; }
+            if ((uint32_t)b == UINT32_MAX) {
+                state->gpr[0] = 0;
+                return XXEMUL_STATUS_OK;
+            }
             if (a != process->base + DARWIN_COUT_BUFFER_OFFSET && a != process->base + DARWIN_CERR_BUFFER_OFFSET) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
             if (!store(process, process->base + 0x700u, 1, b)) return XXEMUL_STATUS_ADDRESS_FAULT;
             status = write_guest(process, a == process->base + DARWIN_COUT_BUFFER_OFFSET ? 1 : 2, process->base + 0x700u, 1);
             state->gpr[0] = (uint8_t)b;
             return status;
-        case CALL_SYNC:
-            state->gpr[0] = 0;
-            return XXEMUL_STATUS_OK;
+        case CALL_SYNC: state->gpr[0] = 0; return XXEMUL_STATUS_OK;
         case CALL_STRING_INIT: {
             unsigned char object[24] = {0};
             uint64_t data = a;
@@ -1363,7 +1715,8 @@ static xxemul_status call_import(xxemul_darwin *process, const struct darwin_thu
                 offset += amount;
             }
             if (!store(process, data + b, 1, 0) || !store(process, a, 8, data) || !store(process, a + 8u, 8, b) ||
-                !store(process, a + 16u, 8, (b + 1u) | (UINT64_C(1) << 63))) return XXEMUL_STATUS_ADDRESS_FAULT;
+                !store(process, a + 16u, 8, (b + 1u) | (UINT64_C(1) << 63)))
+                return XXEMUL_STATUS_ADDRESS_FAULT;
             return XXEMUL_STATUS_OK;
         }
         case CALL_IOS_CLEAR:
@@ -1375,9 +1728,7 @@ static xxemul_status call_import(xxemul_darwin *process, const struct darwin_thu
             status = write_guest(process, (int)a, b, c);
             if (status == XXEMUL_STATUS_OK) state->gpr[0] = c;
             return status;
-        default:
-            snprintf(process->error, sizeof(process->error), "Unsupported Darwin runtime call: %.180s", thunk->name);
-            return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+        default: snprintf(process->error, sizeof(process->error), "Unsupported Darwin runtime call: %.180s", thunk->name); return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     }
 }
 
@@ -1411,9 +1762,8 @@ int xxemul_darwin_try_step(xxemul_darwin *process, xxemul_step_info *info, xxemu
                 snprintf(process->error, sizeof(process->error), "Modeled dyld rejected guest-restored Mach-O: %s", xxemul_status_string(*status));
             }
         }
-    } else if (pc >= process->base + DARWIN_THUNK_OFFSET &&
-        pc - (process->base + DARWIN_THUNK_OFFSET) < process->thunk_count * 16u &&
-        ((pc - process->base - DARWIN_THUNK_OFFSET) & 15u) == 0) {
+    } else if (pc >= process->base + DARWIN_THUNK_OFFSET && pc - (process->base + DARWIN_THUNK_OFFSET) < process->thunk_count * 16u &&
+               ((pc - process->base - DARWIN_THUNK_OFFSET) & 15u) == 0) {
         index = (unsigned)((pc - process->base - DARWIN_THUNK_OFFSET) / 16u);
         process->error[0] = '\0';
         *status = call_import(process, &process->thunks[index]);
@@ -1436,8 +1786,7 @@ xxemul_status xxemul_darwin_handle_svc(xxemul_darwin *process, uint64_t immediat
     xxemul_arm_state *state;
     xxemul_status status;
     uint64_t number;
-    if (process == NULL || !process->started || (immediate != UINT64_C(0x80) && !(immediate == 0 && process->packed_entry)))
-        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (process == NULL || !process->started || (immediate != UINT64_C(0x80) && !(immediate == 0 && process->packed_entry))) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     state = &process->emulator->arm;
     process->error[0] = '\0';
     /* Native Darwin uses x16/svc #0x80. The recognized UPX stub instead
@@ -1472,8 +1821,8 @@ int xxemul_darwin_exit_code(const xxemul_darwin *process)
 const char *xxemul_darwin_symbol(const xxemul_darwin *process, uint64_t address)
 {
     uint64_t offset;
-    if (address != 0 && process != NULL && process->packed_entry && process->posix != NULL &&
-        address == xxemul_darwin_posix_dyld_entry(process->posix)) return "<Darwin modeled dyld entry>";
+    if (address != 0 && process != NULL && process->packed_entry && process->posix != NULL && address == xxemul_darwin_posix_dyld_entry(process->posix))
+        return "<Darwin modeled dyld entry>";
     if (process == NULL || address < process->base + DARWIN_THUNK_OFFSET) return NULL;
     offset = address - process->base - DARWIN_THUNK_OFFSET;
     if ((offset & 15u) != 0u || offset / 16u >= process->thunk_count) return NULL;

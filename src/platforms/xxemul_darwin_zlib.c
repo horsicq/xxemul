@@ -5,13 +5,11 @@
 
 int xxemul_darwin_zlib_supports(const char *name)
 {
-    static const char *const names[] = {
-        "_crc32", "_deflateInit2_", "_deflate", "_deflateEnd",
-        "_inflateInit2_", "_inflate", "_inflateEnd"
-    };
+    static const char *const names[] = {"_crc32", "_deflateInit2_", "_deflate", "_deflateEnd", "_inflateInit2_", "_inflate", "_inflateEnd"};
     size_t i;
     if (!name) return 0;
-    for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) if (!strcmp(name, names[i])) return 1;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        if (!strcmp(name, names[i])) return 1;
     return 0;
 }
 
@@ -63,9 +61,8 @@ struct xxemul_darwin_zlib {
 
 static int guest_range(const xxemul_darwin_zlib *p, uint64_t address, uint64_t size)
 {
-    return address >= p->emulator->region_address &&
-        address - p->emulator->region_address <= p->emulator->region_size &&
-        size <= p->emulator->region_size - (address - p->emulator->region_address);
+    return address >= p->emulator->region_address && address - p->emulator->region_address <= p->emulator->region_size &&
+           size <= p->emulator->region_size - (address - p->emulator->region_address);
 }
 
 static int load(xxemul_darwin_zlib *p, uint64_t address, unsigned size, uint64_t *value)
@@ -94,8 +91,7 @@ static int message(xxemul_darwin_zlib *p, uint64_t stream, uint64_t destination,
     size_t size = 0;
     if (!text) return store(p, stream + 48u, 8, 0);
     while (size < MESSAGE_SIZE - 1u && text[size]) ++size;
-    if (xxemul_write_memory(p->emulator, destination, text, size) != XXEMUL_STATUS_OK ||
-        !store(p, destination + size, 1, 0)) return 0;
+    if (xxemul_write_memory(p->emulator, destination, text, size) != XXEMUL_STATUS_OK || !store(p, destination + size, 1, 0)) return 0;
     return store(p, stream + 48u, 8, destination);
 }
 
@@ -130,42 +126,55 @@ static void bounded_free(voidpf opaque, voidpf pointer)
     free(allocation);
 }
 
-xxemul_darwin_zlib *xxemul_darwin_zlib_create(xxemul *emulator,
-    xxemul_darwin_zlib_allocate allocate, void *context)
+xxemul_darwin_zlib *xxemul_darwin_zlib_create(xxemul *emulator, xxemul_darwin_zlib_allocate allocate, void *context)
 {
     xxemul_darwin_zlib *p;
     if (!emulator || !allocate) return NULL;
     p = calloc(1, sizeof(*p));
     if (!p) return NULL;
-    p->emulator = emulator; p->allocate = allocate; p->context = context;
+    p->emulator = emulator;
+    p->allocate = allocate;
+    p->context = context;
     p->library = dlopen("/usr/lib/libz.1.dylib", RTLD_LOCAL | RTLD_LAZY);
-    if (!p->library) { free(p); return NULL; }
-#define LOAD(member, name) do { \
-    void *symbol = dlsym(p->library, name); \
-    if (!symbol || sizeof(symbol) != sizeof(p->api.member)) goto failed; \
-    memcpy(&p->api.member, &symbol, sizeof(symbol)); \
-} while (0)
+    if (!p->library) {
+        free(p);
+        return NULL;
+    }
+#define LOAD(member, name)                                                   \
+    do {                                                                     \
+        void *symbol = dlsym(p->library, name);                              \
+        if (!symbol || sizeof(symbol) != sizeof(p->api.member)) goto failed; \
+        memcpy(&p->api.member, &symbol, sizeof(symbol));                     \
+    } while (0)
     LOAD(crc32, "crc32");
-    LOAD(deflate_init, "deflateInit2_"); LOAD(deflate_run, "deflate"); LOAD(deflate_end, "deflateEnd");
-    LOAD(inflate_init, "inflateInit2_"); LOAD(inflate_run, "inflate"); LOAD(inflate_end, "inflateEnd");
+    LOAD(deflate_init, "deflateInit2_");
+    LOAD(deflate_run, "deflate");
+    LOAD(deflate_end, "deflateEnd");
+    LOAD(inflate_init, "inflateInit2_");
+    LOAD(inflate_run, "inflate");
+    LOAD(inflate_end, "inflateEnd");
 #undef LOAD
     p->error_message = allocate(context, MESSAGE_SIZE);
     if (!p->error_message || !guest_range(p, p->error_message, MESSAGE_SIZE)) goto failed;
     return p;
 failed:
-    dlclose(p->library); free(p); return NULL;
+    dlclose(p->library);
+    free(p);
+    return NULL;
 }
 
 void xxemul_darwin_zlib_destroy(xxemul_darwin_zlib *p)
 {
     unsigned i;
     if (!p) return;
-    for (i = 0; i < STREAM_LIMIT; ++i) if (p->streams[i].active) {
-        if (p->streams[i].inflate) p->api.inflate_end(&p->streams[i].native);
-        else p->api.deflate_end(&p->streams[i].native);
-    }
+    for (i = 0; i < STREAM_LIMIT; ++i)
+        if (p->streams[i].active) {
+            if (p->streams[i].inflate) p->api.inflate_end(&p->streams[i].native);
+            else p->api.deflate_end(&p->streams[i].native);
+        }
     while (p->allocations) bounded_free(p, p->allocations + 1);
-    dlclose(p->library); free(p);
+    dlclose(p->library);
+    free(p);
 }
 
 static struct modeled_stream *find_stream(xxemul_darwin_zlib *p, uint64_t address)
@@ -178,13 +187,9 @@ static struct modeled_stream *find_stream(xxemul_darwin_zlib *p, uint64_t addres
 
 static int publish(xxemul_darwin_zlib *p, struct modeled_stream *s, int ended)
 {
-    return store(p, s->address + 16u, 8, s->native.total_in) &&
-        store(p, s->address + 40u, 8, s->native.total_out) &&
-        message(p, s->address, s->message, s->native.msg) &&
-        store(p, s->address + 56u, 8, ended ? 0 : s->token) &&
-        store(p, s->address + 88u, 4, (uint32_t)s->native.data_type) &&
-        store(p, s->address + 96u, 8, s->native.adler) &&
-        store(p, s->address + 104u, 8, s->native.reserved);
+    return store(p, s->address + 16u, 8, s->native.total_in) && store(p, s->address + 40u, 8, s->native.total_out) && message(p, s->address, s->message, s->native.msg) &&
+           store(p, s->address + 56u, 8, ended ? 0 : s->token) && store(p, s->address + 88u, 4, (uint32_t)s->native.data_type) &&
+           store(p, s->address + 96u, 8, s->native.adler) && store(p, s->address + 104u, 8, s->native.reserved);
 }
 
 static int overlaps(uint64_t first, uint64_t first_size, uint64_t second, uint64_t second_size)
@@ -205,10 +210,12 @@ int xxemul_darwin_zlib_dispatch(xxemul_darwin_zlib *p, const char *name, xxemul_
     if (!strcmp(name, "_crc32")) {
         uint64_t buffer = registers->gpr[1];
         uint32_t size = (uint32_t)registers->gpr[2];
-        if (!buffer) { registers->gpr[0] = p->api.crc32(0, Z_NULL, 0); return 1; }
+        if (!buffer) {
+            registers->gpr[0] = p->api.crc32(0, Z_NULL, 0);
+            return 1;
+        }
         if (size > BUFFER_LIMIT || !guest_range(p, buffer, size)) goto bad_pointer;
-        registers->gpr[0] = p->api.crc32((uLong)registers->gpr[0],
-            p->emulator->region_data + (size_t)(buffer - p->emulator->region_address), size) & UINT32_MAX;
+        registers->gpr[0] = p->api.crc32((uLong)registers->gpr[0], p->emulator->region_data + (size_t)(buffer - p->emulator->region_address), size) & UINT32_MAX;
         return 1;
     }
     address = registers->gpr[0];
@@ -222,7 +229,10 @@ int xxemul_darwin_zlib_dispatch(xxemul_darwin_zlib *p, const char *name, xxemul_
         uint64_t version_address = registers->gpr[inflate ? 2u : 6u];
         int stream_size = (int32_t)registers->gpr[inflate ? 3u : 7u];
         unsigned i;
-        if (stream_size != GUEST_STREAM_SIZE) { result = Z_VERSION_ERROR; goto done; }
+        if (stream_size != GUEST_STREAM_SIZE) {
+            result = Z_VERSION_ERROR;
+            goto done;
+        }
         if (s || token) goto done;
         if (allocation || release) {
             if (!message(p, address, p->error_message, "Guest zlib allocation callbacks are unsupported")) goto bad_pointer;
@@ -230,17 +240,29 @@ int xxemul_darwin_zlib_dispatch(xxemul_darwin_zlib *p, const char *name, xxemul_
         }
         version = version_string(p, version_address);
         if (!version) goto bad_pointer;
-        for (i = 0; i < STREAM_LIMIT && p->streams[i].active; ++i) {}
-        if (i == STREAM_LIMIT) { result = Z_MEM_ERROR; goto done; }
-        s = &p->streams[i]; memset(s, 0, sizeof(*s));
-        s->address = address; s->inflate = inflate;
+        for (i = 0; i < STREAM_LIMIT && p->streams[i].active; ++i) {
+        }
+        if (i == STREAM_LIMIT) {
+            result = Z_MEM_ERROR;
+            goto done;
+        }
+        s = &p->streams[i];
+        memset(s, 0, sizeof(*s));
+        s->address = address;
+        s->inflate = inflate;
         s->token = p->allocate(p->context, 16u + MESSAGE_SIZE);
-        if (!s->token || !guest_range(p, s->token, 16u + MESSAGE_SIZE)) { result = Z_MEM_ERROR; goto done; }
+        if (!s->token || !guest_range(p, s->token, 16u + MESSAGE_SIZE)) {
+            result = Z_MEM_ERROR;
+            goto done;
+        }
         s->message = s->token + 16u;
-        s->native.zalloc = bounded_allocate; s->native.zfree = bounded_free; s->native.opaque = p;
+        s->native.zalloc = bounded_allocate;
+        s->native.zfree = bounded_free;
+        s->native.opaque = p;
         if (inflate) result = p->api.inflate_init(&s->native, (int32_t)registers->gpr[1], version, (int)sizeof(s->native));
-        else result = p->api.deflate_init(&s->native, (int32_t)registers->gpr[1], (int32_t)registers->gpr[2],
-            (int32_t)registers->gpr[3], (int32_t)registers->gpr[4], (int32_t)registers->gpr[5], version, (int)sizeof(s->native));
+        else
+            result = p->api.deflate_init(&s->native, (int32_t)registers->gpr[1], (int32_t)registers->gpr[2], (int32_t)registers->gpr[3], (int32_t)registers->gpr[4],
+                                         (int32_t)registers->gpr[5], version, (int)sizeof(s->native));
         s->active = result == Z_OK;
         if (!publish(p, s, !s->active)) goto bad_pointer;
         goto done;
@@ -259,25 +281,25 @@ int xxemul_darwin_zlib_dispatch(xxemul_darwin_zlib *p, const char *name, xxemul_
         uint32_t consumed, produced;
         int flush = (int32_t)registers->gpr[1];
         if (flush < Z_NO_FLUSH || flush > Z_TREES || (!inflate && flush > Z_BLOCK)) goto done;
-        if (!load(p, address, 8, &next_in) || !load(p, address + 8u, 4, &available_in) ||
-            !load(p, address + 24u, 8, &next_out) || !load(p, address + 32u, 4, &available_out)) goto bad_pointer;
-        if (available_in > BUFFER_LIMIT || available_out > BUFFER_LIMIT ||
-            (available_in && !guest_range(p, next_in, available_in)) ||
-            (available_out && !guest_range(p, next_out, available_out))) goto bad_pointer;
-        if (overlaps(next_in, available_in, address, GUEST_STREAM_SIZE) ||
-            overlaps(next_out, available_out, address, GUEST_STREAM_SIZE) ||
-            overlaps(next_in, available_in, next_out, available_out)) goto done;
-        s->native.next_in = next_in && guest_range(p, next_in, available_in) ?
-            p->emulator->region_data + (size_t)(next_in - p->emulator->region_address) : Z_NULL;
-        s->native.next_out = next_out && guest_range(p, next_out, available_out) ?
-            p->emulator->region_data + (size_t)(next_out - p->emulator->region_address) : Z_NULL;
-        s->native.avail_in = (uInt)available_in; s->native.avail_out = (uInt)available_out;
+        if (!load(p, address, 8, &next_in) || !load(p, address + 8u, 4, &available_in) || !load(p, address + 24u, 8, &next_out) ||
+            !load(p, address + 32u, 4, &available_out))
+            goto bad_pointer;
+        if (available_in > BUFFER_LIMIT || available_out > BUFFER_LIMIT || (available_in && !guest_range(p, next_in, available_in)) ||
+            (available_out && !guest_range(p, next_out, available_out)))
+            goto bad_pointer;
+        if (overlaps(next_in, available_in, address, GUEST_STREAM_SIZE) || overlaps(next_out, available_out, address, GUEST_STREAM_SIZE) ||
+            overlaps(next_in, available_in, next_out, available_out))
+            goto done;
+        s->native.next_in = next_in && guest_range(p, next_in, available_in) ? p->emulator->region_data + (size_t)(next_in - p->emulator->region_address) : Z_NULL;
+        s->native.next_out = next_out && guest_range(p, next_out, available_out) ? p->emulator->region_data + (size_t)(next_out - p->emulator->region_address) : Z_NULL;
+        s->native.avail_in = (uInt)available_in;
+        s->native.avail_out = (uInt)available_out;
         result = inflate ? p->api.inflate_run(&s->native, flush) : p->api.deflate_run(&s->native, flush);
         consumed = (uint32_t)available_in - s->native.avail_in;
         produced = (uint32_t)available_out - s->native.avail_out;
-        if (!store(p, address, 8, next_in + consumed) || !store(p, address + 8u, 4, s->native.avail_in) ||
-            !store(p, address + 24u, 8, next_out + produced) || !store(p, address + 32u, 4, s->native.avail_out) ||
-            !publish(p, s, 0)) goto bad_pointer;
+        if (!store(p, address, 8, next_in + consumed) || !store(p, address + 8u, 4, s->native.avail_in) || !store(p, address + 24u, 8, next_out + produced) ||
+            !store(p, address + 32u, 4, s->native.avail_out) || !publish(p, s, 0))
+            goto bad_pointer;
     }
 done:
     registers->gpr[0] = (uint64_t)(int64_t)result;
@@ -291,9 +313,22 @@ bad_pointer:
 #else
 
 xxemul_darwin_zlib *xxemul_darwin_zlib_create(xxemul *e, xxemul_darwin_zlib_allocate a, void *c)
-{ (void)e; (void)a; (void)c; return NULL; }
-void xxemul_darwin_zlib_destroy(xxemul_darwin_zlib *p) { (void)p; }
+{
+    (void)e;
+    (void)a;
+    (void)c;
+    return NULL;
+}
+void xxemul_darwin_zlib_destroy(xxemul_darwin_zlib *p)
+{
+    (void)p;
+}
 int xxemul_darwin_zlib_dispatch(xxemul_darwin_zlib *p, const char *n, xxemul_status *s)
-{ (void)p; (void)n; if (s) *s = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION; return 0; }
+{
+    (void)p;
+    (void)n;
+    if (s) *s = XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    return 0;
+}
 
 #endif

@@ -13,7 +13,9 @@ typedef struct hunk_reader {
     size_t size, pos;
     int failed;
 } hunk_reader;
-typedef struct hunk_segment { uint32_t address, size; } hunk_segment;
+typedef struct hunk_segment {
+    uint32_t address, size;
+} hunk_segment;
 
 static uint32_t read_be(const uint8_t *p)
 {
@@ -21,20 +23,28 @@ static uint32_t read_be(const uint8_t *p)
 }
 static void write_be(uint8_t *p, uint32_t n)
 {
-    p[0] = (uint8_t)(n >> 24); p[1] = (uint8_t)(n >> 16);
-    p[2] = (uint8_t)(n >> 8); p[3] = (uint8_t)n;
+    p[0] = (uint8_t)(n >> 24);
+    p[1] = (uint8_t)(n >> 16);
+    p[2] = (uint8_t)(n >> 8);
+    p[3] = (uint8_t)n;
 }
 static uint32_t take(hunk_reader *r, unsigned n)
 {
     uint32_t value = 0;
     unsigned i;
-    if (n > r->size - r->pos) { r->failed = 1; return 0; }
+    if (n > r->size - r->pos) {
+        r->failed = 1;
+        return 0;
+    }
     for (i = 0; i < n; ++i) value = value << 8 | r->data[r->pos++];
     return value;
 }
 static int skip(hunk_reader *r, uint64_t n)
 {
-    if (n > r->size - r->pos) { r->failed = 1; return 0; }
+    if (n > r->size - r->pos) {
+        r->failed = 1;
+        return 0;
+    }
     r->pos += (size_t)n;
     return 1;
 }
@@ -42,9 +52,7 @@ static int skip(hunk_reader *r, uint64_t n)
 /* RELRELOC32 is documented with longword fields, but AmigaDOS V39+ also
  * reads the compact word form. Validate without applying before choosing a
  * dialect, so a failed longword probe cannot relocate any bytes twice. */
-static int relocations(hunk_reader *r, xxemul *e, const hunk_segment *segments,
-                       uint32_t current, uint32_t first, uint32_t count,
-                       unsigned width, int relative, int apply)
+static int relocations(hunk_reader *r, xxemul *e, const hunk_segment *segments, uint32_t current, uint32_t first, uint32_t count, unsigned width, int relative, int apply)
 {
     uint32_t n, i, target, offset;
     while ((n = take(r, width)) != 0 && !r->failed) {
@@ -68,7 +76,7 @@ static int relocations(hunk_reader *r, xxemul *e, const hunk_segment *segments,
 
 xxemul *xxemul_load_amigahunk(const uint8_t *image, size_t size, uint64_t base, xxemul_status *status)
 {
-    hunk_reader r = { image, size, 0, 0 };
+    hunk_reader r = {image, size, 0, 0};
     hunk_segment *segments = NULL;
     xxemul *e = NULL;
     uint32_t table, first, last, count, i, current = 0;
@@ -76,15 +84,23 @@ xxemul *xxemul_load_amigahunk(const uint8_t *image, size_t size, uint64_t base, 
     int body = 0;
     *status = XXEMUL_STATUS_INVALID_IMAGE;
     if ((take(&r, 4) & 0x3fffffffu) != 0x3f3 || r.failed) goto fail;
-    if (take(&r, 4)) { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; goto fail; }
-    table = take(&r, 4); first = take(&r, 4); last = take(&r, 4);
+    if (take(&r, 4)) {
+        *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+        goto fail;
+    }
+    table = take(&r, 4);
+    first = take(&r, 4);
+    last = take(&r, 4);
     if (r.failed || first > last || last >= table) goto fail;
     count = last - first + 1;
     if (count > (r.size - r.pos) / 4 || count > 65536u) goto fail;
     if (!base) base = 0x200000u;
     if ((base & 3u) || base < 0x20000u || base > HUNK_MAX_REGION - HUNK_RUNTIME) goto fail;
     segments = calloc(count, sizeof(*segments));
-    if (!segments) { *status = XXEMUL_STATUS_OUT_OF_MEMORY; goto fail; }
+    if (!segments) {
+        *status = XXEMUL_STATUS_OUT_OF_MEMORY;
+        goto fail;
+    }
     end = base;
     for (i = 0; i < count; ++i) {
         uint32_t raw = take(&r, 4);
@@ -108,7 +124,10 @@ xxemul *xxemul_load_amigahunk(const uint8_t *image, size_t size, uint64_t base, 
         uint32_t type = take(&r, 4) & 0x3fffffffu;
         uint32_t n;
         if (r.failed) goto fail;
-        if (type == 0x3f5 || type == 0x3f6) { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; goto fail; }
+        if (type == 0x3f5 || type == 0x3f6) {
+            *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+            goto fail;
+        }
         if (type == 0x3e8 || type == 0x3f1) {
             n = take(&r, 4);
             if (!skip(&r, (uint64_t)n * 4)) goto fail;
@@ -120,7 +139,8 @@ xxemul *xxemul_load_amigahunk(const uint8_t *image, size_t size, uint64_t base, 
         else if (type >= 0x3e9 && type <= 0x3eb) {
             uint64_t bytes;
             if (body) goto fail;
-            n = take(&r, 4); bytes = (uint64_t)n * 4;
+            n = take(&r, 4);
+            bytes = (uint64_t)n * 4;
             if (r.failed || bytes > segments[current].size) goto fail;
             if (type != 0x3eb) {
                 size_t pos = r.pos;
@@ -130,14 +150,16 @@ xxemul *xxemul_load_amigahunk(const uint8_t *image, size_t size, uint64_t base, 
             body = 1;
         } else if (type == 0x3f2) {
             if (!body) goto fail;
-            ++current; body = 0;
+            ++current;
+            body = 0;
         } else if (type == 0x3ec || type == 0x3fc || type == 0x3f7 || type == 0x3fd) {
             unsigned width = (type == 0x3fc || type == 0x3f7) ? 2 : 4;
             if (!body) goto fail;
             if (type == 0x3fd) {
                 hunk_reader probe = r;
                 if (!relocations(&probe, e, segments, current, first, count, 4, 1, 0)) {
-                    probe = r; width = 2;
+                    probe = r;
+                    width = 2;
                     if (!relocations(&probe, e, segments, current, first, count, 2, 1, 0)) goto fail;
                 }
             }

@@ -53,8 +53,7 @@ static uint64_t macho_fat_u64(const uint8_t *p, int little)
     return (uint64_t)macho_fat_u32(p + 4, 0) | (uint64_t)macho_fat_u32(p, 0) << 32;
 }
 
-static xxemul_status macho_unixthread(const uint8_t *image, size_t size,
-                                     xxemul_arm_state *state, int *found)
+static xxemul_status macho_unixthread(const uint8_t *image, size_t size, xxemul_arm_state *state, int *found)
 {
     size_t offset = 32u, commands_end;
     uint32_t i, count;
@@ -72,8 +71,8 @@ static xxemul_status macho_unixthread(const uint8_t *image, size_t size,
         length = macho_u32(image + offset + 4u);
         if (length < 8u || !macho_range(commands_end, offset, length)) return XXEMUL_STATUS_INVALID_IMAGE;
         if (command == 5u) { /* LC_UNIXTHREAD / ARM_THREAD_STATE64 */
-            if (*found || macho_u32(image + 4u) != UINT32_C(0x0100000c) || length != 288u ||
-                macho_u32(image + offset + 8u) != 6u || macho_u32(image + offset + 12u) != 68u)
+            if (*found || macho_u32(image + 4u) != UINT32_C(0x0100000c) || length != 288u || macho_u32(image + offset + 8u) != 6u ||
+                macho_u32(image + offset + 12u) != 68u)
                 return XXEMUL_STATUS_UNSUPPORTED_IMAGE;
             for (reg = 0; reg < 31u; ++reg) state->gpr[reg] = macho_u64(image + offset + 16u + reg * 8u);
             state->sp = macho_u64(image + offset + 264u);
@@ -89,8 +88,7 @@ static xxemul_status macho_unixthread(const uint8_t *image, size_t size,
 /* FAT headers contain offsets in the container, whereas every thin slice's
  * load commands use offsets relative to that slice. Select, then parse once
  * through the existing thin path. Never dispatch a guest binary to the host. */
-static int macho_load_fat(xxemul_image_format format, const uint8_t *image, size_t size,
-                          xxemul **result, xxemul_status *status)
+static int macho_load_fat(xxemul_image_format format, const uint8_t *image, size_t size, xxemul **result, xxemul_status *status)
 {
     uint32_t magic, count, i;
     uint64_t best_offset = 0, best_size = 0;
@@ -100,8 +98,7 @@ static int macho_load_fat(xxemul_image_format format, const uint8_t *image, size
     xx_io_device *slice;
     if (size < 4u) return 0;
     magic = macho_fat_u32(image, 0);
-    if (magic != UINT32_C(0xcafebabe) && magic != UINT32_C(0xbebafeca) &&
-        magic != UINT32_C(0xcafebabf) && magic != UINT32_C(0xbfbafeca)) return 0;
+    if (magic != UINT32_C(0xcafebabe) && magic != UINT32_C(0xbebafeca) && magic != UINT32_C(0xcafebabf) && magic != UINT32_C(0xbfbafeca)) return 0;
     *result = NULL;
     *status = XXEMUL_STATUS_INVALID_IMAGE;
     if (size < 8u) return 1;
@@ -116,19 +113,29 @@ static int macho_load_fat(xxemul_image_format format, const uint8_t *image, size
         uint64_t offset = wide ? macho_fat_u64(record + 8u, little) : macho_fat_u32(record + 8u, little);
         uint64_t length = wide ? macho_fat_u64(record + 16u, little) : macho_fat_u32(record + 12u, little);
         uint32_t alignment = macho_fat_u32(record + (wide ? 24u : 16u), little);
-        int rank = cpu == UINT32_C(0x0100000c) ? ((subtype & 0xffffffu) == 2u ? 2 :
-                                                                (subtype & 0xffffffu) == 0u ? 1 : 0) : 0;
-        if (alignment > 63u || !length || offset < 8u + (uint64_t)count * record_size ||
-            (offset & ((UINT64_C(1) << alignment) - 1u)) || !macho_range(size, offset, length) ||
-            (wide && macho_fat_u32(record + 28u, little))) return 1;
-        if (rank > best_rank) { best_rank = rank; best_offset = offset; best_size = length; best_subtype = subtype; }
+        int rank = cpu == UINT32_C(0x0100000c) ? ((subtype & 0xffffffu) == 2u ? 2 : (subtype & 0xffffffu) == 0u ? 1 : 0) : 0;
+        if (alignment > 63u || !length || offset < 8u + (uint64_t)count * record_size || (offset & ((UINT64_C(1) << alignment) - 1u)) ||
+            !macho_range(size, offset, length) || (wide && macho_fat_u32(record + 28u, little)))
+            return 1;
+        if (rank > best_rank) {
+            best_rank = rank;
+            best_offset = offset;
+            best_size = length;
+            best_subtype = subtype;
+        }
     }
-    if (!best_rank || format != XXEMUL_IMAGE_MACHO64) { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; return 1; }
-    if (best_size < 32u || macho_u32(image + (size_t)best_offset) != UINT32_C(0xfeedfacf) ||
-        macho_u32(image + (size_t)best_offset + 4u) != UINT32_C(0x0100000c) ||
-        macho_u32(image + (size_t)best_offset + 8u) != best_subtype) return 1;
+    if (!best_rank || format != XXEMUL_IMAGE_MACHO64) {
+        *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+        return 1;
+    }
+    if (best_size < 32u || macho_u32(image + (size_t)best_offset) != UINT32_C(0xfeedfacf) || macho_u32(image + (size_t)best_offset + 4u) != UINT32_C(0x0100000c) ||
+        macho_u32(image + (size_t)best_offset + 8u) != best_subtype)
+        return 1;
     slice = xx_io_mem_open_ro(image + (size_t)best_offset, (size_t)best_size);
-    if (!slice) { *status = XXEMUL_STATUS_OUT_OF_MEMORY; return 1; }
+    if (!slice) {
+        *status = XXEMUL_STATUS_OUT_OF_MEMORY;
+        return 1;
+    }
     *result = xxemul_load_macho(XXEMUL_IMAGE_MACHO64, image + (size_t)best_offset, (size_t)best_size, slice, status);
     xx_io_close(slice);
     return 1;
@@ -193,13 +200,13 @@ xxemul *xxemul_load_macho(xxemul_image_format format, const uint8_t *image, size
         if (segment_end > end) {
             end = segment_end;
         }
-        if (macho.has_main_entry && segment->file_size != 0u && macho.main_entry_offset >= segment->file_offset && macho.main_entry_offset - segment->file_offset < segment->file_size &&
-            (segment->initial_protection & 4u) != 0u) {
+        if (macho.has_main_entry && segment->file_size != 0u && macho.main_entry_offset >= segment->file_offset &&
+            macho.main_entry_offset - segment->file_offset < segment->file_size && (segment->initial_protection & 4u) != 0u) {
             entry = segment->virtual_address + macho.main_entry_offset - segment->file_offset;
             entry_mapped = 1;
         }
-        if (has_thread && entry >= segment->virtual_address && entry - segment->virtual_address < segment->file_size &&
-            (segment->initial_protection & 4u) != 0u) entry_mapped = 1;
+        if (has_thread && entry >= segment->virtual_address && entry - segment->virtual_address < segment->file_size && (segment->initial_protection & 4u) != 0u)
+            entry_mapped = 1;
     }
     if (base == UINT64_MAX || !entry_mapped) {
         goto done;
@@ -227,8 +234,7 @@ xxemul *xxemul_load_macho(xxemul_image_format format, const uint8_t *image, size
             }
             end = base + XXEMUL_DARWIN_IMAGE_WINDOW_SIZE;
         }
-        if (end > UINT64_MAX - (uint64_t)XXEMUL_DARWIN_ARENA_SIZE -
-                (has_thread ? (uint64_t)XXEMUL_DARWIN_VM_ARENA_SIZE : 0u) - UINT64_C(0xfff)) {
+        if (end > UINT64_MAX - (uint64_t)XXEMUL_DARWIN_ARENA_SIZE - (has_thread ? (uint64_t)XXEMUL_DARWIN_VM_ARENA_SIZE : 0u) - UINT64_C(0xfff)) {
             *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
             goto done;
         }
@@ -296,8 +302,9 @@ xxemul_status xxemul_macho_bind_restored(xxemul *emulator, uint64_t header_addre
     if (emulator->region_address > UINT64_MAX - XXEMUL_DARWIN_IMAGE_WINDOW_SIZE) return status;
     window_end = emulator->region_address + XXEMUL_DARWIN_IMAGE_WINDOW_SIZE;
     if (header_address < emulator->region_address || header_address > window_end - sizeof(header) ||
-        xxemul_read_memory(emulator, header_address, header, sizeof(header)) != XXEMUL_STATUS_OK ||
-        macho_u32(header) != UINT32_C(0xfeedfacf) || macho_u32(header + 4u) != UINT32_C(0x0100000c) || macho_u32(header + 12u) != 2u) return status;
+        xxemul_read_memory(emulator, header_address, header, sizeof(header)) != XXEMUL_STATUS_OK || macho_u32(header) != UINT32_C(0xfeedfacf) ||
+        macho_u32(header + 4u) != UINT32_C(0x0100000c) || macho_u32(header + 12u) != 2u)
+        return status;
     command_size = macho_u32(header + 20u);
     count = macho_u32(header + 16u);
     if (command_size > 1024u * 1024u || command_size > window_end - header_address - sizeof(header) || count > command_size / 8u) return status;
@@ -334,7 +341,10 @@ xxemul_status xxemul_macho_bind_restored(xxemul *emulator, uint64_t header_addre
         slide = -(int64_t)(preferred_base - header_address);
     }
     image = xx_mem_calloc(1, (size_t)file_size);
-    if (!image) { status = XXEMUL_STATUS_OUT_OF_MEMORY; goto done; }
+    if (!image) {
+        status = XXEMUL_STATUS_OUT_OF_MEMORY;
+        goto done;
+    }
     offset = sizeof(header);
     for (i = 0; i < count; ++i) {
         uint32_t length = macho_u32(commands + offset + 4u);
@@ -343,8 +353,9 @@ xxemul_status xxemul_macho_bind_restored(xxemul *emulator, uint64_t header_addre
             uint64_t file_offset = macho_u64(commands + offset + 40u), bytes = macho_u64(commands + offset + 48u);
             int pagezero = !memcmp(commands + offset + 8u, "__PAGEZERO\0", 11u) && !bytes && !macho_u32(commands + offset + 60u);
             if (!pagezero && virtual_size) {
-                if (macho_add_signed(macho_u64(commands + offset + 24u), slide, &address) != XXEMUL_STATUS_OK ||
-                    address < emulator->region_address || address > window_end || virtual_size > window_end - address) goto done;
+                if (macho_add_signed(macho_u64(commands + offset + 24u), slide, &address) != XXEMUL_STATUS_OK || address < emulator->region_address ||
+                    address > window_end || virtual_size > window_end - address)
+                    goto done;
                 if (bytes && xxemul_read_memory(emulator, address, image + (size_t)file_offset, (size_t)bytes) != XXEMUL_STATUS_OK) goto done;
             }
         }
@@ -354,13 +365,19 @@ xxemul_status xxemul_macho_bind_restored(xxemul *emulator, uint64_t header_addre
      * the same restored header, not an overlapping segment's file range. */
     if (memcmp(image, commands, sizeof(header) + command_size)) goto done;
     io = xx_io_mem_open_ro(image, (size_t)file_size);
-    if (!io) { status = XXEMUL_STATUS_OUT_OF_MEMORY; goto done; }
+    if (!io) {
+        status = XXEMUL_STATUS_OUT_OF_MEMORY;
+        goto done;
+    }
     xx_macho_init(&macho, io, 0);
     initialized = 1;
     if (!xx_macho_handle_base_info(&macho.format, NULL) || !macho.has_main_entry || !xx_macho_is_64(&macho)) goto done;
     status = macho_linkedit(image, (size_t)file_size, 1, &linkedit);
     if (status != XXEMUL_STATUS_OK) goto done;
-    if (linkedit.has_old_fixups || linkedit.has_initializers) { status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; goto done; }
+    if (linkedit.has_old_fixups || linkedit.has_initializers) {
+        status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+        goto done;
+    }
     status = XXEMUL_STATUS_INVALID_IMAGE;
     for (i = 0; i < xx_macho_get_number_of_segments(&macho); ++i) {
         const xx_macho_segment *segment = xx_macho_get_segment(&macho, i);

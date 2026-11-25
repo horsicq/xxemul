@@ -18,18 +18,10 @@ uint32_t xxemul_windows_context_all(const xxemul *emulator);
  * requested groups and ContextFlags, preserving other caller-owned bytes.
  * Restore validates all selected groups before committing any CPU state.
  * XSTATE/AVX extensions are outside the modeled architectural state. */
-xxemul_status xxemul_windows_context_validate(const xxemul *emulator,
-                                             const uint8_t *bytes, size_t size);
-xxemul_status xxemul_windows_context_capture(const xxemul *emulator,
-                                            const xxemul_x86_state *override_cpu,
-                                            uint8_t *bytes, size_t size,
-                                            uint32_t flags);
-xxemul_status xxemul_windows_context_capture_arm(const xxemul *emulator,
-                                                const xxemul_arm_state *override_cpu,
-                                                uint8_t *bytes, size_t size,
-                                                uint32_t flags);
-xxemul_status xxemul_windows_context_restore(xxemul *emulator,
-                                            const uint8_t *bytes, size_t size);
+xxemul_status xxemul_windows_context_validate(const xxemul *emulator, const uint8_t *bytes, size_t size);
+xxemul_status xxemul_windows_context_capture(const xxemul *emulator, const xxemul_x86_state *override_cpu, uint8_t *bytes, size_t size, uint32_t flags);
+xxemul_status xxemul_windows_context_capture_arm(const xxemul *emulator, const xxemul_arm_state *override_cpu, uint8_t *bytes, size_t size, uint32_t flags);
+xxemul_status xxemul_windows_context_restore(xxemul *emulator, const uint8_t *bytes, size_t size);
 /* FXSAVE-compatible region, used by CONTEXT and native FX instructions. */
 xxemul_status xxemul_windows_fxsave(const xxemul *emulator, uint8_t bytes[512]);
 xxemul_status xxemul_windows_fxrstor(xxemul *emulator, const uint8_t bytes[512]);

@@ -19,7 +19,8 @@
 
 static void sync_sp(xxemul_m68k_state *r)
 {
-    if (r->sr & S) r->ssp = r->a[7]; else r->usp = r->a[7];
+    if (r->sr & S) r->ssp = r->a[7];
+    else r->usp = r->a[7];
 }
 
 static void set_sr(xxemul_m68k_state *r, uint16_t sr)
@@ -76,8 +77,8 @@ static xxemul_status load(xxemul *e, uint32_t address, unsigned size, uint32_t *
 {
     uint8_t bytes[4];
     unsigned i;
-    if ((size > 1 && (address & 1u)) || (uint64_t)address + size > UINT64_C(0x100000000) ||
-        xxemul_read_memory(e, address, bytes, size) != XXEMUL_STATUS_OK) return fault(e, address, 1);
+    if ((size > 1 && (address & 1u)) || (uint64_t)address + size > UINT64_C(0x100000000) || xxemul_read_memory(e, address, bytes, size) != XXEMUL_STATUS_OK)
+        return fault(e, address, 1);
     *value = 0;
     for (i = 0; i < size; ++i) *value = (*value << 8) | bytes[i];
     if (e->memory_hook && e->in_step) e->memory_hook(e->memory_hook_context, address, size, 0);
@@ -100,8 +101,7 @@ static xxemul_status decode(xxemul *e, cdisasm_m68k_instruction *ins)
     uint8_t bytes[CDISASM_M68K_MAX_LENGTH] = {0};
     uint32_t pc = e->m68k.pc;
     size_t available;
-    if ((pc & 1u) || pc < e->region_address || (uint64_t)pc - e->region_address >= e->region_size)
-        return fault(e, pc, 8);
+    if ((pc & 1u) || pc < e->region_address || (uint64_t)pc - e->region_address >= e->region_size) return fault(e, pc, 8);
     available = e->region_size - (size_t)((uint64_t)pc - e->region_address);
     if (available > sizeof(bytes)) available = sizeof(bytes);
     if (available < 2 || xxemul_read_memory(e, pc, bytes, available) != XXEMUL_STATUS_OK) return fault(e, pc, 8);
@@ -135,7 +135,10 @@ static operand_ref resolve(xxemul_m68k_state *r, const cdisasm_m68k_operand *op,
     switch (op->type) {
         case CDISASM_M68K_OP_DREG: ref.kind = 1; return ref;
         case CDISASM_M68K_OP_AREG: ref.kind = 2; return ref;
-        case CDISASM_M68K_OP_RREG: ref.kind = op->reg < 8 ? 1 : 2; ref.reg &= 7; return ref;
+        case CDISASM_M68K_OP_RREG:
+            ref.kind = op->reg < 8 ? 1 : 2;
+            ref.reg &= 7;
+            return ref;
         case CDISASM_M68K_OP_CCR: ref.kind = 4; return ref;
         case CDISASM_M68K_OP_SR: ref.kind = 5; return ref;
         case CDISASM_M68K_OP_USP: ref.kind = 6; return ref;
@@ -160,13 +163,15 @@ static operand_ref resolve(xxemul_m68k_state *r, const cdisasm_m68k_operand *op,
             ref.address = r->a[op->reg];
             break;
         case CDISASM_M68K_EA_DISP: ref.address = r->a[op->reg] + (uint32_t)op->disp; break;
-        case CDISASM_M68K_EA_INDEX: case CDISASM_M68K_EA_PC_INDEX:
+        case CDISASM_M68K_EA_INDEX:
+        case CDISASM_M68K_EA_PC_INDEX:
             index = op->reg2 < 8 ? r->d[op->reg2] : r->a[op->reg2 - 8];
             if (op->index_size == 2) index = sext(index, 2);
             ref.address = (mode == CDISASM_M68K_EA_INDEX ? r->a[op->reg] : op->ext_address) + (uint32_t)op->disp + index;
             break;
         case CDISASM_M68K_EA_ABS_W: ref.address = sext((uint32_t)op->imm, 2); break;
-        case CDISASM_M68K_EA_ABS_L: case CDISASM_M68K_EA_PC_DISP: ref.address = (uint32_t)op->imm; break;
+        case CDISASM_M68K_EA_ABS_L:
+        case CDISASM_M68K_EA_PC_DISP: ref.address = (uint32_t)op->imm; break;
         default: ref.kind = 0; break;
     }
     return ref;
@@ -220,7 +225,8 @@ static uint32_t arithmetic(xxemul_m68k_state *r, uint32_t dst, uint32_t src, uns
     uint64_t wide;
     uint32_t result;
     int carry, overflow;
-    dst &= mask; src &= mask;
+    dst &= mask;
+    src &= mask;
     wide = sub ? (uint64_t)dst - src - carry_in : (uint64_t)dst + src + carry_in;
     result = (uint32_t)wide & mask;
     carry = sub ? (uint64_t)src + carry_in > dst : wide > mask;
@@ -237,14 +243,22 @@ static int condition(uint16_t sr, unsigned cc)
 {
     int c = !!(sr & C), z = !!(sr & Z), n = !!(sr & N), v = !!(sr & V);
     switch (cc) {
-        case 0: return 1; case 1: return 0;
-        case 2: return !c && !z; case 3: return c || z;
-        case 4: return !c; case 5: return c;
-        case 6: return !z; case 7: return z;
-        case 8: return !v; case 9: return v;
-        case 10: return !n; case 11: return n;
-        case 12: return n == v; case 13: return n != v;
-        case 14: return !z && n == v; default: return z || n != v;
+        case 0: return 1;
+        case 1: return 0;
+        case 2: return !c && !z;
+        case 3: return c || z;
+        case 4: return !c;
+        case 5: return c;
+        case 6: return !z;
+        case 7: return z;
+        case 8: return !v;
+        case 9: return v;
+        case 10: return !n;
+        case 11: return n;
+        case 12: return n == v;
+        case 13: return n != v;
+        case 14: return !z && n == v;
+        default: return z || n != v;
     }
 }
 
@@ -269,8 +283,7 @@ static xxemul_status exception(xxemul *e, unsigned vector, uint16_t opcode, uint
     uint32_t access_address = (uint32_t)e->fault_address;
     unsigned access = e->fault_access;
     uint8_t bytes[4];
-    xxemul_status fallback = vector == 4 ? XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION :
-        vector == 3 ? XXEMUL_STATUS_ADDRESS_FAULT : XXEMUL_STATUS_HALTED;
+    xxemul_status fallback = vector == 4 ? XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION : vector == 3 ? XXEMUL_STATUS_ADDRESS_FAULT : XXEMUL_STATUS_HALTED;
     e->m68k_exception_vector = vector;
     e->m68k_exception_opcode = opcode;
     /* An absent table/zero vector is a host-visible stop, not a recursive
@@ -285,14 +298,13 @@ static xxemul_status exception(xxemul *e, unsigned vector, uint16_t opcode, uint
         /* PRM B-2: SSW, access address, IR, SR, PC (seven words). */
         /* I/N is zero while processing an instruction (including its
          * data cycles); function code distinguishes data from program. */
-        uint16_t ssw = (uint16_t)((access == 2 ? 0 : 16) |
-            (old_sr & S ? 4 : 0) | (access == 8 ? 2 : 1));
-        if (store_value(e, sp, 2, ssw) != XXEMUL_STATUS_OK ||
-            store_value(e, sp + 2, 4, access_address) != XXEMUL_STATUS_OK ||
-            store_value(e, sp + 6, 2, opcode) != XXEMUL_STATUS_OK) goto double_fault;
+        uint16_t ssw = (uint16_t)((access == 2 ? 0 : 16) | (old_sr & S ? 4 : 0) | (access == 8 ? 2 : 1));
+        if (store_value(e, sp, 2, ssw) != XXEMUL_STATUS_OK || store_value(e, sp + 2, 4, access_address) != XXEMUL_STATUS_OK ||
+            store_value(e, sp + 6, 2, opcode) != XXEMUL_STATUS_OK)
+            goto double_fault;
     }
-    if (store_value(e, sp + (vector == 3 ? 8u : 0u), 2, old_sr) != XXEMUL_STATUS_OK ||
-        store_value(e, sp + (vector == 3 ? 10u : 2u), 4, saved_pc) != XXEMUL_STATUS_OK) goto double_fault;
+    if (store_value(e, sp + (vector == 3 ? 8u : 0u), 2, old_sr) != XXEMUL_STATUS_OK || store_value(e, sp + (vector == 3 ? 10u : 2u), 4, saved_pc) != XXEMUL_STATUS_OK)
+        goto double_fault;
     r->a[7] = sp;
     r->pc = target;
     sync_sp(r);
@@ -330,7 +342,8 @@ static uint32_t shift_value(xxemul_m68k_state *r, uint32_t value, unsigned size,
 static uint32_t decimal(xxemul_m68k_state *r, uint32_t dst, uint32_t src, int sub)
 {
     int x = !!(r->sr & X), carry, result;
-    dst &= 255u; src &= 255u;
+    dst &= 255u;
+    src &= 255u;
     if (sub) {
         result = (int)dst - (int)src - x;
         if ((int)(dst & 15u) - (int)(src & 15u) - x < 0) result -= 6;
@@ -358,15 +371,29 @@ static xxemul_status execute(xxemul *e, const cdisasm_m68k_instruction *ins, uin
     uint32_t a = 0, b = 0, result = 0;
     xxemul_status status;
 #define IS(s) (!strcmp(name, (s)))
-#define TRY(call) do { status = (call); if (status != XXEMUL_STATUS_OK) return status; } while (0)
-#define SOURCE(i, n) do { src = resolve(r, &ops[i], (n), 1); TRY(read_ref(e, src, &a)); } while (0)
-#define DEST(i, n) do { dst = resolve(r, &ops[i], (n), 1); TRY(read_ref(e, dst, &b)); } while (0)
+#define TRY(call)                                      \
+    do {                                               \
+        status = (call);                               \
+        if (status != XXEMUL_STATUS_OK) return status; \
+    } while (0)
+#define SOURCE(i, n)                       \
+    do {                                   \
+        src = resolve(r, &ops[i], (n), 1); \
+        TRY(read_ref(e, src, &a));         \
+    } while (0)
+#define DEST(i, n)                         \
+    do {                                   \
+        dst = resolve(r, &ops[i], (n), 1); \
+        TRY(read_ref(e, dst, &b));         \
+    } while (0)
 #define WRITE(v) TRY(write_ref(e, dst, (v)))
-    if ((ins->flags & CDISASM_M68K_FLAG_PRIVILEGED) && !(r->sr & S))
-        return exception(e, 8, ins->opcode, r->pc);
+    if ((ins->flags & CDISASM_M68K_FLAG_PRIVILEGED) && !(r->sr & S)) return exception(e, 8, ins->opcode, r->pc);
     if (IS("nop") || IS("reset")) return XXEMUL_STATUS_OK;
     if (IS("illegal")) {
-        if (e->debug_traps) { r->pc = *next; return XXEMUL_STATUS_BREAKPOINT; }
+        if (e->debug_traps) {
+            r->pc = *next;
+            return XXEMUL_STATUS_BREAKPOINT;
+        }
         return exception(e, 4, ins->opcode, r->pc);
     }
     if (IS("trap")) return exception(e, 32u + (opcode & 15u), ins->opcode, *next);
@@ -444,7 +471,8 @@ static xxemul_status execute(xxemul *e, const cdisasm_m68k_instruction *ins, uin
             if (from_memory) {
                 TRY(load(e, a, size, &b));
                 if (size == 2) b = sext(b, 2);
-                if (reg < 8) r->d[reg] = b; else r->a[reg - 8] = b;
+                if (reg < 8) r->d[reg] = b;
+                else r->a[reg - 8] = b;
             } else TRY(store_value(e, a, size, original[reg]));
             if (!predec) a += size;
         }
@@ -457,8 +485,10 @@ static xxemul_status execute(xxemul *e, const cdisasm_m68k_instruction *ins, uin
         unsigned reg = ops[from_memory ? 1 : 0].reg, i;
         a = r->a[mem->reg] + (uint32_t)mem->disp;
         for (i = 0; i < size; ++i) {
-            if (from_memory) { TRY(load(e, a + i * 2u, 1, &b)); result = (result << 8) | b; }
-            else TRY(store_value(e, a + i * 2u, 1, r->d[reg] >> ((size - 1u - i) * 8u)));
+            if (from_memory) {
+                TRY(load(e, a + i * 2u, 1, &b));
+                result = (result << 8) | b;
+            } else TRY(store_value(e, a + i * 2u, 1, r->d[reg] >> ((size - 1u - i) * 8u)));
         }
         if (from_memory) r->d[reg] = (r->d[reg] & ~mask_for(size)) | result;
         return XXEMUL_STATUS_OK;
@@ -467,23 +497,26 @@ static xxemul_status execute(xxemul *e, const cdisasm_m68k_instruction *ins, uin
         SOURCE(0, size);
         dst = resolve(r, &ops[1], size, 1);
         WRITE(a);
-        if (IS("moveq") || (IS("move") && src.kind != 4 && src.kind != 5 && src.kind != 6 && dst.kind < 4))
-            logic_flags(r, a, size);
+        if (IS("moveq") || (IS("move") && src.kind != 4 && src.kind != 5 && src.kind != 6 && dst.kind < 4)) logic_flags(r, a, size);
         return XXEMUL_STATUS_OK;
     }
     if (IS("exg")) {
-        SOURCE(0, 4); DEST(1, 4);
-        WRITE(a); TRY(write_ref(e, src, b));
+        SOURCE(0, 4);
+        DEST(1, 4);
+        WRITE(a);
+        TRY(write_ref(e, src, b));
         return XXEMUL_STATUS_OK;
     }
     if (IS("swap") || IS("ext")) {
         DEST(0, IS("swap") ? 4 : size);
         result = IS("swap") ? (b << 16) | (b >> 16) : sext(b, size == 2 ? 1 : 2);
-        WRITE(result); logic_flags(r, result, dst.size);
+        WRITE(result);
+        logic_flags(r, result, dst.size);
         return XXEMUL_STATUS_OK;
     }
     if (IS("btst") || IS("bchg") || IS("bclr") || IS("bset")) {
-        SOURCE(0, 4); DEST(1, size);
+        SOURCE(0, 4);
+        DEST(1, size);
         a = UINT32_C(1) << (a % (size == 4 ? 32u : 8u));
         r->sr = (uint16_t)((r->sr & ~Z) | (b & a ? 0 : Z));
         if (IS("bchg")) WRITE(b ^ a);
@@ -494,34 +527,47 @@ static xxemul_status execute(xxemul *e, const cdisasm_m68k_instruction *ins, uin
     if ((opcode & 0xf000u) == 0xe000u) {
         unsigned type, shifts;
         int left = !!(opcode & 0x100u);
-        if (count == 1) { DEST(0, 2); type = (opcode >> 9) & 3u; shifts = 1; }
-        else { SOURCE(0, 4); shifts = a & 63u; DEST(1, size); type = (opcode >> 3) & 3u; }
+        if (count == 1) {
+            DEST(0, 2);
+            type = (opcode >> 9) & 3u;
+            shifts = 1;
+        } else {
+            SOURCE(0, 4);
+            shifts = a & 63u;
+            DEST(1, size);
+            type = (opcode >> 3) & 3u;
+        }
         result = shift_value(r, b, dst.size, shifts, type, left);
         WRITE(result);
         return XXEMUL_STATUS_OK;
     }
     if (IS("mulu") || IS("muls") || IS("divu") || IS("divs")) {
-        SOURCE(0, 2); DEST(1, 4);
+        SOURCE(0, 2);
+        DEST(1, 4);
         if (IS("mulu") || IS("muls")) {
             result = IS("mulu") ? a * (b & 0xffffu) : (uint32_t)((int32_t)(int16_t)a * (int32_t)(int16_t)b);
-            WRITE(result); logic_flags(r, result, 4);
+            WRITE(result);
+            logic_flags(r, result, 4);
         } else {
             int64_t dividend = IS("divs") ? (int32_t)b : (int64_t)b;
             int64_t divisor = IS("divs") ? (int16_t)a : (int64_t)a;
             int64_t quotient, remainder;
             if (!divisor) return exception(e, 5, ins->opcode, *next);
-            quotient = dividend / divisor; remainder = dividend % divisor;
+            quotient = dividend / divisor;
+            remainder = dividend % divisor;
             r->sr &= (uint16_t)~C;
             if (IS("divs") ? quotient < -32768 || quotient > 32767 : quotient > 65535) r->sr |= V;
             else {
                 result = ((uint32_t)remainder << 16) | ((uint32_t)quotient & 0xffffu);
-                WRITE(result); logic_flags(r, (uint32_t)quotient, 2);
+                WRITE(result);
+                logic_flags(r, (uint32_t)quotient, 2);
             }
         }
         return XXEMUL_STATUS_OK;
     }
     if (IS("chk")) {
-        SOURCE(0, 2); DEST(1, 2);
+        SOURCE(0, 2);
+        DEST(1, 2);
         if ((int16_t)b < 0 || (int16_t)b > (int16_t)a) {
             r->sr = (uint16_t)((r->sr & ~N) | ((int16_t)b < 0 ? N : 0));
             return exception(e, 6, ins->opcode, *next);
@@ -529,8 +575,14 @@ static xxemul_status execute(xxemul *e, const cdisasm_m68k_instruction *ins, uin
         return XXEMUL_STATUS_OK;
     }
     if (IS("abcd") || IS("sbcd") || IS("nbcd")) {
-        if (count == 2) { SOURCE(0, 1); DEST(1, 1); }
-        else { DEST(0, 1); a = b; b = 0; }
+        if (count == 2) {
+            SOURCE(0, 1);
+            DEST(1, 1);
+        } else {
+            DEST(0, 1);
+            a = b;
+            b = 0;
+        }
         result = decimal(r, b, a, !IS("abcd"));
         WRITE(result);
         return XXEMUL_STATUS_OK;
@@ -539,21 +591,23 @@ static xxemul_status execute(xxemul *e, const cdisasm_m68k_instruction *ins, uin
         /* MC68000 CLR performs a read bus cycle even though it discards data. */
         DEST(0, size);
         if (IS("neg") || IS("negx")) result = arithmetic(r, 0, b, size, 1, IS("negx"), 0);
-        else { result = IS("clr") ? 0 : IS("not") ? ~b : b; logic_flags(r, result, size); }
+        else {
+            result = IS("clr") ? 0 : IS("not") ? ~b : b;
+            logic_flags(r, result, size);
+        }
         if (IS("tas")) result |= 128u;
         if (!IS("tst")) WRITE(result);
         return XXEMUL_STATUS_OK;
     }
     if (IS("adda") || IS("suba") || IS("cmpa")) {
-        SOURCE(0, size); DEST(1, 4);
+        SOURCE(0, size);
+        DEST(1, 4);
         if (size == 2) a = sext(a, 2);
         if (IS("cmpa")) (void)arithmetic(r, b, a, 4, 1, 0, 1);
         else WRITE(IS("adda") ? b + a : b - a);
         return XXEMUL_STATUS_OK;
     }
-    if (IS("add") || IS("addi") || IS("addq") || IS("addx") ||
-        IS("sub") || IS("subi") || IS("subq") || IS("subx") ||
-        IS("cmp") || IS("cmpi") || IS("cmpm")) {
+    if (IS("add") || IS("addi") || IS("addq") || IS("addx") || IS("sub") || IS("subi") || IS("subq") || IS("subx") || IS("cmp") || IS("cmpi") || IS("cmpm")) {
         int compare = name[0] == 'c', sub = name[0] != 'a', extended = IS("addx") || IS("subx");
         SOURCE(0, size);
         dst = resolve(r, &ops[1], size, 1);
@@ -564,7 +618,8 @@ static xxemul_status execute(xxemul *e, const cdisasm_m68k_instruction *ins, uin
         return XXEMUL_STATUS_OK;
     }
     if (IS("and") || IS("andi") || IS("or") || IS("ori") || IS("eor") || IS("eori")) {
-        SOURCE(0, size); DEST(1, size);
+        SOURCE(0, size);
+        DEST(1, size);
         result = name[0] == 'a' ? b & a : name[0] == 'o' ? b | a : b ^ a;
         WRITE(result);
         if (dst.kind < 4) logic_flags(r, result, size);
@@ -590,7 +645,11 @@ xxemul_status xxemul_m68k_step(xxemul *e, xxemul_step_info *info)
     memset(&ins, 0, sizeof(ins));
     status = decode(e, &ins);
     next = pc + ins.length;
-    if (info) { info->address = pc; info->size = ins.length; info->instruction_id = ins.name_id; }
+    if (info) {
+        info->address = pc;
+        info->size = ins.length;
+        info->instruction_id = ins.name_id;
+    }
     if (status == XXEMUL_STATUS_ADDRESS_FAULT) {
         fault_pc = (uint32_t)e->fault_address;
         goto address_error;
@@ -599,8 +658,7 @@ xxemul_status xxemul_m68k_step(xxemul *e, xxemul_step_info *info)
     if ((ins.opcode & 0xf000u) == 0xa000u) trap_vector = 10;
     else if ((ins.opcode & 0xf000u) == 0xf000u) trap_vector = 11;
     else if ((ins.opcode & 0xfff0u) == 0x4e40u) trap_vector = 32u + (ins.opcode & 15u);
-    if (trap_vector && e->m68k_trap_hook &&
-        e->m68k_trap_hook(e, trap_vector, ins.opcode, e->m68k_trap_context) == XXEMUL_STATUS_OK) {
+    if (trap_vector && e->m68k_trap_hook && e->m68k_trap_hook(e, trap_vector, ins.opcode, e->m68k_trap_context) == XXEMUL_STATUS_OK) {
         if (e->m68k.pc == pc) e->m68k.pc = next;
         status = XXEMUL_STATUS_OK;
         goto completed;
@@ -618,10 +676,9 @@ completed:
     /* Trace follows a completed STOP or group-2 instruction trap, but not
      * an illegal instruction, privilege violation or aborted bus access.
      * A TRAP with T set therefore creates two ordinary exception frames. */
-    if ((initial_sr & T) &&
-        (status == XXEMUL_STATUS_OK || (status == XXEMUL_STATUS_HALTED && ins.opcode == 0x4e72 && !e->m68k_exception_vector)) &&
-        (!e->m68k_exception_vector || e->m68k_exception_vector == 5 || e->m68k_exception_vector == 6 ||
-         e->m68k_exception_vector == 7 || e->m68k_exception_vector >= 32)) {
+    if ((initial_sr & T) && (status == XXEMUL_STATUS_OK || (status == XXEMUL_STATUS_HALTED && ins.opcode == 0x4e72 && !e->m68k_exception_vector)) &&
+        (!e->m68k_exception_vector || e->m68k_exception_vector == 5 || e->m68k_exception_vector == 6 || e->m68k_exception_vector == 7 ||
+         e->m68k_exception_vector >= 32)) {
         e->halted = 0;
         status = exception(e, 9, ins.opcode, e->m68k.pc);
     }

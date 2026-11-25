@@ -32,7 +32,7 @@ uint64_t xxemul_windows_teb_address(const xxemul_windows *process);
 uint32_t xxemul_windows_exit_code(const xxemul_windows *process);
 /* Guest access policy; debugger/loader reads remain privileged. access is
  * Windows AV parameter 0(read),1(write),8(execute). */
-int xxemul_windows_memory_access(xxemul_windows *,uint64_t,uint64_t,unsigned,int);
+int xxemul_windows_memory_access(xxemul_windows *, uint64_t, uint64_t, unsigned, int);
 
 /* Bounded scalar calls into the same guest Windows process. Widths describe
  * argument values, not host C types: x86 lays out 4/8-byte stack values;
@@ -51,9 +51,9 @@ typedef struct xxemul_windows_native_call {
     const char *entry; /* Exact export name, or #decimal ordinal. */
     const uint64_t *arguments;
     const uint8_t *argument_widths; /* 4 or 8 for every argument. */
-    size_t argument_count; /* At most 16. */
+    size_t argument_count;          /* At most 16. */
     uint32_t convention;
-    uint8_t return_width; /* 0=void, 4=EAX, 8=RAX or x86 EDX:EAX. */
+    uint8_t return_width;       /* 0=void, 4=EAX, 8=RAX or x86 EDX:EAX. */
     uint64_t instruction_limit; /* Shared by loading, initialization and call. */
 } xxemul_windows_native_call;
 typedef struct xxemul_windows_native_result {
@@ -68,8 +68,7 @@ typedef struct xxemul_windows_native_result {
  * execution makes subsequent calls fail closed. Loader/bridge reentry fails.
  * Native callbacks execute guest instructions; reverse managed callbacks and
  * non-scalar marshalling are not provided by this service. */
-xxemul_status xxemul_windows_invoke_native(xxemul_windows *process, const xxemul_windows_native_call *call,
-                                          xxemul_windows_native_result *result);
+xxemul_status xxemul_windows_invoke_native(xxemul_windows *process, const xxemul_windows_native_call *call, xxemul_windows_native_result *result);
 xxemul_status xxemul_windows_post_input(xxemul_windows *process, uint64_t window, uint32_t message, uint64_t wparam, uint64_t lparam);
 /* Returns a borrowed import name when address is a synthetic API thunk. */
 const char *xxemul_windows_thunk_name(const xxemul *emulator, uint64_t address);

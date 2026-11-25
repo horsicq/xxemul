@@ -16,10 +16,9 @@ typedef void (*xxemul_dotnet_bcl_output_callback)(void *context, unsigned stream
  * each native instruction, and return its typed result/actual LastError. It
  * must never execute a host DLL or implicitly accept an unsupported import.
  * Arguments and method metadata are borrowed for the duration of the call. */
-typedef xxemul_status (*xxemul_dotnet_bcl_pinvoke_callback)(void *context, xxemul_dotnet_vm *vm,
-    const xxemul_dotnet_method_info *method, const xxemul_dotnet_value *arguments,
-    size_t argument_count, xxemul_dotnet_value *result, uint32_t *last_error,
-    uint64_t *remaining_budget);
+typedef xxemul_status (*xxemul_dotnet_bcl_pinvoke_callback)(void *context, xxemul_dotnet_vm *vm, const xxemul_dotnet_method_info *method,
+                                                            const xxemul_dotnet_value *arguments, size_t argument_count, xxemul_dotnet_value *result,
+                                                            uint32_t *last_error, uint64_t *remaining_budget);
 
 /** Explicit compatibility implementation of SharpZipLib's public decompression
  * stream interface. It uses xxfclib's checked zlib decoder; it never extracts a
@@ -60,8 +59,8 @@ XXEMUL_API void xxemul_dotnet_bcl_host_destroy(xxemul_dotnet_bcl_host *host);
  * Without a provider, P/Invoke remains explicitly unsupported. SetLastError
  * declarations retain the actual returned native error for Marshal's getter;
  * unflagged calls preserve the last captured error (Framework-style policy). */
-XXEMUL_API xxemul_status xxemul_dotnet_bcl_set_pinvoke_callback(xxemul_dotnet_bcl_host *host,
-    xxemul_dotnet_bcl_pinvoke_callback callback, void *context, uint64_t max_native_instructions);
+XXEMUL_API xxemul_status xxemul_dotnet_bcl_set_pinvoke_callback(xxemul_dotnet_bcl_host *host, xxemul_dotnet_bcl_pinvoke_callback callback, void *context,
+                                                                uint64_t max_native_instructions);
 /** Execute the actual CLI entry with a real System.String[] vector. The
  * borrowed root program must outlive host. Assembly.Load creates bounded
  * parsed child programs and reflection invokes their real CIL. Unknown

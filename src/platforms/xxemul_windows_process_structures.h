@@ -3,8 +3,7 @@
 
 #include "xxemul_windows_unwind64.h"
 
-typedef int (*xxemul_windows_process_write)(void *context, uint64_t address,
-                                           const void *bytes, size_t size);
+typedef int (*xxemul_windows_process_write)(void *context, uint64_t address, const void *bytes, size_t size);
 typedef struct xxemul_windows_process_memory {
     xxemul_windows_unwind64_read read;
     xxemul_windows_process_write write;
@@ -64,36 +63,18 @@ typedef struct xxemul_windows_thread_description {
 /* Initialization writes only declared fields and preserves pre-existing
  * loader lists/Unicode payloads. A reserved TEB is cleared only on creation.
  * Synchronizers never overwrite the guest's exception registration chain. */
-xxemul_status xxemul_windows_process_initialize(
-    const xxemul_windows_process_memory *memory,
-    const xxemul_windows_process_description *description);
-xxemul_status xxemul_windows_process_initialize_heap(
-    const xxemul_windows_process_memory *memory, int is64, uint64_t heap,
-    uint64_t heap_start, uint64_t heap_limit, uint32_t flags, uint32_t force_flags);
-xxemul_status xxemul_windows_thread_initialize(
-    const xxemul_windows_process_memory *memory,
-    const xxemul_windows_thread_description *description);
-xxemul_status xxemul_windows_process_update_parameters(
-    const xxemul_windows_process_memory *memory,
-    const xxemul_windows_process_description *description);
-xxemul_status xxemul_windows_process_update_heaps(
-    const xxemul_windows_process_memory *memory,
-    const xxemul_windows_process_description *description);
-xxemul_status xxemul_windows_process_update_tls_bitmap(
-    const xxemul_windows_process_memory *memory,
-    const xxemul_windows_process_description *description,
-    const uint32_t *allocated_bits, uint32_t allocated_dwords);
-xxemul_status xxemul_windows_thread_update_tls(
-    const xxemul_windows_process_memory *memory,
-    const xxemul_windows_thread_description *description);
-xxemul_status xxemul_windows_thread_update_errors(
-    const xxemul_windows_process_memory *memory, int is64, uint64_t teb,
-    uint32_t last_error, uint32_t last_status);
-xxemul_status xxemul_windows_process_validate_heap(
-    const xxemul_windows_process_memory *memory,
-    const xxemul_windows_process_description *description, int *valid);
-xxemul_status xxemul_windows_process_update_exception_flags(
-    const xxemul_windows_process_memory *memory, int is64, uint64_t peb,
-    int initializing, int using_veh, int using_vch);
+xxemul_status xxemul_windows_process_initialize(const xxemul_windows_process_memory *memory, const xxemul_windows_process_description *description);
+xxemul_status xxemul_windows_process_initialize_heap(const xxemul_windows_process_memory *memory, int is64, uint64_t heap, uint64_t heap_start, uint64_t heap_limit,
+                                                     uint32_t flags, uint32_t force_flags);
+xxemul_status xxemul_windows_thread_initialize(const xxemul_windows_process_memory *memory, const xxemul_windows_thread_description *description);
+xxemul_status xxemul_windows_process_update_parameters(const xxemul_windows_process_memory *memory, const xxemul_windows_process_description *description);
+xxemul_status xxemul_windows_process_update_heaps(const xxemul_windows_process_memory *memory, const xxemul_windows_process_description *description);
+xxemul_status xxemul_windows_process_update_tls_bitmap(const xxemul_windows_process_memory *memory, const xxemul_windows_process_description *description,
+                                                       const uint32_t *allocated_bits, uint32_t allocated_dwords);
+xxemul_status xxemul_windows_thread_update_tls(const xxemul_windows_process_memory *memory, const xxemul_windows_thread_description *description);
+xxemul_status xxemul_windows_thread_update_errors(const xxemul_windows_process_memory *memory, int is64, uint64_t teb, uint32_t last_error, uint32_t last_status);
+xxemul_status xxemul_windows_process_validate_heap(const xxemul_windows_process_memory *memory, const xxemul_windows_process_description *description, int *valid);
+xxemul_status xxemul_windows_process_update_exception_flags(const xxemul_windows_process_memory *memory, int is64, uint64_t peb, int initializing, int using_veh,
+                                                            int using_vch);
 
 #endif

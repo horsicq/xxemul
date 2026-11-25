@@ -8,8 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
-static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t *image, size_t image_size,
-                                      uint64_t image_base, xxemul_status *status);
+static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t *image, size_t image_size, uint64_t image_base, xxemul_status *status);
 
 static int xxemul_elf_machine_mode(uint16_t machine, xxemul_image_format format, uint64_t *entry, xxemul_arch *arch, xxemul_mode *mode)
 {
@@ -60,10 +59,8 @@ xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t
     /* Runtime loading of ET_DYN is governed by its program/dynamic tables.
      * Packed objects can retain an out-of-file section table that the full
      * format parser rejects, although DT_HASH bounds all required symbols. */
-    if (image_size >= 20u && !memcmp(image, "\177ELF", 4) &&
-        image[4] == (format == XXEMUL_IMAGE_ELF64 ? 2u : 1u) &&
-        ((image[5] == 1u && image[16] == 3u && image[17] == 0u) ||
-         (image[5] == 2u && image[16] == 0u && image[17] == 3u))) {
+    if (image_size >= 20u && !memcmp(image, "\177ELF", 4) && image[4] == (format == XXEMUL_IMAGE_ELF64 ? 2u : 1u) &&
+        ((image[5] == 1u && image[16] == 3u && image[17] == 0u) || (image[5] == 2u && image[16] == 0u && image[17] == 3u))) {
         emulator = xxemul_load_elf_primary(format, image, image_size, image_base, status);
         goto done;
     }
@@ -78,8 +75,7 @@ xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         goto done;
     }
-    if (xx_elf_get_type(&elf) != XX_ELF_TYPE_EXEC ||
-        (elf.data_encoding != XX_ELF_DATA_LSB && elf.data_encoding != XX_ELF_DATA_MSB)) {
+    if (xx_elf_get_type(&elf) != XX_ELF_TYPE_EXEC || (elf.data_encoding != XX_ELF_DATA_LSB && elf.data_encoding != XX_ELF_DATA_MSB)) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         goto done;
     }
@@ -94,23 +90,19 @@ xxemul *xxemul_load_elf(xxemul_image_format format, const uint8_t *image, size_t
         uint32_t flags, isa, abi;
         int big = elf.data_encoding == XX_ELF_DATA_MSB;
         if (image_size < 52u) goto done;
-        flags = big ? ((uint32_t)image[36] << 24) | ((uint32_t)image[37] << 16) |
-                      ((uint32_t)image[38] << 8) | image[39]
-                    : image[36] | ((uint32_t)image[37] << 8) |
-                      ((uint32_t)image[38] << 16) | ((uint32_t)image[39] << 24);
+        flags = big ? ((uint32_t)image[36] << 24) | ((uint32_t)image[37] << 16) | ((uint32_t)image[38] << 8) | image[39]
+                    : image[36] | ((uint32_t)image[37] << 8) | ((uint32_t)image[38] << 16) | ((uint32_t)image[39] << 24);
         isa = flags & 0xf0000000u;
         abi = flags & 0x0000f000u;
         /* Standard MIPS I/II or MIPS32/r2, o32 only. Compressed encodings,
          * n32/n64 and release6 have different execution/ABI semantics. */
-        if ((flags & 0x06000020u) || (abi && abi != 0x1000u) ||
-            (isa != 0u && isa != 0x10000000u && isa != 0x50000000u && isa != 0x70000000u)) {
+        if ((flags & 0x06000020u) || (abi && abi != 0x1000u) || (isa != 0u && isa != 0x10000000u && isa != 0x50000000u && isa != 0x70000000u)) {
             *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
             goto done;
         }
         arch = XXEMUL_ARCH_MIPS;
         mode = big ? XXEMUL_MODE_MIPS32_BE : XXEMUL_MODE_MIPS32;
-    } else if (elf.data_encoding != XX_ELF_DATA_LSB ||
-               !xxemul_elf_machine_mode(xx_elf_get_machine(&elf), format, &entry, &arch, &mode)) {
+    } else if (elf.data_encoding != XX_ELF_DATA_LSB || !xxemul_elf_machine_mode(xx_elf_get_machine(&elf), format, &entry, &arch, &mode)) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         goto done;
     }
@@ -252,9 +244,7 @@ static int shared_mips_flags_valid(uint32_t flags, unsigned width)
     uint32_t isa = flags & UINT32_C(0xf0000000), abi = flags & UINT32_C(0x0000f000);
     /* Standard fixed-width MIPS I/II or MIPS32/r2, o32. Compressed ASEs,
      * n32/on32, the old FP64 ABI and other register-width profiles differ. */
-    if (width == 8u)
-        return !(flags & UINT32_C(0x0f000260)) && !abi &&
-               (isa == UINT32_C(0x60000000) || isa == UINT32_C(0x80000000));
+    if (width == 8u) return !(flags & UINT32_C(0x0f000260)) && !abi && (isa == UINT32_C(0x60000000) || isa == UINT32_C(0x80000000));
     return !(flags & UINT32_C(0x0f000260)) && (!abi || abi == UINT32_C(0x1000)) &&
            (!isa || isa == UINT32_C(0x10000000) || isa == UINT32_C(0x50000000) || isa == UINT32_C(0x70000000));
 }
@@ -349,10 +339,8 @@ static int shared_headers(shared_input *input, uint64_t *dynamic_address, uint64
     if (module->info.machine == 8u) {
         if (!shared_mips_flags_valid(shared_u32(data + (is64 ? 48u : 36u), module->big_endian), module->width))
             return shared_fail(input, XXEMUL_STATUS_UNSUPPORTED_IMAGE, "unsupported MIPS shared ELF ISA or ABI flags");
-        module->info.mode = is64 ? (module->big_endian ? XXEMUL_MODE_MIPS64_BE : XXEMUL_MODE_MIPS64)
-                                 : (module->big_endian ? XXEMUL_MODE_MIPS32_BE : XXEMUL_MODE_MIPS32);
-    } else if (module->big_endian)
-        return shared_fail(input, XXEMUL_STATUS_UNSUPPORTED_IMAGE, "big-endian shared ELF is supported only for MIPS");
+        module->info.mode = is64 ? (module->big_endian ? XXEMUL_MODE_MIPS64_BE : XXEMUL_MODE_MIPS64) : (module->big_endian ? XXEMUL_MODE_MIPS32_BE : XXEMUL_MODE_MIPS32);
+    } else if (module->big_endian) return shared_fail(input, XXEMUL_STATUS_UNSUPPORTED_IMAGE, "big-endian shared ELF is supported only for MIPS");
     phoff = is64 ? shared_u64(data + 32, module->big_endian) : shared_u32(data + 28, module->big_endian);
     phsize = shared_u16(data + (is64 ? 54 : 42), module->big_endian);
     phcount = shared_u16(data + (is64 ? 56 : 44), module->big_endian);
@@ -648,7 +636,8 @@ static int shared_symbol_count(shared_input *input, const shared_dynamic *dynami
             return shared_fail(input, count > limit ? XXEMUL_STATUS_LIMIT_REACHED : XXEMUL_STATUS_INVALID_IMAGE, "invalid/bounded DT_HASH symbol count");
         data = shared_raw(input, dynamic->hash, 8 + ((uint64_t)buckets + count) * 4);
         for (i = 0; i < (uint64_t)buckets + count; ++i)
-            if (shared_u32(data + 8 + (size_t)i * 4, module->big_endian) >= count) return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "DT_HASH index is outside the symbol table");
+            if (shared_u32(data + 8 + (size_t)i * 4, module->big_endian) >= count)
+                return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "DT_HASH index is outside the symbol table");
     } else if (dynamic->gnu_hash) {
         uint32_t buckets, first, bloom, highest = 0, i;
         uint64_t buckets_address, chain_address;
@@ -686,8 +675,7 @@ static int shared_symbol_count(shared_input *input, const shared_dynamic *dynami
             }
         }
     } else if (module->info.machine == 8u && dynamic->mips_symtabno) {
-        if (dynamic->mips_symtabno > limit)
-            return shared_fail(input, XXEMUL_STATUS_LIMIT_REACHED, "MIPS symbol count exceeds limit");
+        if (dynamic->mips_symtabno > limit) return shared_fail(input, XXEMUL_STATUS_LIMIT_REACHED, "MIPS symbol count exceeds limit");
         count = (uint32_t)dynamic->mips_symtabno;
     } else if (section_count && section_offset) {
         uint16_t i;
@@ -750,7 +738,8 @@ static int shared_versions(shared_input *input, const shared_dynamic *dynamic)
         uint64_t auxiliary = address;
         uint16_t count, j;
         uint32_t next;
-        if (!p || shared_u16(p, module->big_endian) != 1 || !(count = shared_u16(p + 2, module->big_endian)) || shared_u32(p + 4, module->big_endian) >= module->string_size)
+        if (!p || shared_u16(p, module->big_endian) != 1 || !(count = shared_u16(p + 2, module->big_endian)) ||
+            shared_u32(p + 4, module->big_endian) >= module->string_size)
             return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "invalid ELF Verneed record");
         next = shared_u32(p + 12, module->big_endian);
         if (!shared_version_next(input, &auxiliary, shared_u32(p + 8, module->big_endian), 16)) return 0;
@@ -776,7 +765,8 @@ static int shared_versions(shared_input *input, const shared_dynamic *dynamic)
         uint64_t auxiliary = address;
         uint16_t count, index, j;
         uint32_t next;
-        if (!p || shared_u16(p, module->big_endian) != 1 || !(count = shared_u16(p + 6, module->big_endian))) return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "invalid ELF Verdef record");
+        if (!p || shared_u16(p, module->big_endian) != 1 || !(count = shared_u16(p + 6, module->big_endian)))
+            return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "invalid ELF Verdef record");
         index = shared_u16(p + 4, module->big_endian);
         next = shared_u32(p + 16, module->big_endian);
         if (!shared_version_next(input, &auxiliary, shared_u32(p + 12, module->big_endian), 20)) return 0;
@@ -888,27 +878,23 @@ static int shared_symbol_address(shared_input *input, uint32_t index, uint64_t *
     return 1;
 }
 
-static int shared_mips_got_exclude_raw(shared_input *input, const uint8_t *got, uint64_t got_size,
-                                      const uint8_t *metadata, uint64_t size)
+static int shared_mips_got_exclude_raw(shared_input *input, const uint8_t *got, uint64_t got_size, const uint8_t *metadata, uint64_t size)
 {
     uint64_t got_offset, offset;
     if (!size) return 1;
     if (!metadata) return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS loader metadata is not file backed");
     got_offset = (uint64_t)(got - input->data);
     offset = (uint64_t)(metadata - input->data);
-    if (got_offset < offset + size && offset < got_offset + got_size)
-        return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS GOT overlaps ELF loader metadata");
+    if (got_offset < offset + size && offset < got_offset + got_size) return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS GOT overlaps ELF loader metadata");
     return 1;
 }
 
-static int shared_mips_got_exclude(shared_input *input, const uint8_t *got, uint64_t got_size,
-                                  uint64_t address, uint64_t size)
+static int shared_mips_got_exclude(shared_input *input, const uint8_t *got, uint64_t got_size, uint64_t address, uint64_t size)
 {
     return shared_mips_got_exclude_raw(input, got, got_size, size ? shared_raw(input, address, size) : NULL, size);
 }
 
-static int shared_mips_got_metadata(shared_input *input, const shared_dynamic *dynamic,
-                                   const uint8_t *got, uint64_t got_size)
+static int shared_mips_got_metadata(shared_input *input, const shared_dynamic *dynamic, const uint8_t *got, uint64_t got_size)
 {
     xxemul_elf_shared *module = input->module;
     int is64 = module->width == 8u;
@@ -917,8 +903,14 @@ static int shared_mips_got_metadata(shared_input *input, const shared_dynamic *d
     uint16_t phnum = shared_u16(input->data + (is64 ? 56u : 44u), module->big_endian);
     uint64_t address, i, j;
     const uint8_t *p;
-#define MIPS_GOT_PROTECT(a, n) do { if (!shared_mips_got_exclude(input, got, got_size, (a), (n))) return 0; } while (0)
-#define MIPS_GOT_PROTECT_RAW(p, n) do { if (!shared_mips_got_exclude_raw(input, got, got_size, (p), (n))) return 0; } while (0)
+#define MIPS_GOT_PROTECT(a, n)                                                  \
+    do {                                                                        \
+        if (!shared_mips_got_exclude(input, got, got_size, (a), (n))) return 0; \
+    } while (0)
+#define MIPS_GOT_PROTECT_RAW(p, n)                                                  \
+    do {                                                                            \
+        if (!shared_mips_got_exclude_raw(input, got, got_size, (p), (n))) return 0; \
+    } while (0)
     MIPS_GOT_PROTECT_RAW(input->data, is64 ? 64u : 52u);
     MIPS_GOT_PROTECT_RAW(input->data + phoff, (uint64_t)phnum * phsize);
     for (i = 0; i < phnum; ++i) {
@@ -938,8 +930,7 @@ static int shared_mips_got_metadata(shared_input *input, const shared_dynamic *d
     if (dynamic->hash) {
         p = shared_raw(input, dynamic->hash, 8u);
         if (!p) return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "invalid MIPS SysV hash metadata");
-        MIPS_GOT_PROTECT(dynamic->hash, 8u + ((uint64_t)shared_u32(p, module->big_endian) +
-                                          shared_u32(p + 4u, module->big_endian)) * 4u);
+        MIPS_GOT_PROTECT(dynamic->hash, 8u + ((uint64_t)shared_u32(p, module->big_endian) + shared_u32(p + 4u, module->big_endian)) * 4u);
     }
     if (dynamic->gnu_hash) {
         uint64_t buckets, first, bloom, size;
@@ -948,8 +939,7 @@ static int shared_mips_got_metadata(shared_input *input, const shared_dynamic *d
         buckets = shared_u32(p, module->big_endian);
         first = shared_u32(p + 4u, module->big_endian);
         bloom = shared_u32(p + 8u, module->big_endian);
-        if (!buckets || !bloom || buckets > module->config.max_symbols || bloom > module->config.max_symbols ||
-            (bloom & (bloom - 1u)) || first > module->symbol_count)
+        if (!buckets || !bloom || buckets > module->config.max_symbols || bloom > module->config.max_symbols || (bloom & (bloom - 1u)) || first > module->symbol_count)
             return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "invalid MIPS GNU hash dimensions");
         size = 16u + bloom * module->width + buckets * 4u + ((uint64_t)module->symbol_count - first) * 4u;
         MIPS_GOT_PROTECT(dynamic->gnu_hash, size);
@@ -958,7 +948,8 @@ static int shared_mips_got_metadata(shared_input *input, const shared_dynamic *d
      * were inventoried. Protect every record before applying GOT writes. */
     address = dynamic->version_need;
     for (i = 0; i < dynamic->version_need_count; ++i) {
-        uint64_t auxiliary, next; unsigned count;
+        uint64_t auxiliary, next;
+        unsigned count;
         p = shared_raw(input, address, 16u);
         MIPS_GOT_PROTECT_RAW(p, 16u);
         count = shared_u16(p + 2u, module->big_endian);
@@ -973,7 +964,8 @@ static int shared_mips_got_metadata(shared_input *input, const shared_dynamic *d
     }
     address = dynamic->version_def;
     for (i = 0; i < dynamic->version_def_count; ++i) {
-        uint64_t auxiliary, next; unsigned count;
+        uint64_t auxiliary, next;
+        unsigned count;
         p = shared_raw(input, address, 20u);
         MIPS_GOT_PROTECT_RAW(p, 20u);
         count = shared_u16(p + 6u, module->big_endian);
@@ -994,34 +986,26 @@ static int shared_mips_got_metadata(shared_input *input, const shared_dynamic *d
 static int shared_mips_got(shared_input *input, const shared_dynamic *dynamic)
 {
     xxemul_elf_shared *module = input->module;
-    uint64_t required = (UINT64_C(1) << 24) | (UINT64_C(1) << 25) |
-                        (UINT64_C(1) << 27) | (UINT64_C(1) << 28) | (UINT64_C(1) << 29);
+    uint64_t required = (UINT64_C(1) << 24) | (UINT64_C(1) << 25) | (UINT64_C(1) << 27) | (UINT64_C(1) << 28) | (UINT64_C(1) << 29);
     uint64_t count, skip = 1, i, fixups, global_count, gp_link;
     unsigned width = module->width;
     uint8_t *got;
     if (module->info.machine != 8u) return 1;
-    if ((dynamic->seen & required) != required || dynamic->mips_rld_version != 1u ||
-        !dynamic->plt_got || (dynamic->plt_got & (width - 1u)) || !dynamic->mips_local_gotno ||
-        dynamic->mips_symtabno != module->symbol_count || dynamic->mips_gotsym > module->symbol_count)
+    if ((dynamic->seen & required) != required || dynamic->mips_rld_version != 1u || !dynamic->plt_got || (dynamic->plt_got & (width - 1u)) ||
+        !dynamic->mips_local_gotno || dynamic->mips_symtabno != module->symbol_count || dynamic->mips_gotsym > module->symbol_count)
         return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "missing/invalid MIPS primary GOT dimensions");
     /* RHF_NOTPOT is a hash-layout hint. Other quickstart/reordering modes
      * need dynamic linker actions that this bounded loader does not model. */
-    if (dynamic->mips_flags & ~UINT64_C(2))
-        return shared_fail(input, XXEMUL_STATUS_UNSUPPORTED_IMAGE, "unsupported MIPS runtime-loader flags");
+    if (dynamic->mips_flags & ~UINT64_C(2)) return shared_fail(input, XXEMUL_STATUS_UNSUPPORTED_IMAGE, "unsupported MIPS runtime-loader flags");
     global_count = module->symbol_count - dynamic->mips_gotsym;
-    if (dynamic->mips_local_gotno > UINT64_MAX - global_count)
-        return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS GOT count overflows");
+    if (dynamic->mips_local_gotno > UINT64_MAX - global_count) return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS GOT count overflows");
     count = dynamic->mips_local_gotno + global_count;
-    if (count > UINT64_MAX / width ||
-        !shared_raw(input, dynamic->plt_got, count * width) ||
-        !(got = shared_mapped(module, dynamic->plt_got, count * width, 0)))
+    if (count > UINT64_MAX / width || !shared_raw(input, dynamic->plt_got, count * width) || !(got = shared_mapped(module, dynamic->plt_got, count * width, 0)))
         return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS GOT exceeds its bounded file-backed mapping");
     /* GOT[0] is reserved. GNU objects reserve GOT[1] too and identify it
      * with its high bit; other objects relocate local entry one normally. */
-    if (dynamic->mips_local_gotno >= 2u &&
-        (shared_word(got + width, width, module->big_endian) & (UINT64_C(1) << (width * 8u - 1u)))) skip = 2;
-    if (dynamic->mips_local_gotno < skip)
-        return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS GOT omits reserved local entries");
+    if (dynamic->mips_local_gotno >= 2u && (shared_word(got + width, width, module->big_endian) & (UINT64_C(1) << (width * 8u - 1u)))) skip = 2;
+    if (dynamic->mips_local_gotno < skip) return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS GOT omits reserved local entries");
     fixups = count - skip;
     if (fixups > module->config.max_relocations - input->result->relocations)
         return shared_fail(input, XXEMUL_STATUS_LIMIT_REACHED, "MIPS implicit GOT relocation limit exceeded");
@@ -1032,8 +1016,7 @@ static int shared_mips_got(shared_input *input, const shared_dynamic *dynamic)
     if (!(dynamic->seen & (UINT64_C(1) << 30)) && dynamic->plt_got > UINT64_MAX - UINT64_C(0x7ff0))
         return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS GP offset overflows");
     gp_link = (dynamic->seen & (UINT64_C(1) << 30)) ? dynamic->mips_gp_value : dynamic->plt_got + UINT64_C(0x7ff0);
-    if (gp_link > UINT64_MAX - module->info.load_bias ||
-        (width == 4u && gp_link + module->info.load_bias > UINT32_MAX))
+    if (gp_link > UINT64_MAX - module->info.load_bias || (width == 4u && gp_link + module->info.load_bias > UINT32_MAX))
         return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "MIPS initial GP exceeds its address width");
     module->mips_gp = module->info.load_bias + gp_link;
     for (i = skip; i < dynamic->mips_local_gotno; ++i) {
@@ -1043,8 +1026,7 @@ static int shared_mips_got(shared_input *input, const shared_dynamic *dynamic)
     for (i = dynamic->mips_gotsym; i < module->symbol_count; ++i) {
         uint64_t address;
         if (!shared_symbol_address(input, (uint32_t)i, &address)) return 0;
-        shared_store(got + (dynamic->mips_local_gotno + i - dynamic->mips_gotsym) * width,
-                     address, width, module->big_endian);
+        shared_store(got + (dynamic->mips_local_gotno + i - dynamic->mips_gotsym) * width, address, width, module->big_endian);
     }
     input->result->relocations += (uint32_t)fixups;
     if (width == 8u) module->emulator->mips64.gpr[28] = module->mips_gp;
@@ -1068,8 +1050,7 @@ static int shared_relocate_one(shared_input *input, const uint8_t *p, int rela)
          * four individual bytes, even for little-endian ELF. */
         symbol = shared_u32(p + 8u, module->big_endian);
         type = p[15];
-        if (ssym || type3 || (type2 && (type2 != 18u || (type != 3u && type != 51u))) ||
-            (type == 3u && type2 != 18u))
+        if (ssym || type3 || (type2 && (type2 != 18u || (type != 3u && type != 51u))) || (type == 3u && type2 != 18u))
             return shared_fail(input, XXEMUL_STATUS_UNSUPPORTED_IMAGE, "unsupported MIPS n64 relocation operation chain");
     }
     if (!type || (module->info.machine == 183 && type == 256)) return 1;
@@ -1142,7 +1123,10 @@ static int shared_relocate_one(shared_input *input, const uint8_t *p, int rela)
             switch (type) {
                 case 2:
                     operation = 2; /* R_MIPS_32: S + A */
-                    if (module->width == 8u) { width = 4u; check = 3; }
+                    if (module->width == 8u) {
+                        width = 4u;
+                        check = 3;
+                    }
                     break;
                 case 3: operation = symbol ? 2 : 1; break; /* R_MIPS_REL32 */
                 case 18:
@@ -1159,8 +1143,7 @@ static int shared_relocate_one(shared_input *input, const uint8_t *p, int rela)
     target = shared_mapped(module, offset, width, 0);
     if (!target || offset > UINT64_MAX - module->info.load_bias || (operation == 1 && symbol))
         return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "invalid ELF relocation target/symbol at 0x%llx", (unsigned long long)offset);
-    if (module->info.machine == 8u && module->mips_got_size && offset < module->mips_got + module->mips_got_size &&
-        module->mips_got < offset + width)
+    if (module->info.machine == 8u && module->mips_got_size && offset < module->mips_got + module->mips_got_size && module->mips_got < offset + width)
         return shared_fail(input, XXEMUL_STATUS_UNSUPPORTED_IMAGE, "explicit MIPS relocation overlaps its implicit GOT fixups");
     if ((module->info.machine == 40 && type >= 21 && type <= 23 && (offset & 3u)) || (module->info.machine == 183 && type >= 1025 && type <= 1027 && (offset & 7u)))
         return shared_fail(input, XXEMUL_STATUS_INVALID_IMAGE, "unaligned ELF dynamic relocation target");
@@ -1294,8 +1277,7 @@ static xxemul_elf_shared *shared_create(const void *image, size_t image_size, co
         shared_fail(&input, XXEMUL_STATUS_UNSUPPORTED_IMAGE, "overlapping ELF relocation tables");
         goto failed;
     }
-    if (!shared_mips_got(&input, &dynamic) ||
-        !shared_relocation_table(&input, dynamic.rel, dynamic.rel_size, dynamic.rel_entry, 0) ||
+    if (!shared_mips_got(&input, &dynamic) || !shared_relocation_table(&input, dynamic.rel, dynamic.rel_size, dynamic.rel_entry, 0) ||
         !shared_relocation_table(&input, dynamic.rela, dynamic.rela_size, dynamic.rela_entry, 1) ||
         !shared_relocation_table(&input, dynamic.jump_rel, dynamic.jump_size, module->width * (dynamic.jump_kind == 7 ? 3u : 2u), dynamic.jump_kind == 7))
         goto failed;
@@ -1377,7 +1359,14 @@ xxemul_status xxemul_elf_shared_initializer_at(const xxemul_elf_shared *module, 
     return XXEMUL_STATUS_OK;
 }
 
-enum { PRIMARY_BEFORE_INIT = 1, PRIMARY_WAIT_INIT, PRIMARY_ARRAY, PRIMARY_WAIT_ARRAY, PRIMARY_COMPLETE, PRIMARY_FAILED };
+enum {
+    PRIMARY_BEFORE_INIT = 1,
+    PRIMARY_WAIT_INIT,
+    PRIMARY_ARRAY,
+    PRIMARY_WAIT_ARRAY,
+    PRIMARY_COMPLETE,
+    PRIMARY_FAILED
+};
 
 static uint64_t primary_pc(const xxemul *emulator)
 {
@@ -1417,8 +1406,7 @@ static void primary_loader_pc(xxemul_elf_shared *module)
     } else emulator->x86.ip = module->primary_return;
 }
 
-static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t *image, size_t size,
-                                      uint64_t image_base, xxemul_status *status)
+static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t *image, size_t size, uint64_t image_base, xxemul_status *status)
 {
     xxemul_elf_shared_config config;
     xxemul_elf_result result;
@@ -1442,14 +1430,16 @@ static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t
     phoff = width == 8u ? shared_u64(image + 32u, big) : shared_u32(image + 28u, big);
     phsize = shared_u16(image + (width == 8u ? 54u : 42u), big);
     phcount = shared_u16(image + (width == 8u ? 56u : 44u), big);
-    if (phsize != (width == 8u ? 56u : 32u) || !phcount || phcount > ELF_SHARED_MAX_PHDRS ||
-        phoff > size || (uint64_t)phsize * phcount > size - phoff) return NULL;
+    if (phsize != (width == 8u ? 56u : 32u) || !phcount || phcount > ELF_SHARED_MAX_PHDRS || phoff > size || (uint64_t)phsize * phcount > size - phoff) return NULL;
     for (i = 0; i < phcount; ++i) {
         const uint8_t *p = image + (size_t)phoff + (size_t)i * phsize;
         uint32_t type = shared_u32(p, big);
         uint64_t address = width == 8u ? shared_u64(p + 16u, big) : shared_u32(p + 8u, big);
         uint64_t memory = width == 8u ? shared_u64(p + 40u, big) : shared_u32(p + 20u, big);
-        if (type == 3u) { *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE; return NULL; }
+        if (type == 3u) {
+            *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
+            return NULL;
+        }
         if (type == 1u && memory && address < low) low = address;
         if (type == 2u) {
             if (found_dynamic++) return NULL;
@@ -1457,8 +1447,9 @@ static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t
             dynamic_size = width == 8u ? shared_u64(p + 32u, big) : shared_u32(p + 16u, big);
         }
     }
-    if (!found_dynamic || !dynamic_size || dynamic_size % (width * 2u) || dynamic_offset > size ||
-        dynamic_size > size - dynamic_offset || dynamic_size / (width * 2u) > ELF_SHARED_MAX_DYNAMIC || low == UINT64_MAX) return NULL;
+    if (!found_dynamic || !dynamic_size || dynamic_size % (width * 2u) || dynamic_offset > size || dynamic_size > size - dynamic_offset ||
+        dynamic_size / (width * 2u) > ELF_SHARED_MAX_DYNAMIC || low == UINT64_MAX)
+        return NULL;
     for (i = 0; i < dynamic_size / (width * 2u); ++i) {
         const uint8_t *p = image + (size_t)dynamic_offset + (size_t)i * width * 2u;
         uint64_t tag = shared_word(p, width, big), value = shared_word(p + width, width, big);
@@ -1473,21 +1464,25 @@ static xxemul *xxemul_load_elf_primary(xxemul_image_format format, const uint8_t
     /* Some library packers publish their DT_INIT wrapper in e_entry too.
      * Require a self-named library and an exact initializer alias; this does
      * not admit arbitrary nonzero-entry ET_DYN executables. */
-    if (entry && (!init || soname == UINT64_MAX ||
-        (shared_u16(image + 18u, big) == 40u ? (entry & ~UINT64_C(1)) != (init & ~UINT64_C(1)) : entry != init))) {
+    if (entry && (!init || soname == UINT64_MAX || (shared_u16(image + 18u, big) == 40u ? (entry & ~UINT64_C(1)) != (init & ~UINT64_C(1)) : entry != init))) {
         *status = XXEMUL_STATUS_UNSUPPORTED_IMAGE;
         return NULL;
     }
     memset(&config, 0, sizeof(config));
     low &= ~UINT64_C(4095);
     if (image_base) {
-        if (image_base < low) { *status = XXEMUL_STATUS_INVALID_ARGUMENT; return NULL; }
+        if (image_base < low) {
+            *status = XXEMUL_STATUS_INVALID_ARGUMENT;
+            return NULL;
+        }
         config.load_bias = image_base - low;
     }
     module = shared_create(image, size, &config, &result, 2u | (image_base != 0u ? 1u : 0u));
-    if (!module) { *status = result.status; return NULL; }
-    if (entry && (soname >= module->string_size || !module->strings[soname] ||
-                  !memchr(module->strings + soname, 0, module->string_size - (size_t)soname))) {
+    if (!module) {
+        *status = result.status;
+        return NULL;
+    }
+    if (entry && (soname >= module->string_size || !module->strings[soname] || !memchr(module->strings + soname, 0, module->string_size - (size_t)soname))) {
         xxemul_elf_shared_destroy(module);
         *status = XXEMUL_STATUS_INVALID_IMAGE;
         return NULL;
@@ -1552,8 +1547,7 @@ xxemul_status xxemul_elf_primary_start(xxemul *emulator)
     xxemul_elf_shared *module = emulator->elf_primary;
     uint64_t sp = primary_sp(emulator), argc;
     if (!module || module->primary_stage) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (sp < module->info.stack_address + 0x100u || !primary_word(module, sp, &argc) || argc > 128u ||
-        sp > UINT64_MAX - (argc + 3u) * module->width)
+    if (sp < module->info.stack_address + 0x100u || !primary_word(module, sp, &argc) || argc > 128u || sp > UINT64_MAX - (argc + 3u) * module->width)
         return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "invalid primary ELF initial process stack");
     module->primary_argc = argc;
     module->primary_argv = sp + module->width;
@@ -1575,14 +1569,15 @@ static xxemul_status primary_array(xxemul_elf_shared *module)
         if (!tag) break;
         if (tag == 25u) {
             if (seen & 1u) return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "duplicate live DT_INIT_ARRAY");
-            seen |= 1u; array = value;
+            seen |= 1u;
+            array = value;
         } else if (tag == 27u) {
             if (seen & 2u) return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "duplicate live DT_INIT_ARRAYSZ");
-            seen |= 2u; size = value;
+            seen |= 2u;
+            size = value;
         }
     }
-    if (i == module->dynamic_size / (module->width * 2u) || size % module->width ||
-        size / module->width >= ELF_SHARED_MAX_INITIALIZERS || (array && !(seen & 2u)) ||
+    if (i == module->dynamic_size / (module->width * 2u) || size % module->width || size / module->width >= ELF_SHARED_MAX_INITIALIZERS || (array && !(seen & 2u)) ||
         (size && (!array || !shared_mapped(module, array, size, 0))) || array > UINT64_MAX - module->info.load_bias)
         return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "invalid live ELF initializer array");
     module->primary_array = module->info.load_bias + array;
@@ -1636,8 +1631,7 @@ static xxemul_status primary_call(xxemul_elf_shared *module, uint64_t target)
         return XXEMUL_STATUS_OK;
     }
     if (emulator->arch == XXEMUL_ARCH_ARM) {
-        if ((module->width == 8u && (target & 3u)) ||
-            (module->width == 4u && (target > UINT32_MAX || (target & 3u) == 2u)))
+        if ((module->width == 8u && (target & 3u)) || (module->width == 4u && (target > UINT32_MAX || (target & 3u) == 2u)))
             return primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "ELF initializer violates ARM instruction alignment");
         /* AAPCS passes argc/argv/envp in r0-r2 or x0-x2. The return
          * address is in LR, and no synthetic x86-style frame is pushed. */
@@ -1667,9 +1661,12 @@ static xxemul_status primary_call(xxemul_elf_shared *module, uint64_t target)
     } else {
         uint64_t values[4];
         unsigned i, j;
-        values[0] = module->primary_return; values[1] = module->primary_argc;
-        values[2] = module->primary_argv; values[3] = module->primary_envp;
-        for (i = 0; i < 4u; ++i) for (j = 0; j < 4u; ++j) frame[i * 4u + j] = (uint8_t)(values[i] >> (8u * j));
+        values[0] = module->primary_return;
+        values[1] = module->primary_argc;
+        values[2] = module->primary_argv;
+        values[3] = module->primary_envp;
+        for (i = 0; i < 4u; ++i)
+            for (j = 0; j < 4u; ++j) frame[i * 4u + j] = (uint8_t)(values[i] >> (8u * j));
         if (xxemul_write_memory(emulator, sp, frame, 16u) != XXEMUL_STATUS_OK)
             return primary_fail(module, XXEMUL_STATUS_ADDRESS_FAULT, "cannot build ELF initializer arguments");
     }
@@ -1685,11 +1682,9 @@ int xxemul_elf_primary_try_step(xxemul *emulator, xxemul_step_info *info, xxemul
     xxemul_elf_shared *module = emulator->elf_primary;
     uint64_t target;
     if (!module || !module->primary_stage || module->primary_stage >= PRIMARY_COMPLETE || primary_pc(emulator) != module->primary_return) return 0;
-    if (emulator->arch == XXEMUL_ARCH_MIPS &&
-        (module->width == 8u ? emulator->mips64_delay_pending : emulator->mips_delay_pending)) return 0;
+    if (emulator->arch == XXEMUL_ARCH_MIPS && (module->width == 8u ? emulator->mips64_delay_pending : emulator->mips_delay_pending)) return 0;
     if (info) info->address = module->primary_return;
-    if ((module->primary_stage == PRIMARY_WAIT_INIT || module->primary_stage == PRIMARY_WAIT_ARRAY) &&
-        primary_sp(emulator) != module->primary_expected_sp) {
+    if ((module->primary_stage == PRIMARY_WAIT_INIT || module->primary_stage == PRIMARY_WAIT_ARRAY) && primary_sp(emulator) != module->primary_expected_sp) {
         *status = primary_fail(module, XXEMUL_STATUS_INVALID_IMAGE, "ELF initializer violates guest ABI stack restoration");
         return 1;
     }
@@ -1712,7 +1707,10 @@ int xxemul_elf_primary_try_step(xxemul *emulator, xxemul_step_info *info, xxemul
             *status = primary_fail(module, XXEMUL_STATUS_ADDRESS_FAULT, "cannot read live ELF initializer pointer");
             return 1;
         }
-        if (!target || target == (module->width == 8u ? UINT64_MAX : UINT32_MAX)) { ++module->primary_array_index; continue; }
+        if (!target || target == (module->width == 8u ? UINT64_MAX : UINT32_MAX)) {
+            ++module->primary_array_index;
+            continue;
+        }
         module->primary_stage = PRIMARY_WAIT_ARRAY;
         *status = primary_call(module, target);
         if (info) info->next_address = primary_pc(emulator);

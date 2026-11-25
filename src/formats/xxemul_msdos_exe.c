@@ -31,16 +31,16 @@ int xxemul_load_msdos_exe(xxemul *emulator, const uint8_t *image, size_t image_s
     int valid = 0;
 
     xx_msdos_init(&msdos, io, 0);
-    if (!xx_msdos_check_is_valid(&msdos.format, NULL) || !xx_msdos_handle_base_info(&msdos.format, NULL) ||
-        msdos.format.format_size <= 0) {
+    if (!xx_msdos_check_is_valid(&msdos.format, NULL) || !xx_msdos_handle_base_info(&msdos.format, NULL) || msdos.format.format_size <= 0) {
         goto done;
     }
     if (xx_msdos_has_pe_header(&msdos)) {
         /* LE/LX DOS extenders execute the real-mode MZ loader first. PE and
          * NE images still belong to their separate execution environments. */
         int64_t offset = xx_msdos_get_pe_offset(&msdos);
-        if (offset < 0 || (uint64_t)offset > image_size || image_size - (size_t)offset < 2u ||
-            image[offset] != 'L' || (image[offset + 1] != 'E' && image[offset + 1] != 'X')) goto done;
+        if (offset < 0 || (uint64_t)offset > image_size || image_size - (size_t)offset < 2u || image[offset] != 'L' ||
+            (image[offset + 1] != 'E' && image[offset + 1] != 'X'))
+            goto done;
     }
     header_size = (size_t)xx_msdos_get_header_size(&msdos) * 16u;
     declared_size = (size_t)msdos.format.format_size;
@@ -105,8 +105,8 @@ int xxemul_load_msdos_exe(xxemul *emulator, const uint8_t *image, size_t image_s
     stack_address = stack_base + (uint16_t)emulator->x86.gpr[XXEMUL_X86_RSP];
     /* SP can point just past conventional memory: a descending stack's
      * first PUSH accesses the preceding word. SS itself must remain inside. */
-    if (xxemul_dos_linear(emulator->x86.segment[XXEMUL_X86_CS], (uint16_t)emulator->x86.ip) >= XXEMUL_DOS_CONVENTIONAL_END ||
-        stack_base >= XXEMUL_DOS_CONVENTIONAL_END || stack_address > XXEMUL_DOS_CONVENTIONAL_END) {
+    if (xxemul_dos_linear(emulator->x86.segment[XXEMUL_X86_CS], (uint16_t)emulator->x86.ip) >= XXEMUL_DOS_CONVENTIONAL_END || stack_base >= XXEMUL_DOS_CONVENTIONAL_END ||
+        stack_address > XXEMUL_DOS_CONVENTIONAL_END) {
         goto done;
     }
     {

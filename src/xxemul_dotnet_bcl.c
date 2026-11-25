@@ -100,49 +100,39 @@ static xxemul_status host_fail(xxemul_dotnet_bcl_host *h, xxemul_status status, 
 static void *host_alloc(xxemul_dotnet_bcl_host *h, size_t bytes)
 {
     void *p;
-    if (!bytes)
-        bytes = 1;
-    if (bytes > h->config.max_native_bytes - h->native_bytes)
-        return NULL;
+    if (!bytes) bytes = 1;
+    if (bytes > h->config.max_native_bytes - h->native_bytes) return NULL;
     p = calloc(bytes, 1);
-    if (p)
-        h->native_bytes += bytes;
+    if (p) h->native_bytes += bytes;
     return p;
 }
 static void host_free(xxemul_dotnet_bcl_host *h, void *p, size_t bytes)
 {
-    if (!p)
-        return;
-    if (!bytes)
-        bytes = 1;
+    if (!p) return;
+    if (!bytes) bytes = 1;
     free(p);
     h->native_bytes -= bytes;
 }
 static char *host_string(xxemul_dotnet_bcl_host *h, const char *s, size_t n)
 {
     char *p;
-    if (n == SIZE_MAX || !(p = host_alloc(h, n + 1)))
-        return NULL;
-    if (n)
-        memcpy(p, s, n);
+    if (n == SIZE_MAX || !(p = host_alloc(h, n + 1))) return NULL;
+    if (n) memcpy(p, s, n);
     return p;
 }
 static bcl_object *lookup(xxemul_dotnet_bcl_host *h, const xxemul_dotnet_vm *vm, uint32_t reference)
 {
     bcl_object *o;
     for (o = h->objects; o; o = o->next)
-        if (o->vm == vm && o->reference == reference)
-            return o;
+        if (o->vm == vm && o->reference == reference) return o;
     return NULL;
 }
 static bcl_object *attach(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm, uint32_t reference, bcl_kind kind)
 {
     bcl_object *o = lookup(h, vm, reference);
-    if (o)
-        return o->kind == kind ? o : NULL;
+    if (o) return o->kind == kind ? o : NULL;
     o = host_alloc(h, sizeof(*o));
-    if (!o)
-        return NULL;
+    if (!o) return NULL;
     o->vm = vm;
     o->reference = reference;
     o->kind = kind;
@@ -154,15 +144,13 @@ static xxemul_status new_host_object(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm
 {
     uint32_t reference;
     xxemul_status status = xxemul_dotnet_vm_new_object(vm, type, &reference);
-    if (status != XXEMUL_STATUS_OK)
-        return status;
+    if (status != XXEMUL_STATUS_OK) return status;
     *out = attach(h, vm, reference, kind);
     return *out ? XXEMUL_STATUS_OK : host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "BCL host storage budget reached");
 }
 static const char *get_string(xxemul_dotnet_vm *vm, xxemul_dotnet_value v, size_t *size)
 {
-    if (size)
-        *size = 0;
+    if (size) *size = 0;
     return v.kind == XXEMUL_DOTNET_VALUE_OBJECT && v.bits <= UINT32_MAX ? xxemul_dotnet_vm_get_string(vm, (uint32_t)v.bits, size) : NULL;
 }
 static int integer(xxemul_dotnet_value v, int64_t *n)
@@ -184,8 +172,7 @@ static xxemul_status text_result(xxemul_dotnet_vm *vm, const char *s, size_t n, 
 {
     uint32_t r;
     xxemul_status status = xxemul_dotnet_vm_new_string(vm, s, n, &r);
-    if (status == XXEMUL_STATUS_OK)
-        *out = object_value(r);
+    if (status == XXEMUL_STATUS_OK) *out = object_value(r);
     return status;
 }
 /* VM strings are canonical UTF8 with the surrogate extension for lone UTF16
@@ -196,8 +183,7 @@ static xxemul_status utf16_units(xxemul_dotnet_bcl_host *h, const char *s, size_
     uint16_t *p;
     *units = NULL;
     *count = 0;
-    if (n > SIZE_MAX / sizeof(uint16_t) - 1 || !(p = host_alloc(h, (n + 1) * sizeof(*p))))
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (n > SIZE_MAX / sizeof(uint16_t) - 1 || !(p = host_alloc(h, (n + 1) * sizeof(*p)))) return XXEMUL_STATUS_LIMIT_REACHED;
     while (at < n) {
         uint32_t ch;
         unsigned need, j;
@@ -207,23 +193,19 @@ static xxemul_status utf16_units(xxemul_dotnet_bcl_host *h, const char *s, size_
             continue;
         }
         need = first >= 0xc2 && first <= 0xdf ? 1 : first >= 0xe0 && first <= 0xef ? 2 : first >= 0xf0 && first <= 0xf4 ? 3 : 0;
-        if (!need || need > n - at)
-            goto bad;
+        if (!need || need > n - at) goto bad;
         ch = first & ((1u << (6 - need)) - 1);
         for (j = 0; j < need; ++j) {
             uint8_t b = (uint8_t)s[at++];
-            if ((b & 0xc0) != 0x80)
-                goto bad;
+            if ((b & 0xc0) != 0x80) goto bad;
             ch = (ch << 6) | (b & 63);
         }
-        if ((need == 1 && ch < 0x80) || (need == 2 && ch < 0x800) || (need == 3 && ch < 0x10000) || ch > 0x10ffff)
-            goto bad;
+        if ((need == 1 && ch < 0x80) || (need == 2 && ch < 0x800) || (need == 3 && ch < 0x10000) || ch > 0x10ffff) goto bad;
         if (ch >= 0x10000) {
             ch -= 0x10000;
             p[used++] = (uint16_t)(0xd800 + (ch >> 10));
             p[used++] = (uint16_t)(0xdc00 + (ch & 1023));
-        } else
-            p[used++] = (uint16_t)ch;
+        } else p[used++] = (uint16_t)ch;
     }
     *units = p;
     *count = used;
@@ -237,15 +219,13 @@ static xxemul_status units_to_text(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *
     size_t i, n = 0;
     char *text;
     xxemul_status status;
-    if (count > (SIZE_MAX - 1) / 3 || !(text = host_alloc(h, count * 3 + 1)))
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (count > (SIZE_MAX - 1) / 3 || !(text = host_alloc(h, count * 3 + 1))) return XXEMUL_STATUS_LIMIT_REACHED;
     for (i = 0; i < count; ++i) {
         uint32_t ch = p[i];
         if (ch >= 0xd800 && ch <= 0xdbff && i + 1 < count && p[i + 1] >= 0xdc00 && p[i + 1] <= 0xdfff) {
             ch = 0x10000 + ((ch - 0xd800) << 10) + p[++i] - 0xdc00;
         }
-        if (ch < 0x80)
-            text[n++] = (char)ch;
+        if (ch < 0x80) text[n++] = (char)ch;
         else if (ch < 0x800) {
             text[n++] = (char)(0xc0 | (ch >> 6));
             text[n++] = (char)(0x80 | (ch & 63));
@@ -269,11 +249,9 @@ static xxemul_status bytes_result(xxemul_dotnet_vm *vm, const uint8_t *p, size_t
     uint32_t r;
     size_t i;
     xxemul_status status = xxemul_dotnet_vm_new_array(vm, "System.Byte", n, &r);
-    if (status != XXEMUL_STATUS_OK)
-        return status;
+    if (status != XXEMUL_STATUS_OK) return status;
     for (i = 0; i < n; ++i)
-        if ((status = xxemul_dotnet_vm_array_set(vm, r, i, value(XXEMUL_DOTNET_VALUE_I4, p[i]))) != XXEMUL_STATUS_OK)
-            return status;
+        if ((status = xxemul_dotnet_vm_array_set(vm, r, i, value(XXEMUL_DOTNET_VALUE_I4, p[i]))) != XXEMUL_STATUS_OK) return status;
     *out = object_value(r);
     return XXEMUL_STATUS_OK;
 }
@@ -289,8 +267,7 @@ static xxemul_status byte_array(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm,
         strcmp(type, "System.Byte[]") || xxemul_dotnet_vm_array_length(vm, (uint32_t)array.bits, size) != XXEMUL_STATUS_OK || *size > h->config.max_image_bytes)
         return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
     *data = host_alloc(h, *size);
-    if (!*data)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (!*data) return XXEMUL_STATUS_LIMIT_REACHED;
     for (i = 0; i < *size; ++i) {
         status = xxemul_dotnet_vm_array_get(vm, (uint32_t)array.bits, i, &item);
         if (status != XXEMUL_STATUS_OK || item.kind != XXEMUL_DOTNET_VALUE_I4 || item.bits > 255) {
@@ -306,17 +283,14 @@ static bcl_module *module_for(xxemul_dotnet_bcl_host *h, const xxemul_dotnet_pro
 {
     bcl_module *m;
     for (m = h->modules; m; m = m->next)
-        if (m->program == program)
-            return m;
+        if (m->program == program) return m;
     return NULL;
 }
 static bcl_module *register_module(xxemul_dotnet_bcl_host *h, const xxemul_dotnet_program *program, int owned, const char *location)
 {
     bcl_module *m = module_for(h, program);
-    if (m)
-        return m;
-    if (h->module_count >= h->config.max_loaded_assemblies || !(m = host_alloc(h, sizeof(*m))))
-        return NULL;
+    if (m) return m;
+    if (h->module_count >= h->config.max_loaded_assemblies || !(m = host_alloc(h, sizeof(*m)))) return NULL;
     m->program = program;
     m->owned = owned;
     m->location = host_string(h, location, strlen(location));
@@ -352,41 +326,27 @@ static xxemul_status assembly_object(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm
 }
 static const char *parent_type(const char *type)
 {
-    if (!strcmp(type, "System.Text.UTF8Encoding"))
-        return "System.Text.Encoding";
+    if (!strcmp(type, "System.Text.UTF8Encoding")) return "System.Text.Encoding";
     if (!strcmp(type, "System.IO.MemoryStream") || !strcmp(type, "System.IO.FileStream") || !strcmp(type, "System.IO.UnmanagedMemoryStream") ||
         !strcmp(type, "System.IO.Compression.DeflateStream") || !strcmp(type, "System.IO.Compression.GZipStream") ||
         !strcmp(type, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream"))
         return "System.IO.Stream";
-    if (!strcmp(type, "System.IO.Stream") || !strcmp(type, "System.Security.Cryptography.HashAlgorithm"))
-        return "System.IDisposable";
+    if (!strcmp(type, "System.IO.Stream") || !strcmp(type, "System.Security.Cryptography.HashAlgorithm")) return "System.IDisposable";
     if (!strcmp(type, "System.Security.Cryptography.SHA256") || !strcmp(type, "System.Security.Cryptography.SHA256Managed"))
         return "System.Security.Cryptography.HashAlgorithm";
-    if (!strcmp(type, "System.Reflection.MethodInfo"))
-        return "System.Reflection.MethodBase";
-    if (!strcmp(type, "System.Reflection.MethodBase"))
-        return "System.Reflection.MemberInfo";
-    if (!strcmp(type, "System.ResolveEventHandler"))
-        return "System.MulticastDelegate";
-    if (!strcmp(type, "System.MulticastDelegate"))
-        return "System.Delegate";
-    if (!strcmp(type, "System.ObjectDisposedException"))
-        return "System.InvalidOperationException";
-    if (!strcmp(type, "System.FieldAccessException") || !strcmp(type, "System.MissingMethodException"))
-        return "System.MemberAccessException";
-    if (!strcmp(type, "System.MemberAccessException"))
-        return "System.SystemException";
-    if (!strcmp(type, "System.SystemException") || !strcmp(type, "System.ApplicationException"))
-        return "System.Exception";
-    if (!strcmp(type, "System.Reflection.TargetInvocationException"))
-        return "System.ApplicationException";
-    if (!strcmp(type, "System.Reflection.TargetParameterCountException"))
-        return "System.ApplicationException";
-    if (!strcmp(type, "System.IO.InvalidDataException") || !strcmp(type, "System.IO.FileNotFoundException") ||
-        !strcmp(type, "System.IO.DirectoryNotFoundException"))
+    if (!strcmp(type, "System.Reflection.MethodInfo")) return "System.Reflection.MethodBase";
+    if (!strcmp(type, "System.Reflection.MethodBase")) return "System.Reflection.MemberInfo";
+    if (!strcmp(type, "System.ResolveEventHandler")) return "System.MulticastDelegate";
+    if (!strcmp(type, "System.MulticastDelegate")) return "System.Delegate";
+    if (!strcmp(type, "System.ObjectDisposedException")) return "System.InvalidOperationException";
+    if (!strcmp(type, "System.FieldAccessException") || !strcmp(type, "System.MissingMethodException")) return "System.MemberAccessException";
+    if (!strcmp(type, "System.MemberAccessException")) return "System.SystemException";
+    if (!strcmp(type, "System.SystemException") || !strcmp(type, "System.ApplicationException")) return "System.Exception";
+    if (!strcmp(type, "System.Reflection.TargetInvocationException")) return "System.ApplicationException";
+    if (!strcmp(type, "System.Reflection.TargetParameterCountException")) return "System.ApplicationException";
+    if (!strcmp(type, "System.IO.InvalidDataException") || !strcmp(type, "System.IO.FileNotFoundException") || !strcmp(type, "System.IO.DirectoryNotFoundException"))
         return "System.IO.IOException";
-    if (!strcmp(type, "System.ArgumentOutOfRangeException") || !strcmp(type, "System.ArgumentNullException"))
-        return "System.ArgumentException";
+    if (!strcmp(type, "System.ArgumentOutOfRangeException") || !strcmp(type, "System.ArgumentNullException")) return "System.ArgumentException";
     if (!strcmp(type, "System.ArgumentException") || !strcmp(type, "System.InvalidOperationException") || !strcmp(type, "System.NullReferenceException") ||
         !strcmp(type, "System.IndexOutOfRangeException") || !strcmp(type, "System.DivideByZeroException") || !strcmp(type, "System.OverflowException") ||
         !strcmp(type, "System.NotSupportedException") || !strcmp(type, "System.InvalidCastException") || !strcmp(type, "System.ObjectDisposedException") ||
@@ -401,17 +361,15 @@ static int bcl_assignable(void *context, const char *source, const char *destina
 {
     unsigned i;
     (void)context;
-    if (!strcmp(source, destination) || !strcmp(destination, "System.Object"))
-        return 1;
+    if (!strcmp(source, destination) || !strcmp(destination, "System.Object")) return 1;
     if (strlen(source) >= 2 && !strcmp(source + strlen(source) - 2, "[]")) {
-        if (!strcmp(destination, "System.Array") || !strcmp(destination, "System.Collections.IEnumerable") ||
-            !strcmp(destination, "System.Collections.ICollection") || !strcmp(destination, "System.Collections.IList"))
+        if (!strcmp(destination, "System.Array") || !strcmp(destination, "System.Collections.IEnumerable") || !strcmp(destination, "System.Collections.ICollection") ||
+            !strcmp(destination, "System.Collections.IList"))
             return 1;
         return 0;
     }
     for (i = 0; i < 32 && source; ++i) {
-        if (!strcmp(source, destination))
-            return 1;
+        if (!strcmp(source, destination)) return 1;
         source = parent_type(source);
     }
     return -1;
@@ -420,10 +378,8 @@ static xxemul_status buffer_reserve(xxemul_dotnet_bcl_host *h, bcl_object *o, si
 {
     uint8_t *bytes;
     size_t target;
-    if (capacity <= o->capacity)
-        return XXEMUL_STATUS_OK;
-    if (capacity > h->config.max_image_bytes)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (capacity <= o->capacity) return XXEMUL_STATUS_OK;
+    if (capacity > h->config.max_image_bytes) return XXEMUL_STATUS_LIMIT_REACHED;
     target = o->capacity ? o->capacity : h->config.max_image_bytes < 256 ? h->config.max_image_bytes : 256;
     while (target < capacity) {
         if (target > h->config.max_image_bytes / 2) {
@@ -432,11 +388,9 @@ static xxemul_status buffer_reserve(xxemul_dotnet_bcl_host *h, bcl_object *o, si
         }
         target *= 2;
     }
-    if (target > h->config.max_native_bytes - h->native_bytes + o->capacity)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (target > h->config.max_native_bytes - h->native_bytes + o->capacity) return XXEMUL_STATUS_LIMIT_REACHED;
     bytes = realloc(o->bytes, target);
-    if (!bytes)
-        return XXEMUL_STATUS_OUT_OF_MEMORY;
+    if (!bytes) return XXEMUL_STATUS_OUT_OF_MEMORY;
     memset(bytes + o->capacity, 0, target - o->capacity);
     h->native_bytes += target - o->capacity;
     o->bytes = bytes;
@@ -448,13 +402,10 @@ static xxemul_status sync_array_stream(xxemul_dotnet_vm *vm, bcl_object *o)
     size_t i;
     xxemul_dotnet_value item;
     xxemul_status status;
-    if (o->codec || !o->insensitive || !o->source)
-        return XXEMUL_STATUS_OK;
+    if (o->codec || !o->insensitive || !o->source) return XXEMUL_STATUS_OK;
     for (i = 0; i < o->length; ++i) {
-        if ((status = xxemul_dotnet_vm_array_get(vm, o->source, i, &item)) != XXEMUL_STATUS_OK)
-            return status;
-        if (item.kind != XXEMUL_DOTNET_VALUE_I4 || item.bits > 255)
-            return XXEMUL_STATUS_DECODE_ERROR;
+        if ((status = xxemul_dotnet_vm_array_get(vm, o->source, i, &item)) != XXEMUL_STATUS_OK) return status;
+        if (item.kind != XXEMUL_DOTNET_VALUE_I4 || item.bits > 255) return XXEMUL_STATUS_DECODE_ERROR;
         o->bytes[i] = (uint8_t)item.bits;
     }
     return XXEMUL_STATUS_OK;
@@ -471,8 +422,7 @@ static ssize_t decode_write(xx_io_device *device, const void *data, size_t size)
         sink->limit_reached = 1;
         return -1;
     }
-    if (size)
-        memcpy(sink->bytes + sink->position, data, size);
+    if (size) memcpy(sink->bytes + sink->position, data, size);
     sink->position += size;
     return (ssize_t)size;
 }
@@ -488,8 +438,7 @@ static void close_stream(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm, bcl_ob
         bcl_object *source = NULL;
         o->closed = 1;
         if (o->codec) {
-            if (!o->channel)
-                source = lookup(h, vm, o->source);
+            if (!o->channel) source = lookup(h, vm, o->source);
             host_free(h, o->bytes, o->capacity);
             o->bytes = NULL;
             o->capacity = 0;
@@ -511,13 +460,10 @@ static int stream_source_cycle(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm, 
 {
     size_t steps = 0, limit = 0;
     const bcl_object *p;
-    for (p = h->objects; p; p = p->next)
-        ++limit;
+    for (p = h->objects; p; p = p->next) ++limit;
     for (p = source; p && p->kind == BCL_STREAM; p = lookup(h, vm, p->source)) {
-        if (p == target || ++steps > limit)
-            return 1;
-        if (!p->codec)
-            break;
+        if (p == target || ++steps > limit) return 1;
+        if (!p->codec) break;
     }
     return 0;
 }
@@ -534,24 +480,17 @@ static xxemul_status stream_decode(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *
     size_t offset = 0, input_size;
     int okay = 0;
     xxemul_status status;
-    if (!o->codec || o->decoded)
-        return XXEMUL_STATUS_OK;
+    if (!o->codec || o->decoded) return XXEMUL_STATUS_OK;
     source = lookup(h, vm, o->source);
-    if (!source || source->kind != BCL_STREAM || source->closed)
-        return xxemul_dotnet_vm_raise_type(vm, "System.ObjectDisposedException");
-    if (source->position > source->length)
-        return XXEMUL_STATUS_DECODE_ERROR;
-    if ((status = sync_array_stream(vm, source)) != XXEMUL_STATUS_OK)
-        return status;
+    if (!source || source->kind != BCL_STREAM || source->closed) return xxemul_dotnet_vm_raise_type(vm, "System.ObjectDisposedException");
+    if (source->position > source->length) return XXEMUL_STATUS_DECODE_ERROR;
+    if ((status = sync_array_stream(vm, source)) != XXEMUL_STATUS_OK) return status;
     input_size = source->length - source->position;
     input = input_size ? source->bytes + source->position : (const uint8_t *)"";
-    if (capacity > h->config.max_native_bytes - h->native_bytes)
-        capacity = h->config.max_native_bytes - h->native_bytes;
-    if (!capacity)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (capacity > h->config.max_native_bytes - h->native_bytes) capacity = h->config.max_native_bytes - h->native_bytes;
+    if (!capacity) return XXEMUL_STATUS_LIMIT_REACHED;
     decoded = host_alloc(h, capacity);
-    if (!decoded)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (!decoded) return XXEMUL_STATUS_LIMIT_REACHED;
     sink.bytes = decoded;
     sink.capacity = capacity;
     sink_device.priv = &sink;
@@ -573,35 +512,27 @@ static xxemul_status stream_decode(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *
                 offset = 10;
                 if (flags & 4) {
                     size_t n;
-                    if (input_size - offset < 2)
-                        goto decoded_done;
+                    if (input_size - offset < 2) goto decoded_done;
                     n = p[offset] | (size_t)p[offset + 1] << 8;
                     offset += 2;
-                    if (n > input_size - offset)
-                        goto decoded_done;
+                    if (n > input_size - offset) goto decoded_done;
                     offset += n;
                 }
                 if (flags & 8) {
-                    while (offset < input_size && p[offset])
-                        ++offset;
-                    if (offset == input_size)
-                        goto decoded_done;
+                    while (offset < input_size && p[offset]) ++offset;
+                    if (offset == input_size) goto decoded_done;
                     ++offset;
                 }
                 if (flags & 16) {
-                    while (offset < input_size && p[offset])
-                        ++offset;
-                    if (offset == input_size)
-                        goto decoded_done;
+                    while (offset < input_size && p[offset]) ++offset;
+                    if (offset == input_size) goto decoded_done;
                     ++offset;
                 }
                 if (flags & 2) {
                     uint16_t expected;
-                    if (input_size - offset < 2)
-                        goto decoded_done;
+                    if (input_size - offset < 2) goto decoded_done;
                     expected = (uint16_t)(p[offset] | (uint16_t)p[offset + 1] << 8);
-                    if ((uint16_t)xx_crc32(XX_CRC_TYPE_CRC32, p, offset) != expected)
-                        goto decoded_done;
+                    if ((uint16_t)xx_crc32(XX_CRC_TYPE_CRC32, p, offset) != expected) goto decoded_done;
                     offset += 2;
                 }
                 if (offset <= input_size && input_size - offset >= 8)
@@ -612,20 +543,16 @@ static xxemul_status stream_decode(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *
     }
 decoded_done:
     written = dst ? xx_io_tell(dst) : -1;
-    if (written < 0 || (uint64_t)written > capacity)
-        okay = 0;
-    if (okay && o->codec == 1)
-        okay = xx_zlib_stream_trailer_matches(input, input_size, decoded, (size_t)written);
+    if (written < 0 || (uint64_t)written > capacity) okay = 0;
+    if (okay && o->codec == 1) okay = xx_zlib_stream_trailer_matches(input, input_size, decoded, (size_t)written);
     if (okay && o->codec == 3) {
         const uint8_t *tail = source->bytes + source->length - 8;
         okay = xxemul_dotnet_u32(tail) == xx_crc32(XX_CRC_TYPE_CRC32, decoded, (size_t)written) && xxemul_dotnet_u32(tail + 4) == (uint32_t)written;
     }
-    if (src)
-        xx_io_close(src);
+    if (src) xx_io_close(src);
     if (!okay) {
         host_free(h, decoded, capacity);
-        if (sink.limit_reached)
-            return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "decompressed stream exceeds configured storage bound");
+        if (sink.limit_reached) return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "decompressed stream exceeds configured storage bound");
         return xxemul_dotnet_vm_raise_type(vm, "System.IO.InvalidDataException");
     }
     {
@@ -658,32 +585,25 @@ static xxemul_status clone_value(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *fr
         *out = in;
         return XXEMUL_STATUS_OK;
     }
-    if (depth > 32)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (depth > 32) return XXEMUL_STATUS_LIMIT_REACHED;
     text = xxemul_dotnet_vm_get_string(from, (uint32_t)in.bits, &n);
-    if (text)
-        return text_result(to, text, n, out);
+    if (text) return text_result(to, text, n, out);
     type = xxemul_dotnet_vm_object_type(from, (uint32_t)in.bits);
-    if (!type)
-        return XXEMUL_STATUS_ADDRESS_FAULT;
+    if (!type) return XXEMUL_STATUS_ADDRESS_FAULT;
     if (xxemul_dotnet_vm_unbox(from, (uint32_t)in.bits, &item) == XXEMUL_STATUS_OK) {
         status = xxemul_dotnet_vm_box(to, type, item, &ref);
-        if (status == XXEMUL_STATUS_OK)
-            *out = object_value(ref);
+        if (status == XXEMUL_STATUS_OK) *out = object_value(ref);
         return status;
     }
     n = strlen(type);
     if (n >= 2 && !strcmp(type + n - 2, "[]")) {
         char *element = host_string(h, type, n - 2);
         size_t length;
-        if (!element)
-            return XXEMUL_STATUS_LIMIT_REACHED;
+        if (!element) return XXEMUL_STATUS_LIMIT_REACHED;
         status = xxemul_dotnet_vm_array_length(from, (uint32_t)in.bits, &length);
-        if (status == XXEMUL_STATUS_OK)
-            status = xxemul_dotnet_vm_new_array(to, element, length, &ref);
+        if (status == XXEMUL_STATUS_OK) status = xxemul_dotnet_vm_new_array(to, element, length, &ref);
         host_free(h, element, n - 1);
-        if (status != XXEMUL_STATUS_OK)
-            return status;
+        if (status != XXEMUL_STATUS_OK) return status;
         for (i = 0; i < length; ++i) {
             if ((status = xxemul_dotnet_vm_array_get(from, (uint32_t)in.bits, i, &item)) != XXEMUL_STATUS_OK ||
                 (status = clone_value(h, from, to, item, &cloned, depth + 1)) != XXEMUL_STATUS_OK ||
@@ -700,42 +620,35 @@ static xxemul_status intrinsic_callback(void *context, xxemul_dotnet_vm *vm, con
 {
     xxemul_dotnet_bcl_host *h = context;
     *handled = 0;
-    if ((h->config.flags & XXEMUL_DOTNET_BCL_SHARPZIP_STREAMS) &&
-        !strcmp(m->type_name, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream") &&
+    if ((h->config.flags & XXEMUL_DOTNET_BCL_SHARPZIP_STREAMS) && !strcmp(m->type_name, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream") &&
         (!strcmp(m->name, ".ctor") || !strcmp(m->name, "Read") || !strcmp(m->name, "Close") || !strcmp(m->name, "Dispose"))) {
         *handled = 1;
         return bcl_dispatch(h, vm, m, a, count, result);
     }
     return XXEMUL_STATUS_OK;
 }
-static xxemul_status field_callback(void *context, xxemul_dotnet_vm *vm, const xxemul_dotnet_field_info *field, int store, xxemul_dotnet_value *result,
-                                    int *handled)
+static xxemul_status field_callback(void *context, xxemul_dotnet_vm *vm, const xxemul_dotnet_field_info *field, int store, xxemul_dotnet_value *result, int *handled)
 {
     xxemul_dotnet_bcl_host *h = context;
     bcl_object *o;
     xxemul_status status;
     uint32_t reference;
     *handled = 0;
-    if (!framework_assembly(field->assembly_name))
-        return XXEMUL_STATUS_OK;
+    if (!framework_assembly(field->assembly_name)) return XXEMUL_STATUS_OK;
     if (!strcmp(field->type_name, "System.String") && !strcmp(field->name, "Empty") && !strcmp(field->signature, "System.String")) {
         *handled = 1;
-        if (store)
-            return xxemul_dotnet_vm_raise_type(vm, "System.FieldAccessException");
+        if (store) return xxemul_dotnet_vm_raise_type(vm, "System.FieldAccessException");
         for (o = h->objects; o; o = o->next)
             if (o->vm == vm && o->kind == BCL_CONSTANT && o->name && !strcmp(o->name, "System.String.Empty")) {
                 *result = object_value(o->reference);
                 return XXEMUL_STATUS_OK;
             }
         status = xxemul_dotnet_vm_new_string(vm, "", 0, &reference);
-        if (status != XXEMUL_STATUS_OK)
-            return status;
+        if (status != XXEMUL_STATUS_OK) return status;
         o = attach(h, vm, reference, BCL_CONSTANT);
-        if (!o)
-            return XXEMUL_STATUS_LIMIT_REACHED;
+        if (!o) return XXEMUL_STATUS_LIMIT_REACHED;
         o->name = host_string(h, "System.String.Empty", 19);
-        if (!o->name)
-            return XXEMUL_STATUS_LIMIT_REACHED;
+        if (!o->name) return XXEMUL_STATUS_LIMIT_REACHED;
         *result = object_value(reference);
         return XXEMUL_STATUS_OK;
     }
@@ -745,8 +658,7 @@ static xxemul_status ensure_vm(xxemul_dotnet_bcl_host *h, bcl_module *module, ui
 {
     xxemul_dotnet_vm_config config;
     xxemul_status status;
-    if (module->vm)
-        return XXEMUL_STATUS_OK;
+    if (module->vm) return XXEMUL_STATUS_OK;
     memset(&config, 0, sizeof(config));
     config.max_instructions = budget;
     config.max_heap_bytes = h->config.max_heap_bytes;
@@ -774,37 +686,27 @@ static xxemul_status reflected_invoke(xxemul_dotnet_bcl_host *h, xxemul_dotnet_v
     xxemul_status status;
     uint64_t used = xxemul_dotnet_vm_instruction_count(caller), budget;
     uint32_t boxed;
-    if (count != 3 || !method || method->kind != BCL_METHOD || !method->module)
-        return XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (h->invoke_depth >= 16)
-        return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "managed host call depth reached");
+    if (count != 3 || !method || method->kind != BCL_METHOD || !method->module) return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (h->invoke_depth >= 16) return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "managed host call depth reached");
     target = &method->module->program->methods[method->index];
     if (a[2].bits && xxemul_dotnet_vm_array_length(caller, (uint32_t)a[2].bits, &n) != XXEMUL_STATUS_OK)
         return xxemul_dotnet_vm_raise_type(caller, "System.ArgumentException");
-    if (n != target->signature.parameter_count)
-        return xxemul_dotnet_vm_raise_type(caller, "System.Reflection.TargetParameterCountException");
-    if (used >= h->config.max_instructions)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (n != target->signature.parameter_count) return xxemul_dotnet_vm_raise_type(caller, "System.Reflection.TargetParameterCountException");
+    if (used >= h->config.max_instructions) return XXEMUL_STATUS_LIMIT_REACHED;
     budget = h->config.max_instructions - used;
-    if ((status = ensure_vm(h, method->module, budget)) != XXEMUL_STATUS_OK)
-        return status;
+    if ((status = ensure_vm(h, method->module, budget)) != XXEMUL_STATUS_OK) return status;
     arguments = host_alloc(h, (n + (target->signature.has_this ? 1 : 0)) * sizeof(*arguments));
-    if (!arguments)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (!arguments) return XXEMUL_STATUS_LIMIT_REACHED;
     if (target->signature.has_this) {
         status = clone_value(h, caller, method->module->vm, a[1], &arguments[0], 0);
-        if (status != XXEMUL_STATUS_OK)
-            goto done;
+        if (status != XXEMUL_STATUS_OK) goto done;
         offset = 1;
     }
     for (i = 0; i < n; ++i) {
-        if ((status = xxemul_dotnet_vm_array_get(caller, (uint32_t)a[2].bits, i, &item)) != XXEMUL_STATUS_OK)
-            goto done;
-        if (item.kind == XXEMUL_DOTNET_VALUE_OBJECT && item.bits &&
-            xxemul_dotnet_vm_unbox(caller, (uint32_t)item.bits, &arguments[i + offset]) == XXEMUL_STATUS_OK)
+        if ((status = xxemul_dotnet_vm_array_get(caller, (uint32_t)a[2].bits, i, &item)) != XXEMUL_STATUS_OK) goto done;
+        if (item.kind == XXEMUL_DOTNET_VALUE_OBJECT && item.bits && xxemul_dotnet_vm_unbox(caller, (uint32_t)item.bits, &arguments[i + offset]) == XXEMUL_STATUS_OK)
             continue;
-        if ((status = clone_value(h, caller, method->module->vm, item, &arguments[i + offset], 0)) != XXEMUL_STATUS_OK)
-            goto done;
+        if ((status = clone_value(h, caller, method->module->vm, item, &arguments[i + offset], 0)) != XXEMUL_STATUS_OK) goto done;
     }
     ++h->statistics.reflected_invocations;
     ++h->invoke_depth;
@@ -827,16 +729,14 @@ static xxemul_status reflected_invoke(xxemul_dotnet_bcl_host *h, xxemul_dotnet_v
             const char *type = xxemul_dotnet_vm_object_type(method->module->vm, exception);
             bcl_object *inner, *wrapper, *source = lookup(h, method->module->vm, exception);
             status = new_host_object(h, caller, type ? type : "System.Exception", BCL_EXCEPTION, &inner);
-            if (status != XXEMUL_STATUS_OK)
-                goto done;
+            if (status != XXEMUL_STATUS_OK) goto done;
             inner->name = host_string(h, source && source->name ? source->name : "", source && source->name ? strlen(source->name) : 0);
             if (!inner->name) {
                 status = XXEMUL_STATUS_LIMIT_REACHED;
                 goto done;
             }
             status = new_host_object(h, caller, "System.Reflection.TargetInvocationException", BCL_EXCEPTION, &wrapper);
-            if (status != XXEMUL_STATUS_OK)
-                goto done;
+            if (status != XXEMUL_STATUS_OK) goto done;
             wrapper->name = host_string(h, "Exception has been thrown by the target of an invocation.", 57);
             wrapper->target = object_value(inner->reference);
             if (!wrapper->name) {
@@ -849,14 +749,11 @@ static xxemul_status reflected_invoke(xxemul_dotnet_bcl_host *h, xxemul_dotnet_v
         host_fail(h, status, "loaded assembly invocation failed: %s", result.diagnostic);
         goto done;
     }
-    if (result.value.kind == XXEMUL_DOTNET_VALUE_VOID)
-        *out = object_value(0);
-    else if (result.value.kind == XXEMUL_DOTNET_VALUE_OBJECT)
-        status = clone_value(h, method->module->vm, caller, result.value, out, 0);
+    if (result.value.kind == XXEMUL_DOTNET_VALUE_VOID) *out = object_value(0);
+    else if (result.value.kind == XXEMUL_DOTNET_VALUE_OBJECT) status = clone_value(h, method->module->vm, caller, result.value, out, 0);
     else {
         status = xxemul_dotnet_vm_box(caller, target->signature.return_type.name, result.value, &boxed);
-        if (status == XXEMUL_STATUS_OK)
-            *out = object_value(boxed);
+        if (status == XXEMUL_STATUS_OK) *out = object_value(boxed);
     }
 done:
     host_free(h, arguments, (n + (target->signature.has_this ? 1 : 0)) * sizeof(*arguments));
@@ -883,8 +780,7 @@ static xxemul_status stringify(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm, 
             return *text ? XXEMUL_STATUS_OK : XXEMUL_STATUS_LIMIT_REACHED;
         }
         type = xxemul_dotnet_vm_object_type(vm, (uint32_t)in.bits);
-        if (!type)
-            return XXEMUL_STATUS_ADDRESS_FAULT;
+        if (!type) return XXEMUL_STATUS_ADDRESS_FAULT;
         if (xxemul_dotnet_vm_unbox(vm, (uint32_t)in.bits, &unboxed) == XXEMUL_STATUS_OK) {
             if (!strcmp(type, "System.Boolean")) {
                 s = unboxed.bits ? "True" : "False";
@@ -912,23 +808,18 @@ static xxemul_status stringify(xxemul_dotnet_bcl_host *h, xxemul_dotnet_vm *vm, 
         *text = host_string(h, s, *size);
         return *text ? XXEMUL_STATUS_OK : XXEMUL_STATUS_LIMIT_REACHED;
     }
-    if (integer(in, &integer_value))
-        snprintf(number, sizeof(number), "%" PRId64, integer_value);
-    else if (in.kind == XXEMUL_DOTNET_VALUE_F)
-        return host_fail(h, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "floating-point default formatting is unsupported");
-    else
-        return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
+    if (integer(in, &integer_value)) snprintf(number, sizeof(number), "%" PRId64, integer_value);
+    else if (in.kind == XXEMUL_DOTNET_VALUE_F) return host_fail(h, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "floating-point default formatting is unsupported");
+    else return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     *size = strlen(number);
     *text = host_string(h, number, *size);
     return *text ? XXEMUL_STATUS_OK : XXEMUL_STATUS_LIMIT_REACHED;
 }
 static xxemul_status emit(xxemul_dotnet_bcl_host *h, unsigned stream, const char *p, size_t n)
 {
-    if (n > h->config.max_output_bytes - h->output_bytes)
-        return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "managed output budget reached");
+    if (n > h->config.max_output_bytes - h->output_bytes) return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "managed output budget reached");
     h->output_bytes += n;
-    if (h->config.output_callback)
-        h->config.output_callback(h->config.output_context, stream, p, n);
+    if (h->config.output_callback) h->config.output_callback(h->config.output_context, stream, p, n);
     return XXEMUL_STATUS_OK;
 }
 static int framework_assembly(const char *assembly)
@@ -948,11 +839,9 @@ static int framework_assembly(const char *assembly)
                                         "System.Resources.ResourceManager",
                                         "netstandard"};
     size_t i;
-    if (!assembly)
-        return 0;
+    if (!assembly) return 0;
     for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
-        if (!strcmp(assembly, names[i]))
-            return 1;
+        if (!strcmp(assembly, names[i])) return 1;
     return 0;
 }
 static int framework_scope(const xxemul_dotnet_method_info *m)
@@ -972,11 +861,9 @@ static int glob_match(const char *pattern, size_t pn, const char *text, size_t t
         } else if (star != SIZE_MAX) {
             pi = star + 1;
             ti = ++retry;
-        } else
-            return 0;
+        } else return 0;
     }
-    while (pi < pn && pattern[pi] == '*')
-        ++pi;
+    while (pi < pn && pattern[pi] == '*') ++pi;
     return pi == pn;
 }
 typedef struct service_signature {
@@ -1073,39 +960,29 @@ static int supported_signature(const xxemul_dotnet_method_info *method)
     };
     size_t i;
     for (i = 0; i < sizeof(list) / sizeof(list[0]); ++i)
-        if (!strcmp(method->type_name, list[i].type) && !strcmp(method->name, list[i].name) && !strcmp(method->signature, list[i].signature))
-            return 1;
+        if (!strcmp(method->type_name, list[i].type) && !strcmp(method->name, list[i].name) && !strcmp(method->signature, list[i].signature)) return 1;
     if (!strcmp(method->type_name, "System.Console") || !strcmp(method->type_name, "System.IO.TextWriter")) {
         static const char *const types[] = {"System.String", "System.Object", "System.Int32",   "System.Int64",
                                             "System.UInt32", "System.UInt64", "System.Boolean", "System.Char"};
-        if (strcmp(method->name, "Write") && strcmp(method->name, "WriteLine"))
-            return 0;
-        if (!strcmp(method->signature, "()System.Void"))
-            return 1;
+        if (strcmp(method->name, "Write") && strcmp(method->name, "WriteLine")) return 0;
+        if (!strcmp(method->signature, "()System.Void")) return 1;
         for (i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
             char signature[128];
             snprintf(signature, sizeof(signature), "(%s)System.Void", types[i]);
-            if (!strcmp(method->signature, signature))
-                return 1;
+            if (!strcmp(method->signature, signature)) return 1;
         }
     }
-    if (!strcmp(method->type_name, "System.IO.Stream") || !strcmp(method->type_name, "System.IO.MemoryStream") ||
-        !strcmp(method->type_name, "System.IO.FileStream") || !strcmp(method->type_name, "System.IO.UnmanagedMemoryStream") ||
-        !strcmp(method->type_name, "System.IO.Compression.DeflateStream") || !strcmp(method->type_name, "System.IO.Compression.GZipStream") ||
+    if (!strcmp(method->type_name, "System.IO.Stream") || !strcmp(method->type_name, "System.IO.MemoryStream") || !strcmp(method->type_name, "System.IO.FileStream") ||
+        !strcmp(method->type_name, "System.IO.UnmanagedMemoryStream") || !strcmp(method->type_name, "System.IO.Compression.DeflateStream") ||
+        !strcmp(method->type_name, "System.IO.Compression.GZipStream") ||
         !strcmp(method->type_name, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream")) {
-        if ((!strcmp(method->name, "Close") || !strcmp(method->name, "Flush") || !strcmp(method->name, "Dispose")) &&
-            !strcmp(method->signature, "()System.Void"))
+        if ((!strcmp(method->name, "Close") || !strcmp(method->name, "Flush") || !strcmp(method->name, "Dispose")) && !strcmp(method->signature, "()System.Void"))
             return 1;
-        if (!strcmp(method->name, "Dispose") && !strcmp(method->signature, "(System.Boolean)System.Void"))
-            return 1;
-        if (!strcmp(method->name, "Seek") && !strcmp(method->signature, "(System.Int64,System.IO.SeekOrigin)System.Int64"))
-            return 1;
-        if ((!strcmp(method->name, "get_Length") || !strcmp(method->name, "get_Position")) && !strcmp(method->signature, "()System.Int64"))
-            return 1;
-        if (!strcmp(method->name, "Read") && !strcmp(method->signature, "(System.Byte[],System.Int32,System.Int32)System.Int32"))
-            return 1;
-        if (!strcmp(method->name, "Write") && !strcmp(method->signature, "(System.Byte[],System.Int32,System.Int32)System.Void"))
-            return 1;
+        if (!strcmp(method->name, "Dispose") && !strcmp(method->signature, "(System.Boolean)System.Void")) return 1;
+        if (!strcmp(method->name, "Seek") && !strcmp(method->signature, "(System.Int64,System.IO.SeekOrigin)System.Int64")) return 1;
+        if ((!strcmp(method->name, "get_Length") || !strcmp(method->name, "get_Position")) && !strcmp(method->signature, "()System.Int64")) return 1;
+        if (!strcmp(method->name, "Read") && !strcmp(method->signature, "(System.Byte[],System.Int32,System.Int32)System.Int32")) return 1;
+        if (!strcmp(method->name, "Write") && !strcmp(method->signature, "(System.Byte[],System.Int32,System.Int32)System.Void")) return 1;
     }
     return 0;
 }
@@ -1138,14 +1015,15 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         if (h->remaining_native_instructions > before)
             return host_fail(h, XXEMUL_STATUS_INVALID_ARGUMENT, "native provider increased instruction budget: %s", m->selector);
         h->statistics.native_instructions += before - h->remaining_native_instructions;
-        if (status != XXEMUL_STATUS_OK)
-            return host_fail(h, status, "native P/Invoke failed (%u): %s!%s", (unsigned)status, binding->module_name, binding->entry_point);
+        if (status != XXEMUL_STATUS_OK) return host_fail(h, status, "native P/Invoke failed (%u): %s!%s", (unsigned)status, binding->module_name, binding->entry_point);
         if (before == h->remaining_native_instructions)
             return host_fail(h, XXEMUL_STATUS_INVALID_ARGUMENT, "native provider completed without executing a guest instruction: %s", m->selector);
         switch (binding->return_type) {
             case 0x01: expected = XXEMUL_DOTNET_VALUE_VOID; break;
-            case 0x0a: case 0x0b: expected = XXEMUL_DOTNET_VALUE_I8; break;
-            case 0x18: case 0x19: expected = XXEMUL_DOTNET_VALUE_NATIVE; break;
+            case 0x0a:
+            case 0x0b: expected = XXEMUL_DOTNET_VALUE_I8; break;
+            case 0x18:
+            case 0x19: expected = XXEMUL_DOTNET_VALUE_NATIVE; break;
             default: expected = XXEMUL_DOTNET_VALUE_I4; break;
         }
         if (out->kind != expected || (expected == XXEMUL_DOTNET_VALUE_I4 && out->bits > UINT32_MAX) ||
@@ -1156,28 +1034,21 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         return XXEMUL_STATUS_OK;
     }
     if (!strcmp(t, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream")) {
-        if (!(h->config.flags & XXEMUL_DOTNET_BCL_SHARPZIP_STREAMS))
-            goto unsupported;
-    } else if (!framework_scope(m))
-        goto unsupported;
-    if (!supported_signature(m))
-        goto unsupported;
+        if (!(h->config.flags & XXEMUL_DOTNET_BCL_SHARPZIP_STREAMS)) goto unsupported;
+    } else if (!framework_scope(m)) goto unsupported;
+    if (!supported_signature(m)) goto unsupported;
     if (!strcmp(t, "System.Runtime.InteropServices.Marshal") && !strcmp(name, "GetLastWin32Error") && !count) {
         *out = value(XXEMUL_DOTNET_VALUE_I4, h->native_last_error);
         return XXEMUL_STATUS_OK;
     }
-    if (!strcmp(t, "System.Object") && !strcmp(name, ".ctor") && count == 1)
-        return XXEMUL_STATUS_OK;
+    if (!strcmp(t, "System.Object") && !strcmp(name, ".ctor") && count == 1) return XXEMUL_STATUS_OK;
     if ((!strcmp(t, "System.Object") || !strcmp(t, "System.Exception")) && !strcmp(name, "GetType") && count == 1) {
         const char *type = xxemul_dotnet_vm_object_type(vm, (uint32_t)a[0].bits);
-        if (!type)
-            return xxemul_dotnet_vm_raise_type(vm, "System.NullReferenceException");
+        if (!type) return xxemul_dotnet_vm_raise_type(vm, "System.NullReferenceException");
         status = new_host_object(h, vm, "System.Type", BCL_TYPE, &o);
-        if (status != XXEMUL_STATUS_OK)
-            return status;
+        if (status != XXEMUL_STATUS_OK) return status;
         o->name = host_string(h, type, strlen(type));
-        if (!o->name)
-            return XXEMUL_STATUS_LIMIT_REACHED;
+        if (!o->name) return XXEMUL_STATUS_LIMIT_REACHED;
         *out = object_value(o->reference);
         return XXEMUL_STATUS_OK;
     }
@@ -1188,8 +1059,7 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
     if ((!strcmp(t, "System.Object") || !strcmp(t, "System.Type") || !strcmp(t, "System.Version")) && !strcmp(name, "ToString") && count == 1) {
         char *text;
         status = stringify(h, vm, a[0], &text, &n);
-        if (status != XXEMUL_STATUS_OK)
-            return status;
+        if (status != XXEMUL_STATUS_OK) return status;
         status = text_result(vm, text, n, out);
         host_free(h, text, n + 1);
         return status;
@@ -1198,15 +1068,13 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         if (!strcmp(name, ".ctor") && (count == 1 || count == 2)) {
             s = count == 2 ? get_string(vm, a[1], &n) : "";
             if (!s) {
-                if (a[1].bits)
-                    return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
+                if (a[1].bits) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
                 s = "";
                 n = 0;
             }
             o = attach(h, vm, (uint32_t)a[0].bits, BCL_EXCEPTION);
-            if (!o)
-                return XXEMUL_STATUS_LIMIT_REACHED;
-            if (o->name) { /* .ctor called again on an existing object */
+            if (!o) return XXEMUL_STATUS_LIMIT_REACHED;
+            if (o->name) {                                  /* .ctor called again on an existing object */
                 host_free(h, o->name, strlen(o->name) + 1); /* same accounting as host destroy */
                 o->name = NULL;
             }
@@ -1214,40 +1082,32 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             return o->name ? XXEMUL_STATUS_OK : XXEMUL_STATUS_LIMIT_REACHED;
         }
         if (!strcmp(name, "get_Message") && count == 1)
-            return text_result(vm, o && o->kind == BCL_EXCEPTION && o->name ? o->name : "", o && o->kind == BCL_EXCEPTION && o->name ? strlen(o->name) : 0,
-                               out);
+            return text_result(vm, o && o->kind == BCL_EXCEPTION && o->name ? o->name : "", o && o->kind == BCL_EXCEPTION && o->name ? strlen(o->name) : 0, out);
         if (!strcmp(name, "get_InnerException") && count == 1) {
             *out = o && o->kind == BCL_EXCEPTION ? o->target : object_value(0);
-            if (out->kind == XXEMUL_DOTNET_VALUE_VOID)
-                *out = object_value(0);
+            if (out->kind == XXEMUL_DOTNET_VALUE_VOID) *out = object_value(0);
             return XXEMUL_STATUS_OK;
         }
     }
     if (!strcmp(t, "System.Type") && count == 1) {
         if (!strcmp(name, "GetTypeFromHandle") && a[0].kind == XXEMUL_DOTNET_VALUE_NATIVE) {
             s = xxemul_dotnet_type_name(program, (uint32_t)a[0].bits);
-            if (!s)
-                return XXEMUL_STATUS_INVALID_IMAGE;
+            if (!s) return XXEMUL_STATUS_INVALID_IMAGE;
             status = new_host_object(h, vm, "System.Type", BCL_TYPE, &o);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
+            if (status != XXEMUL_STATUS_OK) return status;
             o->name = host_string(h, s, strlen(s));
-            if (!o->name)
-                return XXEMUL_STATUS_LIMIT_REACHED;
+            if (!o->name) return XXEMUL_STATUS_LIMIT_REACHED;
             *out = object_value(o->reference);
             return XXEMUL_STATUS_OK;
         }
-        if (!strcmp(name, "get_FullName") && o && o->kind == BCL_TYPE)
-            return text_result(vm, o->name, strlen(o->name), out);
+        if (!strcmp(name, "get_FullName") && o && o->kind == BCL_TYPE) return text_result(vm, o->name, strlen(o->name), out);
     }
     if (!strcmp(t, "System.Environment") && !count) {
-        if (!strcmp(name, "get_NewLine"))
-            return text_result(vm, "\n", 1, out);
+        if (!strcmp(name, "get_NewLine")) return text_result(vm, "\n", 1, out);
     }
     if (!strcmp(t, "System.Text.UTF8Encoding") && !strcmp(name, ".ctor") && (count == 1 || count == 2 || count == 3)) {
         o = attach(h, vm, (uint32_t)a[0].bits, BCL_ENCODING);
-        if (!o)
-            return XXEMUL_STATUS_LIMIT_REACHED;
+        if (!o) return XXEMUL_STATUS_LIMIT_REACHED;
         o->channel = count > 1 ? (unsigned)!!a[1].bits : 0;
         return XXEMUL_STATUS_OK;
     }
@@ -1289,13 +1149,11 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         size_t begin = 0;
         char *text = NULL;
         if (!strcmp(t, "System.IO.TextWriter")) {
-            if (!o || o->kind != BCL_WRITER)
-                goto unsupported;
+            if (!o || o->kind != BCL_WRITER) goto unsupported;
             channel = o->channel;
             begin = 1;
         }
-        if (count > begin + 1)
-            goto unsupported;
+        if (count > begin + 1) goto unsupported;
         if (count > begin) {
             if (!strcmp(m->signature, "(System.Boolean)System.Void")) {
                 s = a[begin].bits ? "True" : "False";
@@ -1306,8 +1164,7 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                 uint16_t unit = (uint16_t)a[begin].bits;
                 xxemul_dotnet_value character;
                 status = units_to_text(h, vm, &unit, 1, &character);
-                if (status == XXEMUL_STATUS_OK)
-                    status = stringify(h, vm, character, &text, &n);
+                if (status == XXEMUL_STATUS_OK) status = stringify(h, vm, character, &text, &n);
             } else if (!strcmp(m->signature, "(System.UInt32)System.Void") || !strcmp(m->signature, "(System.UInt64)System.Void")) {
                 char number[32];
                 uint64_t bits = !strcmp(m->signature, "(System.UInt32)System.Void") ? (uint32_t)a[begin].bits : a[begin].bits;
@@ -1315,36 +1172,28 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                 n = strlen(number);
                 text = host_string(h, number, n);
                 status = text ? XXEMUL_STATUS_OK : XXEMUL_STATUS_LIMIT_REACHED;
-            } else
-                status = stringify(h, vm, a[begin], &text, &n);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
+            } else status = stringify(h, vm, a[begin], &text, &n);
+            if (status != XXEMUL_STATUS_OK) return status;
             status = emit(h, channel, text, n);
             host_free(h, text, n + 1);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
+            if (status != XXEMUL_STATUS_OK) return status;
         }
-        if (!strcmp(name, "WriteLine"))
-            return emit(h, channel, "\n", 1);
+        if (!strcmp(name, "WriteLine")) return emit(h, channel, "\n", 1);
         return XXEMUL_STATUS_OK;
     }
     if (!strcmp(t, "System.Reflection.Assembly")) {
-        if ((!strcmp(name, "GetExecutingAssembly") || !strcmp(name, "GetCallingAssembly")) && count == 0)
-            return assembly_object(h, vm, module, out);
-        if (!strcmp(name, "GetEntryAssembly") && count == 0)
-            return assembly_object(h, vm, h->entry_module, out);
+        if ((!strcmp(name, "GetExecutingAssembly") || !strcmp(name, "GetCallingAssembly")) && count == 0) return assembly_object(h, vm, module, out);
+        if (!strcmp(name, "GetEntryAssembly") && count == 0) return assembly_object(h, vm, h->entry_module, out);
         if (!strcmp(name, "Load") && count == 1) {
             uint8_t *bytes;
             size_t size;
             xxemul_dotnet_program *loaded;
             bcl_module *new_module;
             status = byte_array(h, vm, a[0], &bytes, &size);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
+            if (status != XXEMUL_STATUS_OK) return status;
             loaded = xxemul_dotnet_create(bytes, size, &status);
             host_free(h, bytes, size);
-            if (!loaded)
-                return status == XXEMUL_STATUS_INVALID_IMAGE ? xxemul_dotnet_vm_raise_type(vm, "System.BadImageFormatException") : status;
+            if (!loaded) return status == XXEMUL_STATUS_INVALID_IMAGE ? xxemul_dotnet_vm_raise_type(vm, "System.BadImageFormatException") : status;
             new_module = register_module(h, loaded, 1, "");
             if (!new_module) {
                 xxemul_dotnet_destroy(loaded);
@@ -1352,27 +1201,21 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             }
             return assembly_object(h, vm, new_module, out);
         }
-        if (!o || o->kind != BCL_ASSEMBLY)
-            goto unsupported;
-        if (!strcmp(name, "get_Location") && count == 1)
-            return text_result(vm, o->module->location, strlen(o->module->location), out);
+        if (!o || o->kind != BCL_ASSEMBLY) goto unsupported;
+        if (!strcmp(name, "get_Location") && count == 1) return text_result(vm, o->module->location, strlen(o->module->location), out);
         if (!strcmp(name, "GetManifestResourceStream") && count == 2) {
             const xxemul_dotnet_resource_info *resource;
             s = get_string(vm, a[1], &n);
-            if (!s || memchr(s, 0, n))
-                return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
+            if (!s || memchr(s, 0, n)) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
             resource = xxemul_dotnet_resource_find(o->module->program, s);
             if (!resource || resource->implementation) {
                 *out = object_value(0);
                 return XXEMUL_STATUS_OK;
             }
             status = new_host_object(h, vm, "System.IO.UnmanagedMemoryStream", BCL_STREAM, &o);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
-            if ((status = buffer_reserve(h, o, resource->size)) != XXEMUL_STATUS_OK)
-                return status;
-            if (resource->size)
-                memcpy(o->bytes, resource->data, resource->size);
+            if (status != XXEMUL_STATUS_OK) return status;
+            if ((status = buffer_reserve(h, o, resource->size)) != XXEMUL_STATUS_OK) return status;
+            if (resource->size) memcpy(o->bytes, resource->data, resource->size);
             o->length = resource->size;
             o->channel = 2;
             *out = object_value(o->reference);
@@ -1399,32 +1242,26 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             uint32_t array;
             size_t length = o->module->program->methods[o->index].signature.parameter_count;
             status = xxemul_dotnet_vm_new_array(vm, "System.Reflection.ParameterInfo", length, &array);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
+            if (status != XXEMUL_STATUS_OK) return status;
             for (i = 0; i < length; ++i) {
                 uint32_t parameter;
                 status = xxemul_dotnet_vm_new_object(vm, "System.Reflection.ParameterInfo", &parameter);
-                if (status != XXEMUL_STATUS_OK)
-                    return status;
+                if (status != XXEMUL_STATUS_OK) return status;
                 status = xxemul_dotnet_vm_array_set(vm, array, i, object_value(parameter));
-                if (status != XXEMUL_STATUS_OK)
-                    return status;
+                if (status != XXEMUL_STATUS_OK) return status;
             }
             *out = object_value(array);
             return XXEMUL_STATUS_OK;
         }
-        if (!strcmp(name, "Invoke"))
-            return reflected_invoke(h, vm, o, a, count, out);
+        if (!strcmp(name, "Invoke")) return reflected_invoke(h, vm, o, a, count, out);
     }
     if (!strcmp(t, "System.Resources.ResourceManager")) {
         if (!strcmp(name, ".ctor") && count == 3) {
             bcl_object *assembly = lookup(h, vm, (uint32_t)a[2].bits);
             s = get_string(vm, a[1], &n);
-            if (!s || memchr(s, 0, n) || !assembly || assembly->kind != BCL_ASSEMBLY)
-                return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
+            if (!s || memchr(s, 0, n) || !assembly || assembly->kind != BCL_ASSEMBLY) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
             o = attach(h, vm, (uint32_t)a[0].bits, BCL_RESOURCE_MANAGER);
-            if (!o)
-                return XXEMUL_STATUS_LIMIT_REACHED;
+            if (!o) return XXEMUL_STATUS_LIMIT_REACHED;
             o->module = assembly->module;
             o->name = host_string(h, s, n);
             return o->name ? XXEMUL_STATUS_OK : XXEMUL_STATUS_LIMIT_REACHED;
@@ -1436,23 +1273,18 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             const char *error = NULL;
             char *container;
             s = get_string(vm, a[1], &n);
-            if (!s)
-                return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
+            if (!s) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
             i = strlen(o->name);
             container = host_alloc(h, i + 11);
-            if (!container)
-                return XXEMUL_STATUS_LIMIT_REACHED;
+            if (!container) return XXEMUL_STATUS_LIMIT_REACHED;
             memcpy(container, o->name, i);
             memcpy(container + i, ".resources", 11);
             resource = xxemul_dotnet_resource_find(o->module->program, container);
             host_free(h, container, i + 11);
-            if (!resource || resource->implementation)
-                return xxemul_dotnet_vm_raise_type(vm, "System.Resources.MissingManifestResourceException");
-            if (!xx_dotnet_resources_open(resource->data, resource->size, &view, &error))
-                return xxemul_dotnet_vm_raise_type(vm, "System.IO.InvalidDataException");
+            if (!resource || resource->implementation) return xxemul_dotnet_vm_raise_type(vm, "System.Resources.MissingManifestResourceException");
+            if (!xx_dotnet_resources_open(resource->data, resource->size, &view, &error)) return xxemul_dotnet_vm_raise_type(vm, "System.IO.InvalidDataException");
             if (!xx_dotnet_resources_find(&view, (const uint8_t *)s, n, &entry, &error)) {
-                if (error)
-                    return xxemul_dotnet_vm_raise_type(vm, "System.IO.InvalidDataException");
+                if (error) return xxemul_dotnet_vm_raise_type(vm, "System.IO.InvalidDataException");
                 *out = object_value(0);
                 return XXEMUL_STATUS_OK;
             }
@@ -1460,18 +1292,13 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                 *out = object_value(0);
                 return XXEMUL_STATUS_OK;
             }
-            if (entry.type == 32)
-                return bytes_result(vm, entry.data, entry.size, out);
-            if (entry.type == 1)
-                return text_result(vm, (const char *)entry.data, entry.size, out);
+            if (entry.type == 32) return bytes_result(vm, entry.data, entry.size, out);
+            if (entry.type == 1) return text_result(vm, (const char *)entry.data, entry.size, out);
             if (entry.type == 33) {
                 status = new_host_object(h, vm, "System.IO.UnmanagedMemoryStream", BCL_STREAM, &o);
-                if (status != XXEMUL_STATUS_OK)
-                    return status;
-                if ((status = buffer_reserve(h, o, entry.size)) != XXEMUL_STATUS_OK)
-                    return status;
-                if (entry.size)
-                    memcpy(o->bytes, entry.data, entry.size);
+                if (status != XXEMUL_STATUS_OK) return status;
+                if ((status = buffer_reserve(h, o, entry.size)) != XXEMUL_STATUS_OK) return status;
+                if (entry.size) memcpy(o->bytes, entry.data, entry.size);
                 o->length = entry.size;
                 o->channel = 2;
                 *out = object_value(o->reference);
@@ -1483,13 +1310,10 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                 uint64_t bits = 0;
                 uint32_t reference;
                 xxemul_dotnet_value primitive;
-                for (i = 0; i < entry.size; ++i)
-                    bits |= (uint64_t)entry.data[i] << (i * 8);
+                for (i = 0; i < entry.size; ++i) bits |= (uint64_t)entry.data[i] << (i * 8);
                 primitive = value(entry.type >= 10 && entry.type <= 11 ? XXEMUL_DOTNET_VALUE_I8 : XXEMUL_DOTNET_VALUE_I4, bits);
-                if (entry.type == 5)
-                    primitive.bits = (uint32_t)(int32_t)(int8_t)bits;
-                if (entry.type == 6)
-                    primitive.bits = (uint32_t)(int32_t)(int16_t)bits;
+                if (entry.type == 5) primitive.bits = (uint32_t)(int32_t)(int8_t)bits;
+                if (entry.type == 6) primitive.bits = (uint32_t)(int32_t)(int16_t)bits;
                 if (entry.type == 12) {
                     uint32_t raw = (uint32_t)bits;
                     float f;
@@ -1499,11 +1323,9 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                     memcpy(&bits, &d, 8);
                     primitive = value(XXEMUL_DOTNET_VALUE_F, bits);
                 }
-                if (entry.type == 13)
-                    primitive = value(XXEMUL_DOTNET_VALUE_F, bits);
+                if (entry.type == 13) primitive = value(XXEMUL_DOTNET_VALUE_F, bits);
                 status = xxemul_dotnet_vm_box(vm, names[entry.type - 2], primitive, &reference);
-                if (status == XXEMUL_STATUS_OK)
-                    *out = object_value(reference);
+                if (status == XXEMUL_STATUS_OK) *out = object_value(reference);
                 return status;
             }
             return host_fail(h, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "ResourceManager value type %u unsupported", entry.type);
@@ -1513,81 +1335,67 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         uint8_t *bytes = NULL;
         size_t size = 0;
         o = attach(h, vm, (uint32_t)a[0].bits, BCL_STREAM);
-        if (!o)
-            return XXEMUL_STATUS_LIMIT_REACHED;
+        if (!o) return XXEMUL_STATUS_LIMIT_REACHED;
         if (count == 2) {
             status = byte_array(h, vm, a[1], &bytes, &size);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
+            if (status != XXEMUL_STATUS_OK) return status;
             reset_stream(h, o); /* a repeated .ctor must not leak the old buffer */
             o->bytes = bytes;
             o->length = size;
             o->capacity = size ? size : 1;
             o->source = (uint32_t)a[1].bits;
             o->insensitive = 1;
-        } else
-            reset_stream(h, o);
+        } else reset_stream(h, o);
         return XXEMUL_STATUS_OK;
     }
     if ((!strcmp(t, "System.IO.Compression.DeflateStream") || !strcmp(t, "System.IO.Compression.GZipStream") ||
          !strcmp(t, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream")) &&
         !strcmp(name, ".ctor")) {
         bcl_object *source;
-        if (count < 2 || count > 4 || !(source = lookup(h, vm, (uint32_t)a[1].bits)) || source->kind != BCL_STREAM)
-            goto unsupported;
-        if (strcmp(t, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream") && (count < 3 || a[2].bits != 0))
-            goto unsupported;
+        if (count < 2 || count > 4 || !(source = lookup(h, vm, (uint32_t)a[1].bits)) || source->kind != BCL_STREAM) goto unsupported;
+        if (strcmp(t, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream") && (count < 3 || a[2].bits != 0)) goto unsupported;
         o = attach(h, vm, (uint32_t)a[0].bits, BCL_STREAM);
-        if (!o)
-            return XXEMUL_STATUS_LIMIT_REACHED;
+        if (!o) return XXEMUL_STATUS_LIMIT_REACHED;
         if (stream_source_cycle(h, vm, o, source)) /* self or a chain back to this stream */
             return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
         reset_stream(h, o);
         o->source = (uint32_t)a[1].bits;
         o->codec = !strcmp(t, "System.IO.Compression.DeflateStream") ? 2 : !strcmp(t, "System.IO.Compression.GZipStream") ? 3 : 1;
         o->channel = count == 4 && a[3].bits ? 1 : 0;
-        if (o->codec == 1)
-            ++h->statistics.sharpzip_streams;
+        if (o->codec == 1) ++h->statistics.sharpzip_streams;
         return XXEMUL_STATUS_OK;
     }
     if (o && o->kind == BCL_STREAM &&
-        (!strcmp(t, "System.IO.Stream") || !strcmp(t, "System.IO.MemoryStream") || !strcmp(t, "System.IO.FileStream") ||
-         !strcmp(t, "System.IO.UnmanagedMemoryStream") || !strcmp(t, "System.IO.Compression.DeflateStream") || !strcmp(t, "System.IO.Compression.GZipStream") ||
+        (!strcmp(t, "System.IO.Stream") || !strcmp(t, "System.IO.MemoryStream") || !strcmp(t, "System.IO.FileStream") || !strcmp(t, "System.IO.UnmanagedMemoryStream") ||
+         !strcmp(t, "System.IO.Compression.DeflateStream") || !strcmp(t, "System.IO.Compression.GZipStream") ||
          !strcmp(t, "ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream"))) {
         if ((!strcmp(name, "Close") || !strcmp(name, "Dispose")) && (count == 1 || count == 2)) {
             close_stream(h, vm, o);
             return XXEMUL_STATUS_OK;
         }
         if (!strcmp(name, "ToArray") && count == 1 && !o->codec && !strcmp(t, "System.IO.MemoryStream")) {
-            if ((status = sync_array_stream(vm, o)) != XXEMUL_STATUS_OK)
-                return status;
+            if ((status = sync_array_stream(vm, o)) != XXEMUL_STATUS_OK) return status;
             return bytes_result(vm, o->bytes, o->length, out);
         }
-        if (o->closed)
-            return xxemul_dotnet_vm_raise_type(vm, "System.ObjectDisposedException");
+        if (o->closed) return xxemul_dotnet_vm_raise_type(vm, "System.ObjectDisposedException");
         if (!strcmp(name, "Read") && count == 4) {
             size_t array_length, read;
             xxemul_dotnet_value item;
-            if (!integer(a[2], &x) || !integer(a[3], &y) || x < 0 || y < 0 ||
-                xxemul_dotnet_vm_array_length(vm, (uint32_t)a[1].bits, &array_length) != XXEMUL_STATUS_OK || (uint64_t)x > array_length ||
-                (uint64_t)y > array_length - (size_t)x)
+            if (!integer(a[2], &x) || !integer(a[3], &y) || x < 0 || y < 0 || xxemul_dotnet_vm_array_length(vm, (uint32_t)a[1].bits, &array_length) != XXEMUL_STATUS_OK ||
+                (uint64_t)x > array_length || (uint64_t)y > array_length - (size_t)x)
                 return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentOutOfRangeException");
             if (!y) {
                 ++h->statistics.stream_reads;
                 *out = value(XXEMUL_DOTNET_VALUE_I4, 0);
                 return XXEMUL_STATUS_OK;
             }
-            if ((status = sync_array_stream(vm, o)) != XXEMUL_STATUS_OK)
-                return status;
-            if ((status = stream_decode(h, vm, o)) != XXEMUL_STATUS_OK)
-                return status;
+            if ((status = sync_array_stream(vm, o)) != XXEMUL_STATUS_OK) return status;
+            if ((status = stream_decode(h, vm, o)) != XXEMUL_STATUS_OK) return status;
             read = o->position < o->length ? o->length - o->position : 0;
-            if (read > (size_t)y)
-                read = (size_t)y;
+            if (read > (size_t)y) read = (size_t)y;
             for (i = 0; i < read; ++i) {
                 item = value(XXEMUL_DOTNET_VALUE_I4, o->bytes[o->position + i]);
-                if ((status = xxemul_dotnet_vm_array_set(vm, (uint32_t)a[1].bits, (size_t)x + i, item)) != XXEMUL_STATUS_OK)
-                    return status;
+                if ((status = xxemul_dotnet_vm_array_set(vm, (uint32_t)a[1].bits, (size_t)x + i, item)) != XXEMUL_STATUS_OK) return status;
             }
             o->position += read;
             ++h->statistics.stream_reads;
@@ -1597,43 +1405,32 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         if (!strcmp(name, "Write") && count == 4) {
             size_t array_length;
             xxemul_dotnet_value item;
-            if (o->codec || o->channel == 2)
-                return xxemul_dotnet_vm_raise_type(vm, "System.NotSupportedException");
-            if (!integer(a[2], &x) || !integer(a[3], &y) || x < 0 || y < 0 ||
-                xxemul_dotnet_vm_array_length(vm, (uint32_t)a[1].bits, &array_length) != XXEMUL_STATUS_OK || (uint64_t)x > array_length ||
-                (uint64_t)y > array_length - (size_t)x || o->position > h->config.max_image_bytes || (uint64_t)y > h->config.max_image_bytes - o->position)
+            if (o->codec || o->channel == 2) return xxemul_dotnet_vm_raise_type(vm, "System.NotSupportedException");
+            if (!integer(a[2], &x) || !integer(a[3], &y) || x < 0 || y < 0 || xxemul_dotnet_vm_array_length(vm, (uint32_t)a[1].bits, &array_length) != XXEMUL_STATUS_OK ||
+                (uint64_t)x > array_length || (uint64_t)y > array_length - (size_t)x || o->position > h->config.max_image_bytes ||
+                (uint64_t)y > h->config.max_image_bytes - o->position)
                 return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentOutOfRangeException");
-            if (o->insensitive && o->position + (size_t)y > o->length)
-                return xxemul_dotnet_vm_raise_type(vm, "System.NotSupportedException");
-            if ((status = buffer_reserve(h, o, o->position + (size_t)y)) != XXEMUL_STATUS_OK)
-                return status;
+            if (o->insensitive && o->position + (size_t)y > o->length) return xxemul_dotnet_vm_raise_type(vm, "System.NotSupportedException");
+            if ((status = buffer_reserve(h, o, o->position + (size_t)y)) != XXEMUL_STATUS_OK) return status;
             for (i = 0; i < (size_t)y; ++i) {
-                if ((status = xxemul_dotnet_vm_array_get(vm, (uint32_t)a[1].bits, (size_t)x + i, &item)) != XXEMUL_STATUS_OK)
-                    return status;
-                if (item.kind != XXEMUL_DOTNET_VALUE_I4 || item.bits > 255)
-                    return XXEMUL_STATUS_DECODE_ERROR;
+                if ((status = xxemul_dotnet_vm_array_get(vm, (uint32_t)a[1].bits, (size_t)x + i, &item)) != XXEMUL_STATUS_OK) return status;
+                if (item.kind != XXEMUL_DOTNET_VALUE_I4 || item.bits > 255) return XXEMUL_STATUS_DECODE_ERROR;
                 o->bytes[o->position + i] = (uint8_t)item.bits;
-                if (o->insensitive && (status = xxemul_dotnet_vm_array_set(vm, o->source, o->position + i, item)) != XXEMUL_STATUS_OK)
-                    return status;
+                if (o->insensitive && (status = xxemul_dotnet_vm_array_set(vm, o->source, o->position + i, item)) != XXEMUL_STATUS_OK) return status;
             }
             o->position += (size_t)y;
-            if (o->length < o->position)
-                o->length = o->position;
+            if (o->length < o->position) o->length = o->position;
             ++h->statistics.stream_writes;
             return XXEMUL_STATUS_OK;
         }
-        if (!strcmp(name, "Flush") && count == 1)
-            return XXEMUL_STATUS_OK;
+        if (!strcmp(name, "Flush") && count == 1) return XXEMUL_STATUS_OK;
         if (!strcmp(name, "Seek") && count == 3) {
             int64_t target;
-            if (o->codec || !integer(a[1], &x) || !integer(a[2], &y) || y < 0 || y > 2)
-                goto unsupported;
+            if (o->codec || !integer(a[1], &x) || !integer(a[2], &y) || y < 0 || y > 2) goto unsupported;
             target = y == 0 ? 0 : y == 1 ? (int64_t)o->position : (int64_t)o->length;
-            if ((x > 0 && target > INT64_MAX - x) || (x < 0 && target < INT64_MIN - x))
-                return xxemul_dotnet_vm_raise_type(vm, "System.IO.IOException");
+            if ((x > 0 && target > INT64_MAX - x) || (x < 0 && target < INT64_MIN - x)) return xxemul_dotnet_vm_raise_type(vm, "System.IO.IOException");
             target += x;
-            if (target < 0 || (uint64_t)target > h->config.max_image_bytes)
-                return xxemul_dotnet_vm_raise_type(vm, "System.IO.IOException");
+            if (target < 0 || (uint64_t)target > h->config.max_image_bytes) return xxemul_dotnet_vm_raise_type(vm, "System.IO.IOException");
             o->position = (size_t)target;
             *out = value(XXEMUL_DOTNET_VALUE_I8, (uint64_t)target);
             return XXEMUL_STATUS_OK;
@@ -1649,38 +1446,29 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
     }
     if (!strcmp(t, "System.Security.Cryptography.SHA256") && !strcmp(name, "Create") && count == 0) {
         status = new_host_object(h, vm, "System.Security.Cryptography.SHA256", BCL_HASH, &o);
-        if (status == XXEMUL_STATUS_OK)
-            *out = object_value(o->reference);
+        if (status == XXEMUL_STATUS_OK) *out = object_value(o->reference);
         return status;
     }
     if (!strcmp(t, "System.Security.Cryptography.HashAlgorithm") && !strcmp(name, "ComputeHash") && count == 2 && o && o->kind == BCL_HASH) {
         bcl_object *stream = lookup(h, vm, (uint32_t)a[1].bits);
         uint8_t digest[32];
-        if (o->closed)
-            return xxemul_dotnet_vm_raise_type(vm, "System.ObjectDisposedException");
+        if (o->closed) return xxemul_dotnet_vm_raise_type(vm, "System.ObjectDisposedException");
         if (!strcmp(m->signature, "(System.Byte[])System.Byte[]")) {
             uint8_t *bytes;
             size_t length;
             status = byte_array(h, vm, a[1], &bytes, &length);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
+            if (status != XXEMUL_STATUS_OK) return status;
             int okay = xx_sha256_memory(bytes, length, digest);
             host_free(h, bytes, length);
-            if (!okay)
-                return XXEMUL_STATUS_INVALID_ARGUMENT;
+            if (!okay) return XXEMUL_STATUS_INVALID_ARGUMENT;
             ++h->statistics.sha256_operations;
             return bytes_result(vm, digest, sizeof(digest), out);
         }
-        if (!stream || stream->kind != BCL_STREAM || stream->closed)
-            return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
-        if ((status = sync_array_stream(vm, stream)) != XXEMUL_STATUS_OK)
-            return status;
-        if ((status = stream_decode(h, vm, stream)) != XXEMUL_STATUS_OK)
-            return status;
-        if (stream->position > stream->length)
-            return XXEMUL_STATUS_DECODE_ERROR;
-        if (!xx_sha256_memory(stream->length > stream->position ? stream->bytes + stream->position : (const uint8_t *)"", stream->length - stream->position,
-                              digest))
+        if (!stream || stream->kind != BCL_STREAM || stream->closed) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
+        if ((status = sync_array_stream(vm, stream)) != XXEMUL_STATUS_OK) return status;
+        if ((status = stream_decode(h, vm, stream)) != XXEMUL_STATUS_OK) return status;
+        if (stream->position > stream->length) return XXEMUL_STATUS_DECODE_ERROR;
+        if (!xx_sha256_memory(stream->length > stream->position ? stream->bytes + stream->position : (const uint8_t *)"", stream->length - stream->position, digest))
             return XXEMUL_STATUS_INVALID_ARGUMENT;
         stream->position = stream->length;
         ++h->statistics.sha256_operations;
@@ -1704,8 +1492,7 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         char *hex;
         static const char digits[] = "0123456789ABCDEF";
         status = byte_array(h, vm, a[0], &bytes, &length);
-        if (status != XXEMUL_STATUS_OK)
-            return status;
+        if (status != XXEMUL_STATUS_OK) return status;
         if (length > (h->config.max_native_bytes - 1) / 3) {
             host_free(h, bytes, length);
             return XXEMUL_STATUS_LIMIT_REACHED;
@@ -1719,8 +1506,7 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         for (i = 0; i < length; ++i) {
             hex[i * 3] = digits[bytes[i] >> 4];
             hex[i * 3 + 1] = digits[bytes[i] & 15];
-            if (i + 1 < length)
-                hex[i * 3 + 2] = '-';
+            if (i + 1 < length) hex[i * 3 + 2] = '-';
         }
         status = text_result(vm, hex, n, out);
         host_free(h, hex, n + 1);
@@ -1736,19 +1522,15 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             if (count == 1 && a[0].kind == XXEMUL_DOTNET_VALUE_OBJECT && xxemul_dotnet_vm_array_length(vm, (uint32_t)a[0].bits, &items) == XXEMUL_STATUS_OK)
                 array = (uint32_t)a[0].bits;
             text = host_alloc(h, 1);
-            if (!text)
-                return XXEMUL_STATUS_LIMIT_REACHED;
+            if (!text) return XXEMUL_STATUS_LIMIT_REACHED;
             for (i = 0; i < items; ++i) {
                 char *part, *grown;
                 size_t part_size;
                 if (array) {
-                    if ((status = xxemul_dotnet_vm_array_get(vm, array, i, &item)) != XXEMUL_STATUS_OK)
-                        goto concat_done;
-                } else
-                    item = a[i];
+                    if ((status = xxemul_dotnet_vm_array_get(vm, array, i, &item)) != XXEMUL_STATUS_OK) goto concat_done;
+                } else item = a[i];
                 status = stringify(h, vm, item, &part, &part_size);
-                if (status != XXEMUL_STATUS_OK)
-                    goto concat_done;
+                if (status != XXEMUL_STATUS_OK) goto concat_done;
                 if (part_size > h->config.max_native_bytes - total - 1 || part_size > h->config.max_native_bytes - h->native_bytes) {
                     host_free(h, part, part_size + 1);
                     status = XXEMUL_STATUS_LIMIT_REACHED;
@@ -1776,33 +1558,26 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             size_t na, nb;
             const char *sa = get_string(vm, a[0], &na), *sb = get_string(vm, a[1], &nb);
             int equal;
-            if (!sa && !a[0].bits)
-                equal = !sb && !a[1].bits;
-            else
-                equal = sa && sb && na == nb && !memcmp(sa, sb, na);
-            if (!strcmp(name, "op_Inequality"))
-                equal = !equal;
+            if (!sa && !a[0].bits) equal = !sb && !a[1].bits;
+            else equal = sa && sb && na == nb && !memcmp(sa, sb, na);
+            if (!strcmp(name, "op_Inequality")) equal = !equal;
             *out = value(XXEMUL_DOTNET_VALUE_I4, (unsigned)equal);
             return XXEMUL_STATUS_OK;
         }
-        if (!count || (s = get_string(vm, a[0], &n)) == NULL)
-            return xxemul_dotnet_vm_raise_type(vm, "System.NullReferenceException");
+        if (!count || (s = get_string(vm, a[0], &n)) == NULL) return xxemul_dotnet_vm_raise_type(vm, "System.NullReferenceException");
         if (!strcmp(name, "Replace") && count == 3) {
             size_t old_size, new_size, at = 0, total = 0;
             const char *old = get_string(vm, a[1], &old_size), *replacement = get_string(vm, a[2], &new_size);
             char *buffer;
-            if (!old || !old_size)
-                return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
+            if (!old || !old_size) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
             if (!replacement) {
-                if (a[2].bits)
-                    return XXEMUL_STATUS_INVALID_ARGUMENT;
+                if (a[2].bits) return XXEMUL_STATUS_INVALID_ARGUMENT;
                 replacement = "";
                 new_size = 0;
             }
             while (at < n) {
                 if (old_size <= n - at && !memcmp(s + at, old, old_size)) {
-                    if (new_size > h->config.max_native_bytes - total)
-                        return XXEMUL_STATUS_LIMIT_REACHED;
+                    if (new_size > h->config.max_native_bytes - total) return XXEMUL_STATUS_LIMIT_REACHED;
                     total += new_size;
                     at += old_size;
                 } else {
@@ -1811,8 +1586,7 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                 }
             }
             buffer = host_alloc(h, total + 1);
-            if (!buffer)
-                return XXEMUL_STATUS_LIMIT_REACHED;
+            if (!buffer) return XXEMUL_STATUS_LIMIT_REACHED;
             at = 0;
             i = 0;
             while (at < n) {
@@ -1820,8 +1594,7 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                     memcpy(buffer + i, replacement, new_size);
                     i += new_size;
                     at += old_size;
-                } else
-                    buffer[i++] = s[at++];
+                } else buffer[i++] = s[at++];
             }
             status = text_result(vm, buffer, total, out);
             host_free(h, buffer, total + 1);
@@ -1829,12 +1602,10 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         }
         if ((!strcmp(name, "ToLower") || !strcmp(name, "ToLowerInvariant") || !strcmp(name, "ToUpperInvariant")) && count == 1) {
             char *copy = host_string(h, s, n);
-            if (!copy)
-                return XXEMUL_STATUS_LIMIT_REACHED;
+            if (!copy) return XXEMUL_STATUS_LIMIT_REACHED;
             for (i = 0; i < n; ++i) {
                 unsigned char ch = (unsigned char)copy[i];
-                if (ch < 0x80)
-                    copy[i] = (char)(!strcmp(name, "ToUpperInvariant") ? toupper(ch) : tolower(ch));
+                if (ch < 0x80) copy[i] = (char)(!strcmp(name, "ToUpperInvariant") ? toupper(ch) : tolower(ch));
                 else {
                     host_free(h, copy, n + 1);
                     return host_fail(h, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "non-ASCII invariant case conversion is unsupported");
@@ -1847,16 +1618,14 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         if (!strcmp(name, "StartsWith") && count == 2) {
             size_t length;
             const char *prefix = get_string(vm, a[1], &length);
-            if (!prefix)
-                return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
+            if (!prefix) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
             *out = value(XXEMUL_DOTNET_VALUE_I4, length <= n && !memcmp(s, prefix, length));
             return XXEMUL_STATUS_OK;
         }
         if ((!strcmp(name, "Substring") && (count == 2 || count == 3)) || (!strcmp(name, "get_Chars") && count == 2)) {
             uint16_t *units;
             size_t length;
-            if ((status = utf16_units(h, s, n, &units, &length)) != XXEMUL_STATUS_OK)
-                return status;
+            if ((status = utf16_units(h, s, n, &units, &length)) != XXEMUL_STATUS_OK) return status;
             if (!integer(a[1], &x) || x < 0 || (uint64_t)x > length) {
                 host_free(h, units, (n + 1) * sizeof(*units));
                 return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentOutOfRangeException");
@@ -1883,8 +1652,7 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             size_t units = 0;
             for (i = 0; i < n; ++i) {
                 unsigned char c = (unsigned char)s[i];
-                if ((c & 0xc0) != 0x80)
-                    units += c >= 0xf0 ? 2 : 1;
+                if ((c & 0xc0) != 0x80) units += c >= 0xf0 ? 2 : 1;
             }
             *out = value(XXEMUL_DOTNET_VALUE_I4, units);
             return XXEMUL_STATUS_OK;
@@ -1898,18 +1666,13 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         char *end;
         long parsed;
         s = get_string(vm, a[0], &n);
-        if (!s)
-            return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
-        if (memchr(s, 0, n))
-            return xxemul_dotnet_vm_raise_type(vm, "System.FormatException");
+        if (!s) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
+        if (memchr(s, 0, n)) return xxemul_dotnet_vm_raise_type(vm, "System.FormatException");
         errno = 0;
         parsed = strtol(s, &end, 10);
-        while (*end && isspace((unsigned char)*end))
-            ++end;
-        if (end == s || *end)
-            return xxemul_dotnet_vm_raise_type(vm, "System.FormatException");
-        if (errno == ERANGE || parsed < INT32_MIN || parsed > INT32_MAX)
-            return xxemul_dotnet_vm_raise_type(vm, "System.OverflowException");
+        while (*end && isspace((unsigned char)*end)) ++end;
+        if (end == s || *end) return xxemul_dotnet_vm_raise_type(vm, "System.FormatException");
+        if (errno == ERANGE || parsed < INT32_MIN || parsed > INT32_MAX) return xxemul_dotnet_vm_raise_type(vm, "System.OverflowException");
         *out = value(XXEMUL_DOTNET_VALUE_I4, (uint32_t)(int32_t)parsed);
         return XXEMUL_STATUS_OK;
     }
@@ -1920,16 +1683,14 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
                 return XXEMUL_STATUS_OK;
             }
         status = new_host_object(h, vm, "System.AppDomain", BCL_DOMAIN, &o);
-        if (status == XXEMUL_STATUS_OK)
-            *out = object_value(o->reference);
+        if (status == XXEMUL_STATUS_OK) *out = object_value(o->reference);
         return status;
     }
     if (!strcmp(t, "System.ResolveEventHandler") && !strcmp(name, ".ctor") && count == 3) {
         if (a[2].kind != XXEMUL_DOTNET_VALUE_NATIVE || a[2].bits > UINT32_MAX || xxemul_dotnet_resolve_token(program, (uint32_t)a[2].bits) == SIZE_MAX)
             return XXEMUL_STATUS_DECODE_ERROR;
         o = attach(h, vm, (uint32_t)a[0].bits, BCL_DELEGATE);
-        if (!o)
-            return XXEMUL_STATUS_LIMIT_REACHED;
+        if (!o) return XXEMUL_STATUS_LIMIT_REACHED;
         o->module = module;
         o->target = a[1];
         o->method_token = (uint32_t)a[2].bits;
@@ -1937,31 +1698,26 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
     }
     if (!strcmp(t, "System.AppDomain") && !strcmp(name, "add_AssemblyResolve") && count == 2 && o && o->kind == BCL_DOMAIN) {
         bcl_object *handler = lookup(h, vm, (uint32_t)a[1].bits);
-        if (!handler || handler->kind != BCL_DELEGATE)
-            return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
+        if (!handler || handler->kind != BCL_DELEGATE) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
         h->resolver = handler;
         return XXEMUL_STATUS_OK;
     }
     if (!strcmp(t, "System.IO.Path") && count == 1) {
         s = get_string(vm, a[0], &n);
-        if (!s)
-            return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
+        if (!s) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
         if (!strcmp(name, "GetDirectoryName")) {
             size_t end = n;
-            while (end && s[end - 1] != '/' && s[end - 1] != '\\')
-                --end;
+            while (end && s[end - 1] != '/' && s[end - 1] != '\\') --end;
             if (!end) {
                 *out = object_value(0);
                 return XXEMUL_STATUS_OK;
             }
-            if (end > 1)
-                --end;
+            if (end > 1) --end;
             return text_result(vm, s, end, out);
         }
         if (!strcmp(name, "GetFileName") || !strcmp(name, "GetFileNameWithoutExtension")) {
             size_t start = n, end = n;
-            while (start && s[start - 1] != '/' && s[start - 1] != '\\')
-                --start;
+            while (start && s[start - 1] != '/' && s[start - 1] != '\\') --start;
             if (!strcmp(name, "GetFileNameWithoutExtension")) {
                 for (i = n; i > start; --i)
                     if (s[i - 1] == '.') {
@@ -1977,35 +1733,26 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         const char *pattern = get_string(vm, a[1], &pattern_size);
         uint32_t array;
         s = get_string(vm, a[0], &n);
-        if (!s || !pattern)
-            return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
+        if (!s || !pattern) return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentException");
         {
             bcl_module *member;
             size_t matches = 0, at = 0, base = strlen(h->entry_path);
-            while (base && h->entry_path[base - 1] != '/' && h->entry_path[base - 1] != '\\')
-                --base;
-            if (base > 1)
-                --base;
-            if (n != base || memcmp(s, h->entry_path, base))
-                return xxemul_dotnet_vm_raise_type(vm, "System.IO.DirectoryNotFoundException");
+            while (base && h->entry_path[base - 1] != '/' && h->entry_path[base - 1] != '\\') --base;
+            if (base > 1) --base;
+            if (n != base || memcmp(s, h->entry_path, base)) return xxemul_dotnet_vm_raise_type(vm, "System.IO.DirectoryNotFoundException");
             for (member = h->modules; member; member = member->next) {
                 size_t length = strlen(member->location), start = length;
-                while (start && member->location[start - 1] != '/' && member->location[start - 1] != '\\')
-                    --start;
-                if (length && start && start - 1 == n && !memcmp(member->location, s, n) &&
-                    glob_match(pattern, pattern_size, member->location + start, length - start))
+                while (start && member->location[start - 1] != '/' && member->location[start - 1] != '\\') --start;
+                if (length && start && start - 1 == n && !memcmp(member->location, s, n) && glob_match(pattern, pattern_size, member->location + start, length - start))
                     ++matches;
             }
             status = xxemul_dotnet_vm_new_array(vm, "System.String", matches, &array);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
+            if (status != XXEMUL_STATUS_OK) return status;
             for (member = h->modules; member; member = member->next) {
                 size_t length = strlen(member->location), start = length;
                 xxemul_dotnet_value text;
-                while (start && member->location[start - 1] != '/' && member->location[start - 1] != '\\')
-                    --start;
-                if (length && start && start - 1 == n && !memcmp(member->location, s, n) &&
-                    glob_match(pattern, pattern_size, member->location + start, length - start)) {
+                while (start && member->location[start - 1] != '/' && member->location[start - 1] != '\\') --start;
+                if (length && start && start - 1 == n && !memcmp(member->location, s, n) && glob_match(pattern, pattern_size, member->location + start, length - start)) {
                     if ((status = text_result(vm, member->location, length, &text)) != XXEMUL_STATUS_OK ||
                         (status = xxemul_dotnet_vm_array_set(vm, array, at++, text)) != XXEMUL_STATUS_OK)
                         return status;
@@ -2026,8 +1773,7 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
             return xxemul_dotnet_vm_raise_type(vm, "System.ArgumentNullException");
         }
         for (member = h->modules; member; member = member->next)
-            if (strlen(member->location) == n && !memcmp(member->location, s, n) && n)
-                break;
+            if (strlen(member->location) == n && !memcmp(member->location, s, n) && n) break;
         if (!strcmp(name, "Exists")) {
             *out = value(XXEMUL_DOTNET_VALUE_I4, member != NULL);
             return XXEMUL_STATUS_OK;
@@ -2035,14 +1781,11 @@ static xxemul_status bcl_dispatch(void *context, xxemul_dotnet_vm *vm, const xxe
         if (!strcmp(name, "OpenRead")) {
             const uint8_t *bytes;
             size_t length;
-            if (!member)
-                return xxemul_dotnet_vm_raise_type(vm, "System.IO.FileNotFoundException");
+            if (!member) return xxemul_dotnet_vm_raise_type(vm, "System.IO.FileNotFoundException");
             bytes = xxemul_dotnet_data(member->program, &length);
             status = new_host_object(h, vm, "System.IO.FileStream", BCL_STREAM, &o);
-            if (status != XXEMUL_STATUS_OK)
-                return status;
-            if ((status = buffer_reserve(h, o, length)) != XXEMUL_STATUS_OK)
-                return status;
+            if (status != XXEMUL_STATUS_OK) return status;
+            if ((status = buffer_reserve(h, o, length)) != XXEMUL_STATUS_OK) return status;
             memcpy(o->bytes, bytes, length);
             o->length = length;
             o->channel = 2;
@@ -2059,88 +1802,69 @@ unsupported:
 xxemul_dotnet_bcl_host *xxemul_dotnet_bcl_host_create(const xxemul_dotnet_bcl_config *config, xxemul_status *status)
 {
     xxemul_dotnet_bcl_host *h = calloc(1, sizeof(*h));
-    if (status)
-        *status = XXEMUL_STATUS_OUT_OF_MEMORY;
-    if (!h)
-        return NULL;
-    if (config)
-        h->config = *config;
-    if (!h->config.max_instructions)
-        h->config.max_instructions = UINT64_C(1000000);
-    if (!h->config.max_heap_bytes)
-        h->config.max_heap_bytes = 0x1000000;
-    if (!h->config.max_native_bytes)
-        h->config.max_native_bytes = 0x4000000;
-    if (!h->config.max_image_bytes)
-        h->config.max_image_bytes = 0x1000000;
-    if (!h->config.max_output_bytes)
-        h->config.max_output_bytes = 0x400000;
-    if (!h->config.max_loaded_assemblies)
-        h->config.max_loaded_assemblies = 16;
+    if (status) *status = XXEMUL_STATUS_OUT_OF_MEMORY;
+    if (!h) return NULL;
+    if (config) h->config = *config;
+    if (!h->config.max_instructions) h->config.max_instructions = UINT64_C(1000000);
+    if (!h->config.max_heap_bytes) h->config.max_heap_bytes = 0x1000000;
+    if (!h->config.max_native_bytes) h->config.max_native_bytes = 0x4000000;
+    if (!h->config.max_image_bytes) h->config.max_image_bytes = 0x1000000;
+    if (!h->config.max_output_bytes) h->config.max_output_bytes = 0x400000;
+    if (!h->config.max_loaded_assemblies) h->config.max_loaded_assemblies = 16;
     if (h->config.max_image_bytes > 0x10000000 || h->config.max_native_bytes > SIZE_MAX / 2 || h->config.max_loaded_assemblies > 256 ||
         (h->config.flags & ~XXEMUL_DOTNET_BCL_SHARPZIP_STREAMS) || h->config.filesystem_root) {
-        if (status)
-            *status = h->config.filesystem_root ? XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION : XXEMUL_STATUS_INVALID_ARGUMENT;
+        if (status) *status = h->config.filesystem_root ? XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION : XXEMUL_STATUS_INVALID_ARGUMENT;
         free(h);
         return NULL;
     }
     h->entry_path = host_string(h, h->config.logical_entry_path ? h->config.logical_entry_path : "/app/program.exe",
                                 strlen(h->config.logical_entry_path ? h->config.logical_entry_path : "/app/program.exe"));
     if (!h->entry_path) {
-        if (status)
-            *status = XXEMUL_STATUS_LIMIT_REACHED;
+        if (status) *status = XXEMUL_STATUS_LIMIT_REACHED;
         free(h);
         return NULL;
     }
-    if (status)
-        *status = XXEMUL_STATUS_OK;
+    if (status) *status = XXEMUL_STATUS_OK;
     return h;
 }
 void xxemul_dotnet_bcl_host_destroy(xxemul_dotnet_bcl_host *h)
 {
     bcl_object *o, *next;
     bcl_module *m, *mn;
-    if (!h)
-        return;
+    if (!h) return;
     for (o = h->objects; o; o = next) {
         next = o->next;
         host_free(h, o->bytes, o->capacity);
-        if (o->name)
-            host_free(h, o->name, strlen(o->name) + 1);
+        if (o->name) host_free(h, o->name, strlen(o->name) + 1);
         host_free(h, o, sizeof(*o));
     }
     for (m = h->modules; m; m = mn) {
         mn = m->next;
-        if (m->vm)
-            xxemul_dotnet_vm_destroy(m->vm);
-        if (m->owned)
-            xxemul_dotnet_destroy((xxemul_dotnet_program *)m->program);
+        if (m->vm) xxemul_dotnet_vm_destroy(m->vm);
+        if (m->owned) xxemul_dotnet_destroy((xxemul_dotnet_program *)m->program);
         host_free(h, m->location, strlen(m->location) + 1);
         host_free(h, m, sizeof(*m));
     }
     host_free(h, h->entry_path, strlen(h->entry_path) + 1);
     free(h);
 }
-xxemul_status xxemul_dotnet_bcl_set_pinvoke_callback(xxemul_dotnet_bcl_host *h,
-    xxemul_dotnet_bcl_pinvoke_callback callback, void *context, uint64_t max_native_instructions)
+xxemul_status xxemul_dotnet_bcl_set_pinvoke_callback(xxemul_dotnet_bcl_host *h, xxemul_dotnet_bcl_pinvoke_callback callback, void *context,
+                                                     uint64_t max_native_instructions)
 {
-    if (!h || h->executing || h->entry_module || (!callback && (context || max_native_instructions)))
-        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (!h || h->executing || h->entry_module || (!callback && (context || max_native_instructions))) return XXEMUL_STATUS_INVALID_ARGUMENT;
     h->pinvoke_callback = callback;
     h->pinvoke_context = context;
     h->max_native_instructions = callback ? (max_native_instructions ? max_native_instructions : UINT64_C(0x100000)) : 0;
     return XXEMUL_STATUS_OK;
 }
-static xxemul_status bcl_execute_impl(xxemul_dotnet_bcl_host *h, const xxemul_dotnet_program *program, int argc, const char *const *argv,
-                                      xxemul_dotnet_result *result)
+static xxemul_status bcl_execute_impl(xxemul_dotnet_bcl_host *h, const xxemul_dotnet_program *program, int argc, const char *const *argv, xxemul_dotnet_result *result)
 {
     bcl_module *module;
     size_t entry, i;
     uint32_t array;
     xxemul_dotnet_value argument;
     xxemul_status status;
-    if (!h || !program || !result || argc < 0 || (argc && !argv) || h->executing)
-        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (!h || !program || !result || argc < 0 || (argc && !argv) || h->executing) return XXEMUL_STATUS_INVALID_ARGUMENT;
     memset(result, 0, sizeof(*result));
     h->diagnostic[0] = 0;
     h->output_bytes = 0;
@@ -2149,27 +1873,20 @@ static xxemul_status bcl_execute_impl(xxemul_dotnet_bcl_host *h, const xxemul_do
     {
         size_t size;
         xxemul_dotnet_data(program, &size);
-        if (size > h->config.max_image_bytes)
-            return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "root image exceeds configured bound");
+        if (size > h->config.max_image_bytes) return host_fail(h, XXEMUL_STATUS_LIMIT_REACHED, "root image exceeds configured bound");
     }
-    if (h->entry_module)
-        return host_fail(h, XXEMUL_STATUS_INVALID_ARGUMENT, "host already executed an entry; create a fresh host for a new process");
+    if (h->entry_module) return host_fail(h, XXEMUL_STATUS_INVALID_ARGUMENT, "host already executed an entry; create a fresh host for a new process");
     module = register_module(h, program, 0, h->entry_path);
-    if (!module)
-        return XXEMUL_STATUS_LIMIT_REACHED;
+    if (!module) return XXEMUL_STATUS_LIMIT_REACHED;
     h->entry_module = module;
     entry = xxemul_dotnet_entry_point(program);
-    if (entry == SIZE_MAX)
-        return host_fail(h, XXEMUL_STATUS_INVALID_IMAGE, "managed entry point is missing");
-    if ((status = ensure_vm(h, module, h->config.max_instructions)) != XXEMUL_STATUS_OK)
-        return status;
+    if (entry == SIZE_MAX) return host_fail(h, XXEMUL_STATUS_INVALID_IMAGE, "managed entry point is missing");
+    if ((status = ensure_vm(h, module, h->config.max_instructions)) != XXEMUL_STATUS_OK) return status;
     status = xxemul_dotnet_vm_new_array(module->vm, "System.String", (size_t)argc, &array);
-    if (status != XXEMUL_STATUS_OK)
-        return status;
+    if (status != XXEMUL_STATUS_OK) return status;
     for (i = 0; i < (size_t)argc; ++i) {
         xxemul_dotnet_value text;
-        if (!argv[i])
-            return XXEMUL_STATUS_INVALID_ARGUMENT;
+        if (!argv[i]) return XXEMUL_STATUS_INVALID_ARGUMENT;
         if ((status = text_result(module->vm, argv[i], strlen(argv[i]), &text)) != XXEMUL_STATUS_OK ||
             (status = xxemul_dotnet_vm_array_set(module->vm, array, i, text)) != XXEMUL_STATUS_OK)
             return status;
@@ -2181,24 +1898,19 @@ static xxemul_status bcl_execute_impl(xxemul_dotnet_bcl_host *h, const xxemul_do
     module->invoking = 0;
     h->executing = 0;
     h->statistics.managed_instructions = h->config.max_instructions - h->remaining_instructions;
-    if (status != XXEMUL_STATUS_OK && !h->diagnostic[0])
-        snprintf(h->diagnostic, sizeof(h->diagnostic), "%s", result->diagnostic);
+    if (status != XXEMUL_STATUS_OK && !h->diagnostic[0]) snprintf(h->diagnostic, sizeof(h->diagnostic), "%s", result->diagnostic);
     return status;
 }
-xxemul_status xxemul_dotnet_bcl_execute(xxemul_dotnet_bcl_host *h, const xxemul_dotnet_program *program, int argc, const char *const *argv,
-                                        xxemul_dotnet_result *result)
+xxemul_status xxemul_dotnet_bcl_execute(xxemul_dotnet_bcl_host *h, const xxemul_dotnet_program *program, int argc, const char *const *argv, xxemul_dotnet_result *result)
 {
     xxemul_status status;
-    if (!result)
-        return XXEMUL_STATUS_INVALID_ARGUMENT;
+    if (!result) return XXEMUL_STATUS_INVALID_ARGUMENT;
     memset(result, 0, sizeof(*result));
     status = bcl_execute_impl(h, program, argc, argv, result);
     result->status = status;
     if (status != XXEMUL_STATUS_OK && h) {
-        if (!h->diagnostic[0])
-            snprintf(h->diagnostic, sizeof(h->diagnostic), "managed BCL execution failed with status %u", (unsigned)status);
-        if (!result->diagnostic[0])
-            snprintf(result->diagnostic, sizeof(result->diagnostic), "%.*s", (int)sizeof(result->diagnostic) - 1, h->diagnostic);
+        if (!h->diagnostic[0]) snprintf(h->diagnostic, sizeof(h->diagnostic), "managed BCL execution failed with status %u", (unsigned)status);
+        if (!result->diagnostic[0]) snprintf(result->diagnostic, sizeof(result->diagnostic), "%.*s", (int)sizeof(result->diagnostic) - 1, h->diagnostic);
     }
     return status;
 }

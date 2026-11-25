@@ -161,24 +161,45 @@ static int net_assignable(xxemul_dotnet_vm *vm, const char *source, const char *
             if (!strcmp(parent, destination)) return 1;
             source = parent;
         } else {
-            static const struct { const char *name, *parent; } parents[] = {
-                {"System.Exception", "System.Object"}, {"System.SystemException", "System.Exception"},
-                {"System.ApplicationException", "System.Exception"}, {"System.Reflection.TargetInvocationException", "System.ApplicationException"},
-                {"System.ArithmeticException", "System.SystemException"}, {"System.DivideByZeroException", "System.ArithmeticException"},
-                {"System.OverflowException", "System.ArithmeticException"}, {"System.NullReferenceException", "System.SystemException"},
-                {"System.InvalidCastException", "System.SystemException"}, {"System.IndexOutOfRangeException", "System.SystemException"},
-                {"System.ArgumentException", "System.SystemException"}, {"System.ArgumentNullException", "System.ArgumentException"},
-                {"System.ArgumentOutOfRangeException", "System.ArgumentException"}, {"System.InvalidOperationException", "System.SystemException"},
-                {"System.FormatException", "System.SystemException"}, {"System.TypeInitializationException", "System.SystemException"},
-                {"System.NotSupportedException", "System.SystemException"}, {"System.IO.IOException", "System.SystemException"},
-                {"System.IO.InvalidDataException", "System.SystemException"}, {"System.ObjectDisposedException", "System.InvalidOperationException"},
-                {"System.String", "System.Object"}, {"System.Array", "System.Object"}
-            };
+            static const struct {
+                const char *name, *parent;
+            } parents[] = {{"System.Exception", "System.Object"},
+                           {"System.SystemException", "System.Exception"},
+                           {"System.ApplicationException", "System.Exception"},
+                           {"System.Reflection.TargetInvocationException", "System.ApplicationException"},
+                           {"System.ArithmeticException", "System.SystemException"},
+                           {"System.DivideByZeroException", "System.ArithmeticException"},
+                           {"System.OverflowException", "System.ArithmeticException"},
+                           {"System.NullReferenceException", "System.SystemException"},
+                           {"System.InvalidCastException", "System.SystemException"},
+                           {"System.IndexOutOfRangeException", "System.SystemException"},
+                           {"System.ArgumentException", "System.SystemException"},
+                           {"System.ArgumentNullException", "System.ArgumentException"},
+                           {"System.ArgumentOutOfRangeException", "System.ArgumentException"},
+                           {"System.InvalidOperationException", "System.SystemException"},
+                           {"System.FormatException", "System.SystemException"},
+                           {"System.TypeInitializationException", "System.SystemException"},
+                           {"System.NotSupportedException", "System.SystemException"},
+                           {"System.IO.IOException", "System.SystemException"},
+                           {"System.IO.InvalidDataException", "System.SystemException"},
+                           {"System.ObjectDisposedException", "System.InvalidOperationException"},
+                           {"System.String", "System.Object"},
+                           {"System.Array", "System.Object"}};
             size_t i;
             for (i = 0; i < sizeof(parents) / sizeof(parents[0]); ++i)
-                if (!strcmp(source, parents[i].name)) { parent = parents[i].parent; break; }
-            if (!parent) { size_t n = strlen(source); if (n >= 2 && source[n - 2] == '[' && source[n - 1] == ']') parent = "System.Array"; }
-            if (parent) { if (!strcmp(parent, destination)) return 1; source = parent; continue; }
+                if (!strcmp(source, parents[i].name)) {
+                    parent = parents[i].parent;
+                    break;
+                }
+            if (!parent) {
+                size_t n = strlen(source);
+                if (n >= 2 && source[n - 2] == '[' && source[n - 1] == ']') parent = "System.Array";
+            }
+            if (parent) {
+                if (!strcmp(parent, destination)) return 1;
+                source = parent;
+                continue;
+            }
             int answer = vm->config.assignability_callback ? vm->config.assignability_callback(vm->config.assignability_context, source, destination) : -1;
             if (answer >= 0) return answer > 0;
             if (!strcmp(source, "System.Object")) return 0;
@@ -238,8 +259,9 @@ static xxemul_dotnet_type net_named_type(const char *name)
         }
     if (!strcmp(name, "System.String")) type.element_type = 14;
     if (!strcmp(name, "System.Object")) type.element_type = 28;
-    if (!strcmp(name, "System.IntPtr") || !strcmp(name, "System.RuntimeTypeHandle") ||
-        !strcmp(name, "System.RuntimeFieldHandle") || !strcmp(name, "System.RuntimeMethodHandle")) type.element_type = 24;
+    if (!strcmp(name, "System.IntPtr") || !strcmp(name, "System.RuntimeTypeHandle") || !strcmp(name, "System.RuntimeFieldHandle") ||
+        !strcmp(name, "System.RuntimeMethodHandle"))
+        type.element_type = 24;
     if (!strcmp(name, "System.UIntPtr")) type.element_type = 25;
     return type;
 }
@@ -411,7 +433,10 @@ xxemul_status xxemul_dotnet_vm_array_set(xxemul_dotnet_vm *vm, uint32_t referenc
     if (!array || array->kind != 2 || index >= array->length) return XXEMUL_STATUS_ADDRESS_FAULT;
     return net_coerce(vm, &array->element_type, value, &array->elements[index]);
 }
-const xxemul_dotnet_program *xxemul_dotnet_vm_get_program(const xxemul_dotnet_vm *vm) { return vm ? vm->program : NULL; }
+const xxemul_dotnet_program *xxemul_dotnet_vm_get_program(const xxemul_dotnet_vm *vm)
+{
+    return vm ? vm->program : NULL;
+}
 const xxemul_dotnet_method_info *xxemul_dotnet_vm_caller(const xxemul_dotnet_vm *vm)
 {
     return vm && vm->callback_caller < vm->program->method_count ? &vm->program->methods[vm->callback_caller].info : NULL;
@@ -421,7 +446,8 @@ xxemul_status xxemul_dotnet_vm_array_length(const xxemul_dotnet_vm *vm, uint32_t
     net_object *object = vm ? net_object_at(vm, reference) : NULL;
     if (length) *length = 0;
     if (!object || object->kind != 2 || !length) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    *length = object->length; return XXEMUL_STATUS_OK;
+    *length = object->length;
+    return XXEMUL_STATUS_OK;
 }
 xxemul_status xxemul_dotnet_vm_array_get(const xxemul_dotnet_vm *vm, uint32_t reference, size_t index, xxemul_dotnet_value *value)
 {
@@ -429,16 +455,20 @@ xxemul_status xxemul_dotnet_vm_array_get(const xxemul_dotnet_vm *vm, uint32_t re
     if (value) memset(value, 0, sizeof(*value));
     if (!object || object->kind != 2 || !value) return XXEMUL_STATUS_INVALID_ARGUMENT;
     if (index >= object->length) return XXEMUL_STATUS_ADDRESS_FAULT;
-    *value = object->elements[index]; return XXEMUL_STATUS_OK;
+    *value = object->elements[index];
+    return XXEMUL_STATUS_OK;
 }
 xxemul_status xxemul_dotnet_vm_box(xxemul_dotnet_vm *vm, const char *type_name, xxemul_dotnet_value value, uint32_t *reference)
 {
-    xxemul_dotnet_type type; xxemul_dotnet_value normalized; xxemul_status status;
+    xxemul_dotnet_type type;
+    xxemul_dotnet_value normalized;
+    xxemul_status status;
     if (reference) *reference = 0;
     if (!vm || !type_name || !reference) return XXEMUL_STATUS_INVALID_ARGUMENT;
     type = net_named_type(type_name);
     if (net_type_kind(&type) == XXEMUL_DOTNET_VALUE_OBJECT || net_type_kind(&type) == XXEMUL_DOTNET_VALUE_VOID) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    status = net_coerce(vm, &type, value, &normalized); if (status != XXEMUL_STATUS_OK) return status;
+    status = net_coerce(vm, &type, value, &normalized);
+    if (status != XXEMUL_STATUS_OK) return status;
     status = net_add_object(vm, type_name, 3, reference);
     if (status == XXEMUL_STATUS_OK) vm->objects[*reference - 1]->boxed = normalized;
     return status;
@@ -448,14 +478,14 @@ xxemul_status xxemul_dotnet_vm_unbox(const xxemul_dotnet_vm *vm, uint32_t refere
     net_object *object = vm ? net_object_at(vm, reference) : NULL;
     if (value) memset(value, 0, sizeof(*value));
     if (!object || object->kind != 3 || !value) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    *value = object->boxed; return XXEMUL_STATUS_OK;
+    *value = object->boxed;
+    return XXEMUL_STATUS_OK;
 }
 xxemul_status xxemul_dotnet_vm_raise(xxemul_dotnet_vm *vm, uint32_t reference)
 {
     net_object *object;
     if (!vm || !vm->running || !(object = net_object_at(vm, reference))) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (net_assignable(vm, object->type_name, "System.Exception") != 1)
-        return net_fail(vm, XXEMUL_STATUS_DECODE_ERROR, "throw requires System.Exception");
+    if (net_assignable(vm, object->type_name, "System.Exception") != 1) return net_fail(vm, XXEMUL_STATUS_DECODE_ERROR, "throw requires System.Exception");
     object->throw_method = vm->result ? vm->result->method_index : SIZE_MAX;
     object->throw_pc = vm->result ? vm->result->pc : 0;
     object->thrown = 1;
@@ -464,20 +494,27 @@ xxemul_status xxemul_dotnet_vm_raise(xxemul_dotnet_vm *vm, uint32_t reference)
 }
 xxemul_status xxemul_dotnet_vm_raise_type(xxemul_dotnet_vm *vm, const char *type_name)
 {
-    uint32_t reference; xxemul_status status;
+    uint32_t reference;
+    xxemul_status status;
     if (!vm || !vm->running || !type_name) return XXEMUL_STATUS_INVALID_ARGUMENT;
     status = net_add_object(vm, type_name, 0, &reference);
     if (status != XXEMUL_STATUS_OK) return net_allocation_failure(vm, status);
     return xxemul_dotnet_vm_raise(vm, reference);
 }
-uint32_t xxemul_dotnet_vm_exception(const xxemul_dotnet_vm *vm) { return vm ? vm->exception_reference : 0; }
-uint64_t xxemul_dotnet_vm_instruction_count(const xxemul_dotnet_vm *vm) { return vm && vm->result ? vm->result->instructions : 0; }
+uint32_t xxemul_dotnet_vm_exception(const xxemul_dotnet_vm *vm)
+{
+    return vm ? vm->exception_reference : 0;
+}
+uint64_t xxemul_dotnet_vm_instruction_count(const xxemul_dotnet_vm *vm)
+{
+    return vm && vm->result ? vm->result->instructions : 0;
+}
 xxemul_status xxemul_dotnet_vm_consume_instructions(xxemul_dotnet_vm *vm, uint64_t count)
 {
     if (!vm || !vm->running || !vm->result) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (count > vm->config.max_instructions - vm->result->instructions)
-        return net_fail(vm, XXEMUL_STATUS_LIMIT_REACHED, "nested CIL instruction limit reached");
-    vm->result->instructions += count; return XXEMUL_STATUS_OK;
+    if (count > vm->config.max_instructions - vm->result->instructions) return net_fail(vm, XXEMUL_STATUS_LIMIT_REACHED, "nested CIL instruction limit reached");
+    vm->result->instructions += count;
+    return XXEMUL_STATUS_OK;
 }
 
 xxemul_dotnet_vm *xxemul_dotnet_vm_create(const xxemul_dotnet_program *program, const xxemul_dotnet_vm_config *config, xxemul_status *status)
@@ -895,8 +932,7 @@ static xxemul_status net_field(xxemul_dotnet_vm *vm, net_frame *frame, uint32_t 
         const xxemul_dotnet_field_info *info = xxemul_dotnet_field_info_token(vm->program, token);
         xxemul_dotnet_type type;
         int handled = 0;
-        if (!info || !vm->config.field_callback)
-            return net_fail(vm, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "external field requires callback: 0x%08x", token);
+        if (!info || !vm->config.field_callback) return net_fail(vm, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "external field requires callback: 0x%08x", token);
         if (store && (status = net_pop(vm, frame, &value)) != XXEMUL_STATUS_OK) return status;
         status = vm->config.field_callback(vm->config.field_context, vm, info, store, &value, &handled);
         if (!handled) {
@@ -1120,8 +1156,7 @@ static int net_protected(const xxemul_dotnet_method *method, size_t index, uint3
     if (net_inside(pc, clause->try_offset, clause->try_length)) return 1;
     for (i = 0; i < method->clause_count; ++i) {
         const xxemul_dotnet_exception_clause *other = &method->clauses[i];
-        if ((other->flags == 0 || other->flags == 1) && net_same_try(clause, other) &&
-            net_inside(pc, other->handler_offset, other->handler_length)) return 1;
+        if ((other->flags == 0 || other->flags == 1) && net_same_try(clause, other) && net_inside(pc, other->handler_offset, other->handler_length)) return 1;
     }
     return 0;
 }
@@ -1138,8 +1173,7 @@ static size_t net_next_finally(const xxemul_dotnet_method *method, const net_tra
     for (i = 0; i < method->clause_count; ++i) {
         const xxemul_dotnet_exception_clause *clause = &method->clauses[i];
         if (clause->flags != 2 && !(transfer->exceptional && clause->flags == 4)) continue;
-        if (!net_protected(method, i, transfer->origin) ||
-            (transfer->target != UINT32_MAX && net_protected(method, i, transfer->target))) continue;
+        if (!net_protected(method, i, transfer->origin) || (transfer->target != UINT32_MAX && net_protected(method, i, transfer->target))) continue;
         if (net_inside(transfer->origin, clause->handler_offset, clause->handler_length)) continue;
         if (transfer->previous_finally != SIZE_MAX && !net_finally_before(method, transfer->previous_finally, i)) continue;
         if (selected == SIZE_MAX || net_finally_before(method, i, selected)) selected = i;
@@ -1154,8 +1188,7 @@ static void net_clear_exception_result(xxemul_dotnet_vm *vm)
 }
 /* Continue one pending leave/exception transfer. It executes every exited
  * finally/fault exactly once before entering the selected catch or target. */
-static xxemul_status net_continue_transfer(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method,
-    net_frame *frame, uint32_t *next)
+static xxemul_status net_continue_transfer(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method, net_frame *frame, uint32_t *next)
 {
     net_transfer *transfer;
     size_t finalizer;
@@ -1187,8 +1220,8 @@ static xxemul_status net_continue_transfer(xxemul_dotnet_vm *vm, const xxemul_do
         return XXEMUL_STATUS_ADDRESS_FAULT;
     }
 }
-static xxemul_status net_begin_transfer(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method,
-    net_frame *frame, uint32_t origin, uint32_t target, size_t catch_clause, uint32_t exception, uint32_t *next)
+static xxemul_status net_begin_transfer(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method, net_frame *frame, uint32_t origin, uint32_t target, size_t catch_clause,
+                                        uint32_t exception, uint32_t *next)
 {
     net_transfer *transfer;
     /* A new exception abandoning an active finally replaces that unwind.
@@ -1201,24 +1234,26 @@ static xxemul_status net_begin_transfer(xxemul_dotnet_vm *vm, const xxemul_dotne
         }
         --frame->transfer_count;
     }
-    if (frame->transfer_count >= frame->transfer_capacity)
-        return net_fail(vm, XXEMUL_STATUS_LIMIT_REACHED, "exception continuation limit reached");
+    if (frame->transfer_count >= frame->transfer_capacity) return net_fail(vm, XXEMUL_STATUS_LIMIT_REACHED, "exception continuation limit reached");
     transfer = &frame->transfers[frame->transfer_count++];
     memset(transfer, 0, sizeof(*transfer));
-    transfer->origin = origin; transfer->target = target; transfer->exception = exception;
-    transfer->catch_clause = catch_clause; transfer->exceptional = exception != 0;
+    transfer->origin = origin;
+    transfer->target = target;
+    transfer->exception = exception;
+    transfer->catch_clause = catch_clause;
+    transfer->exceptional = exception != 0;
     transfer->active_finally = transfer->previous_finally = SIZE_MAX;
     return net_continue_transfer(vm, method, frame, next);
 }
-static xxemul_status net_dispatch_exception(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method,
-    net_frame *frame, uint32_t pc, uint32_t *next)
+static xxemul_status net_dispatch_exception(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method, net_frame *frame, uint32_t pc, uint32_t *next)
 {
     net_object *exception = net_object_at(vm, vm->exception_reference);
     size_t i, selected = SIZE_MAX;
     if (!exception) return net_fail(vm, XXEMUL_STATUS_DECODE_ERROR, "invalid pending exception object");
     for (i = 0; i < method->clause_count; ++i) {
         const xxemul_dotnet_exception_clause *clause = &method->clauses[i];
-        const char *name; int match;
+        const char *name;
+        int match;
         if (clause->flags || !net_inside(pc, clause->try_offset, clause->try_length)) continue;
         name = xxemul_dotnet_type_name(vm->program, clause->class_token_or_filter_offset);
         if (!name) return net_fail(vm, XXEMUL_STATUS_INVALID_IMAGE, "invalid catch class");
@@ -1226,30 +1261,27 @@ static xxemul_status net_dispatch_exception(xxemul_dotnet_vm *vm, const xxemul_d
         if (match < 0) return net_fail(vm, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "unknown exception type relationship: %s -> %s", exception->type_name, name);
         if (match && (selected == SIZE_MAX || clause->try_length < method->clauses[selected].try_length)) selected = i;
     }
-    return net_begin_transfer(vm, method, frame, pc,
-        selected == SIZE_MAX ? UINT32_MAX : method->clauses[selected].handler_offset,
-        selected, vm->exception_reference, next);
+    return net_begin_transfer(vm, method, frame, pc, selected == SIZE_MAX ? UINT32_MAX : method->clauses[selected].handler_offset, selected, vm->exception_reference,
+                              next);
 }
-static xxemul_status net_eh_branch(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method,
-    uint32_t origin, uint32_t target, int leave, size_t stack_count)
+static xxemul_status net_eh_branch(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method, uint32_t origin, uint32_t target, int leave, size_t stack_count)
 {
     size_t i;
     for (i = 0; i < method->clause_count; ++i) {
         const xxemul_dotnet_exception_clause *clause = &method->clauses[i];
         int from_try = net_inside(origin, clause->try_offset, clause->try_length), to_try = net_inside(target, clause->try_offset, clause->try_length);
-        int from_handler = net_inside(origin, clause->handler_offset, clause->handler_length), to_handler = net_inside(target, clause->handler_offset, clause->handler_length);
+        int from_handler = net_inside(origin, clause->handler_offset, clause->handler_length),
+            to_handler = net_inside(target, clause->handler_offset, clause->handler_length);
         /* A compiler may branch to a try's first instruction, including a
          * leave from an adjacent catch. Its entry stack must be empty. Jumps
          * into the protected interior or directly into handlers stay invalid. */
         if ((!from_try && to_try && (target != clause->try_offset || (!leave && stack_count))) || (!from_handler && to_handler) ||
-            (!leave && ((from_try && !to_try) || from_handler != to_handler)) ||
-            (leave && from_handler && !to_handler && (clause->flags == 2 || clause->flags == 4)))
+            (!leave && ((from_try && !to_try) || from_handler != to_handler)) || (leave && from_handler && !to_handler && (clause->flags == 2 || clause->flags == 4)))
             return net_fail(vm, XXEMUL_STATUS_DECODE_ERROR, "branch crosses an exception region without valid leave");
     }
     return XXEMUL_STATUS_OK;
 }
-static xxemul_status net_eh_fallthrough(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method,
-    uint32_t origin, uint32_t target, size_t stack_count)
+static xxemul_status net_eh_fallthrough(xxemul_dotnet_vm *vm, const xxemul_dotnet_method *method, uint32_t origin, uint32_t target, size_t stack_count)
 {
     size_t i;
     for (i = 0; i < method->clause_count; ++i) {
@@ -1268,7 +1300,11 @@ static xxemul_status net_body(xxemul_dotnet_vm *vm, size_t method_index, net_fra
 {
     const xxemul_dotnet_method *method = &vm->program->methods[method_index];
     uint32_t pc = 0;
-#define NET_BODY_FAIL(...) do { status = net_fail(__VA_ARGS__); goto instruction_failed; } while (0)
+#define NET_BODY_FAIL(...)              \
+    do {                                \
+        status = net_fail(__VA_ARGS__); \
+        goto instruction_failed;        \
+    } while (0)
     while (pc < method->info.code_size) {
         xxbyte_instruction instruction;
         uint32_t opcode, next, token;
@@ -1456,7 +1492,10 @@ static xxemul_status net_body(xxemul_dotnet_vm *vm, size_t method_index, net_fra
                 answer = net_assignable(vm, object->type_name, name);
                 if (answer < 0) NET_BODY_FAIL(vm, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "unknown cast relationship: %s -> %s", object->type_name, name);
                 if (!answer) {
-                    if (opcode == 0x74) { status = net_managed_fail(vm, "System.InvalidCastException"); goto instruction_failed; }
+                    if (opcode == 0x74) {
+                        status = net_managed_fail(vm, "System.InvalidCastException");
+                        goto instruction_failed;
+                    }
                     value.bits = 0;
                 }
             }
@@ -1467,14 +1506,17 @@ static xxemul_status net_body(xxemul_dotnet_vm *vm, size_t method_index, net_fra
             uint32_t reference;
             if (!name) NET_BODY_FAIL(vm, XXEMUL_STATUS_INVALID_IMAGE, "invalid newarr type token");
             if ((status = net_pop(vm, frame, &value)) != XXEMUL_STATUS_OK) goto instruction_failed;
-            if ((value.kind != XXEMUL_DOTNET_VALUE_I4 && value.kind != XXEMUL_DOTNET_VALUE_NATIVE) || value.bits > INT32_MAX)
-                { status = net_managed_fail(vm, "System.OverflowException"); goto instruction_failed; }
+            if ((value.kind != XXEMUL_DOTNET_VALUE_I4 && value.kind != XXEMUL_DOTNET_VALUE_NATIVE) || value.bits > INT32_MAX) {
+                status = net_managed_fail(vm, "System.OverflowException");
+                goto instruction_failed;
+            }
             status = xxemul_dotnet_vm_new_array(vm, name, (size_t)value.bits, &reference);
             if (status != XXEMUL_STATUS_OK) return net_allocation_failure(vm, status);
             status = net_push(vm, frame, net_value(XXEMUL_DOTNET_VALUE_OBJECT, reference));
         } else if (opcode == 0x8e) {
             net_object *array;
-            if ((status = net_pop(vm, frame, &value)) != XXEMUL_STATUS_OK || (status = net_require_object(vm, value, &array)) != XXEMUL_STATUS_OK) goto instruction_failed;
+            if ((status = net_pop(vm, frame, &value)) != XXEMUL_STATUS_OK || (status = net_require_object(vm, value, &array)) != XXEMUL_STATUS_OK)
+                goto instruction_failed;
             if (array->kind != 2) NET_BODY_FAIL(vm, XXEMUL_STATUS_DECODE_ERROR, "ldlen requires vector");
             status = net_push(vm, frame, net_value(XXEMUL_DOTNET_VALUE_NATIVE, array->length));
         } else if ((opcode >= 0x90 && opcode <= 0xa4)) status = net_array(vm, frame, opcode, token);
@@ -1505,7 +1547,8 @@ static xxemul_status net_body(xxemul_dotnet_vm *vm, size_t method_index, net_fra
             for (index = 0; index < method->clause_count; ++index) {
                 const xxemul_dotnet_exception_clause *clause = &method->clauses[index];
                 if (!clause->flags && frame->caught[index] && net_inside(pc, clause->handler_offset, clause->handler_length) &&
-                    (caught == SIZE_MAX || clause->handler_length < method->clauses[caught].handler_length)) caught = index;
+                    (caught == SIZE_MAX || clause->handler_length < method->clauses[caught].handler_length))
+                    caught = index;
             }
             if (caught == SIZE_MAX) NET_BODY_FAIL(vm, XXEMUL_STATUS_DECODE_ERROR, "rethrow outside a catch handler");
             vm->exception_reference = frame->caught[caught];
@@ -1514,14 +1557,13 @@ static xxemul_status net_body(xxemul_dotnet_vm *vm, size_t method_index, net_fra
             if (xxemul_dotnet_resolve_token(vm->program, token) == SIZE_MAX) NET_BODY_FAIL(vm, XXEMUL_STATUS_INVALID_IMAGE, "invalid ldftn token");
             status = net_push(vm, frame, net_value(XXEMUL_DOTNET_VALUE_NATIVE, token));
         } else if (opcode == 0xd0) {
-            unsigned table = token >> 24; uint32_t rid = token & 0xffffff;
-            if (!rid || !((table == 4 && rid <= vm->program->field_count) ||
-                ((table == 1 || table == 2 || table == 27) && xxemul_dotnet_type_name(vm->program, token)) ||
-                ((table == 6 || table == 10) && xxemul_dotnet_resolve_token(vm->program, token) != SIZE_MAX)))
+            unsigned table = token >> 24;
+            uint32_t rid = token & 0xffffff;
+            if (!rid || !((table == 4 && rid <= vm->program->field_count) || ((table == 1 || table == 2 || table == 27) && xxemul_dotnet_type_name(vm->program, token)) ||
+                          ((table == 6 || table == 10) && xxemul_dotnet_resolve_token(vm->program, token) != SIZE_MAX)))
                 NET_BODY_FAIL(vm, XXEMUL_STATUS_INVALID_IMAGE, "invalid ldtoken metadata handle");
             status = net_push(vm, frame, net_value(XXEMUL_DOTNET_VALUE_NATIVE, token));
-        }
-        else if (opcode == 0x8c || opcode == 0xa5) {
+        } else if (opcode == 0x8c || opcode == 0xa5) {
             const char *name = xxemul_dotnet_type_name(vm->program, token);
             xxemul_dotnet_type type;
             net_object *object;
@@ -1539,16 +1581,22 @@ static xxemul_status net_body(xxemul_dotnet_vm *vm, size_t method_index, net_fra
                 status = net_push(vm, frame, net_value(XXEMUL_DOTNET_VALUE_OBJECT, reference));
             } else {
                 if ((status = net_require_object(vm, value, &object)) != XXEMUL_STATUS_OK) goto instruction_failed;
-                if (object->kind != 3 || strcmp(object->type_name, name)) { status = net_managed_fail(vm, "System.InvalidCastException"); goto instruction_failed; }
+                if (object->kind != 3 || strcmp(object->type_name, name)) {
+                    status = net_managed_fail(vm, "System.InvalidCastException");
+                    goto instruction_failed;
+                }
                 status = net_push(vm, frame, object->boxed);
             }
         } else if (opcode == 0xc3) {
             if ((status = net_pop(vm, frame, &value)) != XXEMUL_STATUS_OK) goto instruction_failed;
             if (value.kind != XXEMUL_DOTNET_VALUE_F) NET_BODY_FAIL(vm, XXEMUL_STATUS_DECODE_ERROR, "ckfinite requires floating operand");
-            if (!isfinite(net_double(value.bits))) { status = net_managed_fail(vm, "System.ArithmeticException"); goto instruction_failed; }
+            if (!isfinite(net_double(value.bits))) {
+                status = net_managed_fail(vm, "System.ArithmeticException");
+                goto instruction_failed;
+            }
             status = net_push(vm, frame, value);
         } else NET_BODY_FAIL(vm, XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION, "unsupported CIL %s (0x%x) at IL_%04x", instruction.mnemonic, opcode, pc);
-instruction_failed:
+    instruction_failed:
         if (status != XXEMUL_STATUS_OK) {
             if (!vm->exception_reference || !method->clause_count) return status;
             eh_transfer = 1;
@@ -1594,15 +1642,17 @@ static xxemul_status net_execute(xxemul_dotnet_vm *vm, size_t index, const xxemu
         if (handled) {
             if (vm->exception_reference && status == XXEMUL_STATUS_OK) status = XXEMUL_STATUS_ADDRESS_FAULT;
             if (status != XXEMUL_STATUS_OK) return net_fail(vm, status, "intrinsic method failed: %s", method->info.selector);
-            { xxemul_dotnet_value returned = *result; return net_coerce(vm, &method->signature.return_type, returned, result); }
+            {
+                xxemul_dotnet_value returned = *result;
+                return net_coerce(vm, &method->signature.return_type, returned, result);
+            }
         }
         if (status != XXEMUL_STATUS_OK || vm->exception_reference) {
             vm->exception_reference = 0;
             return net_fail(vm, status != XXEMUL_STATUS_OK ? status : XXEMUL_STATUS_DECODE_ERROR, "unhandled intrinsic modified execution state");
         }
     }
-    if (method->info.has_exception_handlers && !method->clause_count)
-        return net_fail(vm, XXEMUL_STATUS_INVALID_IMAGE, "exception metadata is missing");
+    if (method->info.has_exception_handlers && !method->clause_count) return net_fail(vm, XXEMUL_STATUS_INVALID_IMAGE, "exception metadata is missing");
     if (count > SIZE_MAX - method->local_count || count + method->local_count > SIZE_MAX - method->info.max_stack ||
         count + method->local_count + method->info.max_stack > SIZE_MAX / sizeof(xxemul_dotnet_value))
         return net_fail(vm, XXEMUL_STATUS_LIMIT_REACHED, "CIL frame size overflow");
@@ -1678,37 +1728,51 @@ static xxemul_status net_initialize_module(xxemul_dotnet_vm *vm)
 {
     /* ECMA-335's global module type is TypeDef 1. Some old synthetic test
      * assemblies omit it; do not mistake their ordinary first type for it. */
-    if (vm->program->type_def_count && vm->program->types[0].token == UINT32_C(0x02000001) &&
-        !strcmp(vm->program->types[0].name, "<Module>")) return net_initialize(vm, UINT32_C(0x02000001));
+    if (vm->program->type_def_count && vm->program->types[0].token == UINT32_C(0x02000001) && !strcmp(vm->program->types[0].name, "<Module>"))
+        return net_initialize(vm, UINT32_C(0x02000001));
     return XXEMUL_STATUS_OK;
 }
 static int net_is_module_initializer(const xxemul_dotnet_vm *vm, size_t index)
 {
-    return vm->program->type_def_count && !strcmp(vm->program->types[0].name, "<Module>") &&
-        vm->program->methods[index].owner_token == UINT32_C(0x02000001) && !strcmp(vm->program->methods[index].info.name, ".cctor");
+    return vm->program->type_def_count && !strcmp(vm->program->types[0].name, "<Module>") && vm->program->methods[index].owner_token == UINT32_C(0x02000001) &&
+           !strcmp(vm->program->methods[index].info.name, ".cctor");
 }
-xxemul_status xxemul_dotnet_vm_invoke_nested(xxemul_dotnet_vm *vm, size_t method_index,
-    const xxemul_dotnet_value *arguments, size_t argument_count, xxemul_dotnet_result *result)
+xxemul_status xxemul_dotnet_vm_invoke_nested(xxemul_dotnet_vm *vm, size_t method_index, const xxemul_dotnet_value *arguments, size_t argument_count,
+                                             xxemul_dotnet_result *result)
 {
     xxemul_dotnet_result *outer;
     xxemul_dotnet_value value = {0, XXEMUL_DOTNET_VALUE_VOID};
-    uint64_t before; size_t parent_method; uint32_t parent_pc; xxemul_status status;
+    uint64_t before;
+    size_t parent_method;
+    uint32_t parent_pc;
+    xxemul_status status;
     if (!result) return XXEMUL_STATUS_INVALID_ARGUMENT;
     if (vm && result == vm->result) return XXEMUL_STATUS_INVALID_ARGUMENT;
-    if (!vm || !vm->running || !vm->result || result == vm->result || method_index >= vm->program->method_count ||
-        (!arguments && argument_count) || vm->exception_reference || vm->result->status != XXEMUL_STATUS_OK) {
-        memset(result, 0, sizeof(*result)); result->status = XXEMUL_STATUS_INVALID_ARGUMENT;
-        (void)snprintf(result->diagnostic, sizeof(result->diagnostic), "invalid nested VM invocation"); return result->status;
+    if (!vm || !vm->running || !vm->result || result == vm->result || method_index >= vm->program->method_count || (!arguments && argument_count) ||
+        vm->exception_reference || vm->result->status != XXEMUL_STATUS_OK) {
+        memset(result, 0, sizeof(*result));
+        result->status = XXEMUL_STATUS_INVALID_ARGUMENT;
+        (void)snprintf(result->diagnostic, sizeof(result->diagnostic), "invalid nested VM invocation");
+        return result->status;
     }
-    outer = vm->result; before = outer->instructions; parent_method = outer->method_index; parent_pc = outer->pc;
+    outer = vm->result;
+    before = outer->instructions;
+    parent_method = outer->method_index;
+    parent_pc = outer->pc;
     if (argument_count != vm->program->methods[method_index].signature.parameter_count + (vm->program->methods[method_index].signature.has_this ? 1u : 0u))
         status = net_execute(vm, method_index, arguments, argument_count, &value);
     else {
         status = net_initialize_module(vm);
         if (status == XXEMUL_STATUS_OK && !net_is_module_initializer(vm, method_index)) status = net_execute(vm, method_index, arguments, argument_count, &value);
     }
-    *result = *outer; result->instructions = outer->instructions - before; result->status = status; result->value = value;
-    if (status == XXEMUL_STATUS_OK) { outer->method_index = parent_method; outer->pc = parent_pc; }
+    *result = *outer;
+    result->instructions = outer->instructions - before;
+    result->status = status;
+    result->value = value;
+    if (status == XXEMUL_STATUS_OK) {
+        outer->method_index = parent_method;
+        outer->pc = parent_pc;
+    }
     return status;
 }
 xxemul_status xxemul_dotnet_vm_invoke(xxemul_dotnet_vm *vm, size_t method_index, const xxemul_dotnet_value *arguments, size_t argument_count,
@@ -1732,8 +1796,7 @@ xxemul_status xxemul_dotnet_vm_invoke(xxemul_dotnet_vm *vm, size_t method_index,
         status = net_execute(vm, method_index, arguments, argument_count, &result->value);
     else {
         status = net_initialize_module(vm);
-        if (status == XXEMUL_STATUS_OK && !net_is_module_initializer(vm, method_index))
-            status = net_execute(vm, method_index, arguments, argument_count, &result->value);
+        if (status == XXEMUL_STATUS_OK && !net_is_module_initializer(vm, method_index)) status = net_execute(vm, method_index, arguments, argument_count, &result->value);
     }
     if (vm->exception_reference) {
         net_object *exception = net_object_at(vm, vm->exception_reference);

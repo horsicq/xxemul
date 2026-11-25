@@ -14,11 +14,9 @@ typedef struct xxemul_darwin_bzip2 xxemul_darwin_bzip2;
  * must be zero; native diagnostic output is not part of the guest streams.
  * ReadGetUnused returns a guest copy valid until that BZ handle is closed.
  * WriteClose64 writes four 32-bit counters through optional guest pointers. */
-xxemul_darwin_bzip2 *xxemul_darwin_bzip2_create(xxemul *emulator,
-    xxemul_darwin_posix_allocate allocate, void *context, xxemul_darwin_posix *posix);
+xxemul_darwin_bzip2 *xxemul_darwin_bzip2_create(xxemul *emulator, xxemul_darwin_posix_allocate allocate, void *context, xxemul_darwin_posix *posix);
 void xxemul_darwin_bzip2_destroy(xxemul_darwin_bzip2 *process);
 int xxemul_darwin_bzip2_supports(const char *name);
-int xxemul_darwin_bzip2_dispatch(xxemul_darwin_bzip2 *process, const char *name,
-    xxemul_status *status);
+int xxemul_darwin_bzip2_dispatch(xxemul_darwin_bzip2 *process, const char *name, xxemul_status *status);
 
 #endif
