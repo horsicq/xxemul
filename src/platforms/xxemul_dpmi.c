@@ -733,6 +733,10 @@ static xxemul_status dpmi_begin_real_interrupt(xxemul *emulator, uint8_t vector,
                       emulator->x86.ip == XXEMUL_DPMI_HOST_VECTOR_BASE + (kind == DPMI_TRANSITION_SIMULATE ? 0x31u : (uint32_t)vector) * 4u;
     if (!cs && !ip) return XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
     if ((emulator->dos_cr0 & UINT32_C(0x80000000)) || emulator->dos_dpmi_transition_depth >= XXEMUL_DPMI_TRANSITIONS) {
+        /* A reflected hardware/software interrupt is not an INT 31h call: an
+         * AX=8012h/CF result would look like the real handler's output. */
+        if (kind == DPMI_TRANSITION_REFLECT)
+            return emulator->dos_dpmi_transition_depth >= XXEMUL_DPMI_TRANSITIONS ? XXEMUL_STATUS_LIMIT_REACHED : XXEMUL_STATUS_UNSUPPORTED_INSTRUCTION;
         xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x8012u);
         emulator->x86.flags |= DPMI_CF;
         return XXEMUL_STATUS_OK;
@@ -1187,7 +1191,7 @@ xxemul_status xxemul_dpmi_interrupt(xxemul *emulator)
         case 0x0400u:
             xxemul_x86_set_reg16(emulator, XXEMUL_X86_RAX, 0x005au);
             xxemul_x86_set_reg16(emulator, XXEMUL_X86_RBX, 3u); /* 386 host, real reflection, resident/no virtual memory */
-            xxemul_x86_set_reg16(emulator, XXEMUL_X86_RCX, 3u);
+            emulator->x86.gpr[XXEMUL_X86_RCX] = (emulator->x86.gpr[XXEMUL_X86_RCX] & ~UINT64_C(0xff)) | 3u; /* CL = 386; CH is not a result */
             xxemul_x86_set_reg16(emulator, XXEMUL_X86_RDX, ((uint32_t)emulator->dos_pic_master_offset << 8u) | emulator->dos_pic_slave_offset);
             return XXEMUL_STATUS_OK;
         default: break;
