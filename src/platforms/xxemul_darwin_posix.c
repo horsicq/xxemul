@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 /* Darwin ARM64 file/stdio/time services. Guest code is never executed by the host. */
 #ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE 1

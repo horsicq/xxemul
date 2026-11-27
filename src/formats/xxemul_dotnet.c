@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #include "../xxemul_dotnet_internal.h"
 
 #include <xxfclib/formats/executable/dotnet/xx_dotnet_inspect.h>

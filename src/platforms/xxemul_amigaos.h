@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #ifndef XXEMUL_AMIGAOS_H
 #define XXEMUL_AMIGAOS_H
 #include "xxemul/xxemul.h"

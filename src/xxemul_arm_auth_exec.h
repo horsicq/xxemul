@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #ifndef XXEMUL_ARM_AUTH_EXEC_H
 #define XXEMUL_ARM_AUTH_EXEC_H
 

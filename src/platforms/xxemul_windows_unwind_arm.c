@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #include "xxemul_windows_unwind_arm.h"
 #include <string.h>
 

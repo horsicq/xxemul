@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #ifndef XXEMUL_DEX_INTERNAL_H
 #define XXEMUL_DEX_INTERNAL_H
 

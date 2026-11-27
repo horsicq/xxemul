@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #include "xxemul/xxemul.h"
 
 /* Keep status formatting independent of the native CPU backends so a DEX

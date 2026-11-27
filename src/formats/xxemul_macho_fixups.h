@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 /* Private, portable decoding of dyld chained fixups. No host Mach-O ABI. */
 #ifndef XXEMUL_MACHO_FIXUPS_H
 #define XXEMUL_MACHO_FIXUPS_H

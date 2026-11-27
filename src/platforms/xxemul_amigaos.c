@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #include "xxemul_amigaos.h"
 #include "xxemul_internal.h"
 #include "xxemul_dos_files.h"

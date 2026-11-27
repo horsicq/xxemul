@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #include "xxemul_internal.h"
 
 #include <xxfclib/formats/executable/com/xx_com.h>

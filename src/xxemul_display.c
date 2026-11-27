@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #include "xxemul_internal.h"
 
 #define XXEMUL_TEXT_BASE 0xb8000u

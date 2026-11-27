@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 #ifndef XXEMUL_XXEMUL_DOTNET_H
 #define XXEMUL_XXEMUL_DOTNET_H
 

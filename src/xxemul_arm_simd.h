@@ -1,3 +1,5 @@
+/* Copyright (c) 2026 hors<horsicq@gmail.com> */
+
 /* A64 vector register and instruction helpers. Included after scalar helpers. */
 #ifndef XXEMUL_ARM_SIMD_H
 #define XXEMUL_ARM_SIMD_H
